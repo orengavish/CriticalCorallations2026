@@ -30,7 +30,9 @@ import sys; sys.path.insert(0, str(_ROOT)) if str(_ROOT) not in sys.path else No
 
 from lib.config_loader import get_config
 from lib.logger import get_logger
-from lib.db import get_db, init_db, get_pending_commands, update_command_status, get_system_state, record_completed_trade, spawn_replenishment
+from lib.db import (get_db, init_db, get_pending_commands, update_command_status,
+                    get_system_state, set_system_state, record_completed_trade,
+                    spawn_replenishment, update_price_cache, get_cached_price)
 from lib.ib_client import IBClient
 from lib.order_builder import build_bracket, place_bracket
 
@@ -60,21 +62,27 @@ def _write_ib_event(db_path, event_type: str, component: str,
         log.warning(f"ib_event write failed: {e}")
 
 
-def _handle_exec_fill(order_id: int, fill_price: float, db_path):
-    """Event-driven fill: mark SUBMITTED command FILLED immediately on execDetails."""
+def _handle_exec_fill(order_id: int, fill_price: float, db_path, symbol: str = None):
+    """
+    Event-driven fill: mark SUBMITTED command FILLED immediately on execDetails.
+    Also saves price to price_cache — bypasses IB's 15-min paper delay for future commands.
+    """
     now = _now_utc()
     try:
         with get_db(db_path) as con:
             row = con.execute(
-                "SELECT id FROM commands WHERE ib_order_id=? AND status='SUBMITTED'",
+                "SELECT id, symbol FROM commands WHERE ib_order_id=? AND status='SUBMITTED'",
                 (order_id,)
             ).fetchone()
             if row:
+                sym = symbol or row["symbol"]
                 update_command_status(
                     con, row["id"], "FILLED",
                     fill_price=fill_price,
                     fill_time=now,
                 )
+                # Save price so --build-trades can use it instead of 15-min delayed quote
+                update_price_cache(con, sym, fill_price, now, source="fill")
                 log.info(
                     f"[event] Command {row['id']} FILLED "
                     f"(execDetails orderId={order_id} price={fill_price})"
@@ -420,16 +428,20 @@ def replenish_if_enabled(ibc: IBClient, db_path, cfg) -> int:
     if not candidates:
         return 0
 
-    try:
-        price = ibc.get_price(cfg.symbols[0]) if ibc else None
-    except Exception:
-        price = None
-    if not price:
-        return 0
-
     tick = cfg.orders.tick_size
     spawned = 0
     for cmd in candidates:
+        # Get price: prefer price_cache (fill-sourced, no delay), then IB
+        try:
+            with get_db(db_path) as con:
+                price = get_cached_price(con, cmd["symbol"])
+            if not price:
+                price = ibc.get_price(cmd["symbol"]) if ibc else None
+        except Exception:
+            price = None
+        if not price:
+            log.warning(f"[replenish] No price for {cmd['symbol']} — skipping cmd {cmd['id']}")
+            continue
         try:
             with get_db(db_path) as con:
                 child_id = spawn_replenishment(con, cmd, price, tick)
@@ -442,6 +454,113 @@ def replenish_if_enabled(ibc: IBClient, db_path, cfg) -> int:
             log.error(f"[replenish] Failed for cmd {cmd['id']}: {e}")
 
     return spawned
+
+
+def build_trades(db_path=None):
+    """
+    --build-trades mode: send as many commands as possible at once.
+
+    For each trading symbol:
+      1. Get current price from price_cache (fill-sourced, no 15-min delay).
+         Fallback: reqMktData with 5s timeout, saved as 'paper_delayed'.
+      2. Generate one BUY + one SELL PENDING command at price ± entry_offset.
+      3. Insert all as PENDING, then immediately submit them.
+
+    Brackets are fast-exit (tp_ticks / sl_ticks from config).
+    Contracts per symbol from config.orders.quantity_per_symbol.
+    """
+    cfg     = get_config()
+    db_path = db_path or Path(cfg.paths.db)
+    init_db(db_path)
+
+    symbols   = cfg.symbols
+    tick      = cfg.orders.tick_size
+    tp_ticks  = getattr(cfg.orders, "tp_ticks", 4)
+    sl_ticks  = getattr(cfg.orders, "sl_ticks", 4)
+
+    qty_map = {}
+    try:
+        qty_map = dict(cfg.orders.quantity_per_symbol)
+    except Exception:
+        pass
+
+    log.info(f"build_trades: symbols={symbols}")
+
+    ibc = IBClient(cfg)
+    try:
+        ibc.connect(live=True, paper=True)
+    except ConnectionError as e:
+        log.error(f"build_trades: IB connection failed: {e}")
+        sys.exit(1)
+
+    register_ib_events(ibc, db_path)
+
+    def _get_price(sym: str) -> float | None:
+        # First: use cached fill price (no delay)
+        with get_db(db_path) as con:
+            p = get_cached_price(con, sym)
+        if p:
+            log.info(f"build_trades: {sym} price from cache: {p}")
+            return p
+        # Fallback: IB paper quote (15-min delay for paper)
+        try:
+            p = ibc.get_price(sym)
+            if p:
+                with get_db(db_path) as con:
+                    update_price_cache(con, sym, p, _now_utc(), source="paper_delayed")
+                log.info(f"build_trades: {sym} price from IB (delayed): {p}")
+                return p
+        except Exception as e:
+            log.warning(f"build_trades: could not get price for {sym}: {e}")
+        return None
+
+    def _rt(p: float) -> float:
+        return round(round(p / tick) * tick, 10)
+
+    inserted = 0
+    for sym in symbols:
+        price = _get_price(sym)
+        if price is None:
+            log.warning(f"build_trades: skipping {sym} — no price available")
+            continue
+
+        qty    = qty_map.get(sym, 1)
+        offset = tick  # 1-tick offset so LMT fills quickly
+
+        for direction in ("BUY", "SELL"):
+            if direction == "BUY":
+                entry = _rt(price - offset)
+                tp    = _rt(entry + tp_ticks * tick)
+                sl    = _rt(entry - sl_ticks * tick)
+            else:
+                entry = _rt(price + offset)
+                tp    = _rt(entry - tp_ticks * tick)
+                sl    = _rt(entry + sl_ticks * tick)
+
+            bracket = tp_ticks * tick
+
+            with get_db(db_path) as con:
+                con.execute("""
+                    INSERT INTO commands
+                        (symbol, line_price, line_type, line_strength,
+                         direction, entry_type, entry_price, tp_price, sl_price,
+                         bracket_size, source, quantity, status)
+                    VALUES (?, ?, ?, 1, ?, 'LMT', ?, ?, ?, ?, 'random_lmt', ?, 'PENDING')
+                """, (sym, entry,
+                      "SUPPORT" if direction == "BUY" else "RESISTANCE",
+                      direction, entry, tp, sl, bracket, qty))
+                cmd_id = con.execute("SELECT last_insert_rowid()").fetchone()[0]
+            log.info(f"build_trades: inserted cmd={cmd_id} {sym} {direction} "
+                     f"entry={entry} tp={tp} sl={sl} qty={qty}")
+            inserted += 1
+
+    log.info(f"build_trades: {inserted} PENDING commands inserted — submitting...")
+
+    # Submit all in one pass
+    submitted = process_pending_commands(ibc, db_path, cfg)
+    log.info(f"build_trades: submitted {submitted}/{inserted} orders")
+
+    ibc.disconnect()
 
 
 def run_broker(db_path=None, dry_run: bool = False):
@@ -489,7 +608,6 @@ def run_broker(db_path=None, dry_run: bool = False):
                     log.error("Reconnect failed after max attempts — aborting broker")
                     # R-ERR-05: abort means trigger shutdown then exit
                     with get_db(db_path) as con:
-                        from lib.db import set_system_state
                         set_system_state(con, "SESSION", "SHUTDOWN")
                     break
 
@@ -656,12 +774,18 @@ def self_test() -> bool:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Galao broker")
-    parser.add_argument("--self-test", action="store_true")
-    parser.add_argument("--dry-run",   action="store_true",
+    parser.add_argument("--self-test",    action="store_true")
+    parser.add_argument("--dry-run",      action="store_true",
                         help="Log commands instead of sending to IB")
+    parser.add_argument("--build-trades", action="store_true",
+                        help="Insert+submit commands for all symbols at current price, then exit")
     args = parser.parse_args()
 
     if args.self_test:
         sys.exit(0 if self_test() else 1)
+
+    if args.build_trades:
+        build_trades()
+        sys.exit(0)
 
     run_broker(dry_run=args.dry_run)

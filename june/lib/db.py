@@ -176,6 +176,14 @@ CREATE TABLE IF NOT EXISTS completed_trades (
     recorded_at  TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
 );
 
+CREATE TABLE IF NOT EXISTS price_cache (
+    symbol          TEXT PRIMARY KEY,
+    last_price      REAL    NOT NULL,
+    last_fill_ts    TEXT    NOT NULL,  -- ISO UTC of the fill that set this price
+    source          TEXT    NOT NULL DEFAULT 'fill',  -- fill | paper_delayed
+    updated_at      TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+);
+
 CREATE INDEX IF NOT EXISTS idx_commands_status      ON commands(status);
 CREATE INDEX IF NOT EXISTS idx_commands_symbol      ON commands(symbol);
 CREATE INDEX IF NOT EXISTS idx_positions_status     ON positions(status);
@@ -275,6 +283,14 @@ def _migrate(path: Path = None):
         "ALTER TABLE commands ADD COLUMN source TEXT",
         "ALTER TABLE commands ADD COLUMN parent_command_id INTEGER",
         "ALTER TABLE commands ADD COLUMN critical_line_id INTEGER REFERENCES critical_lines(id)",
+        # June 2026: price_cache table (CREATE IF NOT EXISTS is idempotent)
+        """CREATE TABLE IF NOT EXISTS price_cache (
+            symbol       TEXT PRIMARY KEY,
+            last_price   REAL NOT NULL,
+            last_fill_ts TEXT NOT NULL,
+            source       TEXT NOT NULL DEFAULT 'fill',
+            updated_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%%H:%%M:%%SZ','now'))
+        )""",
     ]
     with get_db(path) as con:
         for stmt in alter_stmts:
@@ -468,6 +484,35 @@ def get_fetch_log_latest(con, symbol: str, date: str) -> list:
         (symbol, date)
     ).fetchall()
 
+
+
+# ── Price cache helpers ───────────────────────────────────────────────────────
+
+def update_price_cache(con, symbol: str, price: float, fill_ts: str,
+                       source: str = "fill"):
+    """
+    Save or update the last known price for a symbol.
+    Called every time a fill is received — bypasses IB's 15-min paper delay.
+    source: 'fill' (from execDetails) | 'paper_delayed' (from reqMktData fallback)
+    """
+    con.execute(
+        "INSERT INTO price_cache (symbol, last_price, last_fill_ts, source)"
+        " VALUES (?,?,?,?)"
+        " ON CONFLICT(symbol) DO UPDATE SET"
+        "   last_price=excluded.last_price,"
+        "   last_fill_ts=excluded.last_fill_ts,"
+        "   source=excluded.source,"
+        "   updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')",
+        (symbol, price, fill_ts, source)
+    )
+
+
+def get_cached_price(con, symbol: str) -> float | None:
+    """Return the last cached price for symbol, or None if not available."""
+    row = con.execute(
+        "SELECT last_price FROM price_cache WHERE symbol=?", (symbol,)
+    ).fetchone()
+    return row["last_price"] if row else None
 
 
 # ── Self-test ─────────────────────────────────────────────────────────────────
