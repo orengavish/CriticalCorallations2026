@@ -149,9 +149,14 @@ python trader/broker.py --build-trades            # send all pending at once
 | # | Goal | Status |
 |---|------|--------|
 | 1 | june/ folder setup (this file) | ✅ Done |
-| 2 | Fetcher: Google Drive, scheduled, data correctness | in progress |
-| 3 | Backtrader rewrite: DB-first, incremental fetch+simulate | todo |
-| 4 | Broker: --build-trades, bracket traceability, price cache | todo |
+| 2 | Fetcher: Google Drive, scheduled, data correctness | ✅ Done |
+| 3 | Backtrader rewrite: DB-first, incremental fetch+simulate | ✅ Done |
+| 4 | Broker: --build-trades, bracket traceability, price cache | ✅ Done |
+
+### Pending manual steps
+- **Other computer:** remove all scheduler tasks there too (we only cleared this PC)
+- **Google Drive:** add credentials JSON + folder ID to `config.yaml` → set `enabled: true`
+- **Task Scheduler:** `GalaoFetcherJune` registered on this PC at 23:30 daily ✅
 
 Full plan: see `../weekplan_jun6.md`
 

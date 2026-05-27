@@ -11,14 +11,14 @@ $settings = New-ScheduledTaskSettingsSet `
     -ExecutionTimeLimit (New-TimeSpan -Hours 4) `
     -RestartCount 1 `
     -RestartInterval (New-TimeSpan -Minutes 10) `
-    -StartWhenAvailable $true
+    -StartWhenAvailable
 
 Register-ScheduledTask `
     -TaskName    "GalaoFetcherJune" `
     -Action      $action `
     -Trigger     $trigger `
     -Settings    $settings `
-    -Description "Galgo June fetcher — daily 23:30 local. Single computer, all 4 symbols." `
+    -Description "Galgo June fetcher - daily 23:30 local. Single computer, all 4 symbols." `
     -RunLevel    Highest `
     -Force
 

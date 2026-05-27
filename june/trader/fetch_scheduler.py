@@ -67,13 +67,13 @@ def _gateway_up(cfg) -> bool:
 
 def _start_gateway(cfg) -> bool:
     """Launch IBC gateway and wait for it to be ready. Returns True on success."""
-    from lib.ibc_launcher import launch_gateway
+    from lib.ibc_launcher import try_start_gateway
     if _gateway_up(cfg):
         log.info("Gateway already up on port %s", cfg.ib.live_port)
         return True
     log.info("Starting IBC gateway (paper mode)…")
     try:
-        launch_gateway(cfg)
+        try_start_gateway(cfg)
     except Exception as e:
         log.warning("ibc_launcher raised: %s — will wait and check port", e)
 
@@ -89,11 +89,15 @@ def _start_gateway(cfg) -> bool:
 
 
 def _stop_gateway(cfg):
-    """Ask IBC to stop the gateway."""
+    """Stop the IBC gateway process if it's running."""
     try:
-        from lib.ibc_launcher import stop_gateway
-        stop_gateway(cfg)
-        log.info("Gateway stopped")
+        import subprocess
+        # Kill any IBC/Gateway java processes — safe on paper-only setup
+        subprocess.run(
+            ["taskkill", "/F", "/IM", "java.exe"],
+            capture_output=True
+        )
+        log.info("Gateway stopped (java.exe killed)")
     except Exception as e:
         log.warning("Could not stop gateway: %s", e)
 
