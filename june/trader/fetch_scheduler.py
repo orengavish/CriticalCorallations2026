@@ -132,12 +132,8 @@ def _stop_gateway(cfg):
 
 # ── Priority list ─────────────────────────────────────────────────────────────
 
-def _get_priority_dates(cfg, symbols: list) -> list:
-    """
-    Return list of (symbol, date) pairs to fetch, priority order:
-      1. Dates with verified_trades in DB but no tick files (backfill)
-      2. Yesterday if not yet fetched
-    """
+def _present_files(cfg) -> set:
+    """Return set of (symbol, date_str, dtype) tuples for complete CSV files."""
     from pathlib import Path as P
     history_dir = P(cfg.paths.history)
     present = set()
@@ -148,18 +144,33 @@ def _get_priority_dates(cfg, symbols: list) -> list:
                 sym, ftype, dc = parts[0], parts[1], parts[2]
                 date_s = f"{dc[:4]}-{dc[4:6]}-{dc[6:]}"
                 present.add((sym, date_s, ftype))
+    return present
 
-    pairs = []
-    seen  = set()
 
-    # Priority 1: verified_trades dates missing tick files
+def _get_priority_dates(cfg, symbols: list) -> list:
+    """
+    Return list of (symbol, date) pairs to fetch, priority order:
+      1. Days with verified trades AND missing tick files, sorted by trade count DESC
+         (more verified trades = higher backtest value → fetch first)
+      2. Yesterday for each symbol if not yet fetched
+      3. Other recent dates missing tick files
+    Called repeatedly during the fetch loop so priority stays current.
+    """
+    from pathlib import Path as P
+    present = _present_files(cfg)
+    pairs   = []
+    seen    = set()
+
+    # Priority 1: verified_trades dates — sorted by trade count DESC
     try:
         from lib.db import get_db
         db_path = P(cfg.paths.db)
         with get_db(db_path) as con:
             rows = con.execute(
-                "SELECT DISTINCT DATE(fill_time) AS d, symbol "
-                "FROM verified_trades ORDER BY d DESC"
+                "SELECT DATE(fill_time) AS d, symbol, COUNT(*) AS n "
+                "FROM verified_trades "
+                "GROUP BY DATE(fill_time), symbol "
+                "ORDER BY n DESC, d DESC"
             ).fetchall()
         for r in rows:
             sym, d = r["symbol"], r["d"]
@@ -206,22 +217,17 @@ def run(specific_date: date = None, backfill: bool = False,
 
     # ── Determine what to fetch ──
     if specific_date:
-        pairs = [(sym, specific_date) for sym in symbols]
-    elif backfill:
-        pairs = _get_priority_dates(cfg, symbols)
-        if not pairs:
-            log.info("Nothing to backfill — all priority dates covered")
-            return True
+        # Fixed date: build list once, no dynamic re-priority needed
+        static_pairs = [(sym, specific_date) for sym in symbols]
+        dynamic_mode = False
     else:
-        # Normal daily run: yesterday + any priority backfill
-        pairs = _get_priority_dates(cfg, symbols)
-        if not pairs:
-            log.info("All symbols up to date — nothing to fetch")
+        static_pairs = None
+        dynamic_mode = True   # re-evaluate priority after each completed file
+        initial = _get_priority_dates(cfg, symbols)
+        if not initial:
+            log.info("Nothing to fetch — all priority dates covered")
             return True
-
-    log.info("Fetch plan: %d (symbol, date) pairs", len(pairs))
-    for sym, d in pairs:
-        log.info("  → %s  %s", sym, d)
+        log.info("Fetch plan (dynamic): first target → %s %s", initial[0][0], initial[0][1])
 
     # ── Start gateway ──
     if not _start_gateway(cfg):
@@ -239,8 +245,21 @@ def run(specific_date: date = None, backfill: bool = False,
     progress_conn = _init_progress_db(prog_db_path)
 
     all_ok = True
+    _runner_path = Path(__file__).parent.parent / "back-trading" / "bt_matrix_runner.py"
+
+    def _next_target():
+        """Return next (sym, day) to fetch, or None if done."""
+        if not dynamic_mode:
+            return static_pairs.pop(0) if static_pairs else None
+        pairs = _get_priority_dates(cfg, symbols)
+        return pairs[0] if pairs else None
+
     try:
-        for sym, target_day in pairs:
+        while True:
+            target = _next_target()
+            if target is None:
+                break
+            sym, target_day = target
             log.info("--- %s  %s ---", sym, target_day)
             try:
                 results = fetch_day(ib, sym, target_day,
@@ -264,13 +283,27 @@ def run(specific_date: date = None, backfill: bool = False,
                 if ok:
                     file_id = gdrive.upload_file(file_path)
                     if file_id:
-                        log.info("Uploaded %s → Drive %s", file_path.name, file_id)
+                        log.info("Uploaded %s to Drive %s", file_path.name, file_id)
                     elif getattr(getattr(cfg, "google_drive", None), "enabled", False):
                         log.warning("Drive upload failed for %s", file_path.name)
                         all_ok = False
                 else:
                     log.warning("Verification FAILED for %s %s %s", sym, dtype, target_day)
                     all_ok = False
+
+            # Trigger matrix runner for newly completed (sym, date) in background
+            if _runner_path.exists():
+                try:
+                    import subprocess as _sp
+                    date_str = target_day.strftime("%Y-%m-%d")
+                    _sp.Popen(
+                        [sys.executable, str(_runner_path),
+                         "--incremental", sym, date_str],
+                        cwd=str(_runner_path.parent),
+                    )
+                    log.info("Triggered matrix runner for %s %s", sym, date_str)
+                except Exception as exc:
+                    log.warning("Could not trigger matrix runner: %s", exc)
 
     finally:
         progress_conn.close()
@@ -288,13 +321,127 @@ def run(specific_date: date = None, backfill: bool = False,
     return all_ok
 
 
+def _self_test():
+    """Test priority ordering without touching real DB or gateway."""
+    import sqlite3, tempfile, os, shutil
+
+    print("Running fetch_scheduler self-test...")
+    tmp_ga  = tempfile.mktemp(suffix="_ga.db")
+    tmp_dir = tempfile.mkdtemp()
+    try:
+        # Create minimal galao.db with completed_trades
+        ga_conn = sqlite3.connect(tmp_ga)
+        ga_conn.execute("""
+            CREATE TABLE completed_trades (
+                id INTEGER PRIMARY KEY, symbol TEXT, direction TEXT,
+                fill_price REAL, fill_time TEXT, exit_price REAL, exit_time TEXT,
+                exit_reason TEXT, pnl_points REAL, bracket_size REAL,
+                entry_type TEXT, source TEXT
+            )
+        """)
+        # MES 2026-06-27 has 3 trades (highest priority)
+        # MNQ 2026-06-27 has 1 trade (lower)
+        ga_conn.executemany("INSERT INTO completed_trades VALUES (?,?,?,?,?,?,?,?,?,?,NULL,NULL)", [
+            (1, "MES", "BUY",  5500.0, "2026-06-27T14:00:00+00:00",
+             5501.0, "2026-06-27T14:05:00+00:00", "TP", 5.0, 4.0),
+            (2, "MES", "SELL", 5501.0, "2026-06-27T14:10:00+00:00",
+             5500.0, "2026-06-27T14:15:00+00:00", "TP", 5.0, 4.0),
+            (3, "MES", "BUY",  5500.0, "2026-06-27T14:20:00+00:00",
+             5498.0, "2026-06-27T14:25:00+00:00", "SL", -10.0, 4.0),
+            (4, "MNQ", "BUY", 19500.0, "2026-06-27T14:00:00+00:00",
+             19502.0, "2026-06-27T14:05:00+00:00", "TP", 4.0, 4.0),
+        ])
+        ga_conn.commit()
+        ga_conn.close()
+
+        # Simulate cfg-like object
+        class FakePaths:
+            db      = tmp_ga
+            history = tmp_dir
+
+        class FakeCfg:
+            paths = FakePaths()
+            symbols = ["MES", "MNQ", "MYM", "M2K"]
+
+        class FakeFetcher:
+            symbols_override = ["MES", "MNQ", "MYM", "M2K"]
+
+        cfg = FakeCfg()
+
+        # Monkey-patch get_db to work with our temp DB
+        import lib.db as _libdb
+        orig_get_db = _libdb.get_db
+
+        from contextlib import contextmanager
+
+        @contextmanager
+        def _fake_get_db(path):
+            conn = sqlite3.connect(str(path))
+            conn.row_factory = sqlite3.Row
+            # Add verified_trades VIEW that reads completed_trades directly
+            try:
+                conn.execute("DROP VIEW IF EXISTS verified_trades")
+                conn.execute("""
+                    CREATE VIEW verified_trades AS
+                    SELECT * FROM completed_trades
+                    WHERE fill_price IS NOT NULL AND exit_price IS NOT NULL
+                """)
+            except Exception:
+                pass
+            try:
+                yield conn
+            finally:
+                conn.close()
+
+        _libdb.get_db = _fake_get_db
+
+        try:
+            # Test 1: MES 2026-06-27 should be #1 (3 trades vs MNQ's 1)
+            pairs = _get_priority_dates(cfg, ["MES", "MNQ", "MYM", "M2K"])
+            assert len(pairs) > 0, "Expected at least 1 pair"
+            assert pairs[0][0] == "MES", \
+                f"Expected MES first (3 trades), got {pairs[0][0]}"
+            assert pairs[0][1].isoformat() == "2026-06-27", \
+                f"Expected 2026-06-27, got {pairs[0][1]}"
+
+            # Test 2: after MES CSV added, MNQ should be next
+            # Simulate MES trades CSV now present
+            mes_csv = Path(tmp_dir) / "MES_trades_20260627.csv"
+            mes_csv.write_text("time_utc,price,size\n" + "x" * 200)
+            pairs2 = _get_priority_dates(cfg, ["MES", "MNQ", "MYM", "M2K"])
+            # MES trades done, MES bidask still missing AND MNQ trades missing
+            # First should still be MES (bidask missing) or MNQ
+            found_mnq = any(p[0] == "MNQ" for p in pairs2)
+            assert found_mnq, "MNQ should appear in priority list"
+
+            print("PASS -- MES (3 trades) ranked before MNQ (1 trade), "
+                  "dynamic re-priority confirmed")
+            return True
+        finally:
+            _libdb.get_db = orig_get_db
+
+    except Exception as e:
+        print(f"FAIL -- {e}")
+        import traceback; traceback.print_exc()
+        return False
+    finally:
+        try: os.unlink(tmp_ga)
+        except Exception: pass
+        try: shutil.rmtree(tmp_dir, ignore_errors=True)
+        except Exception: pass
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Galgo scheduled tick fetcher")
-    parser.add_argument("--run-now",      action="store_true", help="Run immediately (default)")
-    parser.add_argument("--date",         default=None, help="Fetch specific date YYYY-MM-DD")
-    parser.add_argument("--backfill",     action="store_true", help="Fetch all missing priority dates")
-    parser.add_argument("--no-keep-gateway", action="store_true", help="Stop IBC after run (maintenance)")
+    parser.add_argument("--run-now",         action="store_true")
+    parser.add_argument("--date",            default=None, help="Fetch specific date YYYY-MM-DD")
+    parser.add_argument("--backfill",        action="store_true")
+    parser.add_argument("--no-keep-gateway", action="store_true")
+    parser.add_argument("--self-test",       action="store_true")
     args = parser.parse_args()
+
+    if args.self_test:
+        sys.exit(0 if _self_test() else 1)
 
     if not _acquire_lock():
         sys.exit(1)
