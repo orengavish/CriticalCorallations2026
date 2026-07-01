@@ -11,7 +11,7 @@ ib:
   paper_client_ids: [201, 202, 203, 204, 205, 206, 207, 208, 209, 210]
   reconnect_interval_seconds: 30
   connection_timeout: 5
-  fetcher_client_ids: [801, 802, 803]
+  fetcher_client_ids: [801, 802, 803, 804]
   ibc_startgateway_bat: "C:\\IBC\\StartGateway.bat"
   ibc_mode: paper
 

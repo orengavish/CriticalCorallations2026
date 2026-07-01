@@ -15,3 +15,5 @@ logs/
 *.pptx
 *.csv
 .claude/settings.local.json
+secrets.ini
+*.secret

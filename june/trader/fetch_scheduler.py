@@ -31,6 +31,7 @@ Windows Task Scheduler:
   Note   : adjust UTC time seasonally for CT offset
 """
 
+import os
 import sys
 import time
 import argparse
@@ -50,6 +51,33 @@ CT  = ZoneInfo("America/Chicago")
 UTC = ZoneInfo("UTC")
 
 log = get_logger("fetch_scheduler")
+
+_LOCK_FILE = _ROOT / "data" / "fetch_scheduler.lock"
+
+
+def _acquire_lock() -> bool:
+    """Write PID lock file. Returns True if we got the lock, False if another instance is running."""
+    if _LOCK_FILE.exists():
+        try:
+            pid = int(_LOCK_FILE.read_text().strip())
+            import psutil
+            if psutil.pid_exists(pid):
+                proc = psutil.Process(pid)
+                if any("fetch_scheduler" in " ".join(p) for p in [proc.cmdline()]):
+                    log.warning("Another fetch_scheduler is already running (pid=%d) — exiting", pid)
+                    return False
+        except Exception:
+            pass  # stale lock — overwrite it
+    _LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    _LOCK_FILE.write_text(str(os.getpid()))
+    return True
+
+
+def _release_lock():
+    try:
+        _LOCK_FILE.unlink(missing_ok=True)
+    except Exception:
+        pass
 
 
 # ── IBC helpers ───────────────────────────────────────────────────────────────
@@ -165,7 +193,7 @@ def _get_priority_dates(cfg, symbols: list) -> list:
 # ── Main run ──────────────────────────────────────────────────────────────────
 
 def run(specific_date: date = None, backfill: bool = False,
-        keep_gateway: bool = False) -> bool:
+        keep_gateway: bool = True) -> bool:
     """
     Execute one full fetch cycle.
     Returns True if all fetches succeeded and verified.
@@ -250,6 +278,8 @@ def run(specific_date: date = None, backfill: bool = False,
             ib.disconnect()
         except Exception:
             pass
+        # Gateway stays running — watchdog manages it 24/7.
+        # Pass --no-keep-gateway CLI flag to stop after fetch (maintenance only).
         if not keep_gateway:
             _stop_gateway(cfg)
 
@@ -263,11 +293,18 @@ if __name__ == "__main__":
     parser.add_argument("--run-now",      action="store_true", help="Run immediately (default)")
     parser.add_argument("--date",         default=None, help="Fetch specific date YYYY-MM-DD")
     parser.add_argument("--backfill",     action="store_true", help="Fetch all missing priority dates")
-    parser.add_argument("--keep-gateway", action="store_true", help="Don't stop IBC after run")
+    parser.add_argument("--no-keep-gateway", action="store_true", help="Stop IBC after run (maintenance)")
     args = parser.parse_args()
 
-    specific = date.fromisoformat(args.date) if args.date else None
-    success  = run(specific_date=specific,
-                   backfill=args.backfill,
-                   keep_gateway=args.keep_gateway)
+    if not _acquire_lock():
+        sys.exit(1)
+
+    try:
+        specific = date.fromisoformat(args.date) if args.date else None
+        success  = run(specific_date=specific,
+                       backfill=args.backfill,
+                       keep_gateway=not args.no_keep_gateway)
+    finally:
+        _release_lock()
+
     sys.exit(0 if success else 1)

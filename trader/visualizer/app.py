@@ -56,6 +56,8 @@ log = get_logger("visualizer")
 app = Flask(__name__, template_folder="templates", static_folder="static")
 _cfg = None
 _db_path = None
+_fetch_proc = None        # tracked fetcher process
+_fetch_rate_state = {}    # "SYM_DTYPE" -> {ts, records} for server-side rate
 
 
 def _get_cfg():
@@ -394,13 +396,14 @@ def api_generate():
 
     cfg  = _get_cfg()
     tick = cfg.orders.tick_size
-    sym  = (cfg.symbols or ["MES"])[0]
+    gen_symbols = _fetch_symbols() or ["MES", "MNQ", "MYM", "M2K"]
+    sym  = (cfg.symbols or gen_symbols)[0]  # for critical_line mode
 
     def rt(p):
         return round(round(p / tick) * tick, 10)
 
-    def _make_cmd(anchor_price, direction, entry_type, source, critical_line_id=None,
-                  line_type=None, strength=1):
+    def _make_cmd(anchor_price, direction, entry_type, source, symbol=None,
+                  critical_line_id=None, line_type=None, strength=1):
         offset = _rnd.randint(1, max(1, max_offset)) * tick
         if entry_type == "MKT":
             ep = rt(anchor_price)
@@ -411,7 +414,7 @@ def api_generate():
         tp = rt(ep + bracket) if direction == "BUY" else rt(ep - bracket)
         sl = rt(ep - bracket) if direction == "BUY" else rt(ep + bracket)
         return {
-            "symbol":           sym,
+            "symbol":           symbol or sym,
             "line_price":       anchor_price,
             "line_type":        line_type or ("SUPPORT" if direction == "BUY" else "RESISTANCE"),
             "line_strength":    strength,
@@ -514,23 +517,26 @@ def api_generate():
                  f"bracket={bracket}")
 
     else:
-        # ── Random mode (existing behaviour) ─────────────────────────────────
-        for _ in range(count):
-            entry_type = _rnd.choice(types)
-            direction  = _rnd.choice(["BUY", "SELL"])
-            trade = _make_cmd(
-                anchor_price = price,
-                direction    = direction,
-                entry_type   = entry_type,
-                source       = f"random_{entry_type.lower()}",
-            )
-            cmd_id = _insert(trade)
-            inserted.append({
-                "id": cmd_id, "direction": direction, "entry_type": entry_type,
-                "entry_price": trade["entry_price"],
-            })
+        # ── Random mode — generate `count` commands per symbol ────────────────
+        for s in gen_symbols:
+            for _ in range(count):
+                entry_type = _rnd.choice(types)
+                direction  = _rnd.choice(["BUY", "SELL"])
+                trade = _make_cmd(
+                    anchor_price = price,
+                    direction    = direction,
+                    entry_type   = entry_type,
+                    source       = f"random_{entry_type.lower()}",
+                    symbol       = s,
+                )
+                cmd_id = _insert(trade)
+                inserted.append({
+                    "id": cmd_id, "symbol": s, "direction": direction,
+                    "entry_type": entry_type, "entry_price": trade["entry_price"],
+                })
 
-        log.info(f"[generate] random: {len(inserted)} cmds near price={price} bracket={bracket}")
+        log.info(f"[generate] random: {len(inserted)} cmds ({len(gen_symbols)} syms × {count}) "
+                 f"near price={price} bracket={bracket}")
 
     return jsonify({"count": len(inserted), "price": price, "commands": inserted})
 
@@ -1128,39 +1134,100 @@ def _fetch_symbols():
 
 @app.route("/api/fetch-status")
 def api_fetch_status():
-    from datetime import date as date_cls, timedelta
+    """Fetch status grid from june project's fetch_progress.db + history CSVs."""
+    import sqlite3 as _sq3
+    from datetime import date as date_cls, datetime, timedelta, timezone
+
     today = date_cls.today()
     days = []
     d = today
-    while len(days) < 30:
+    while len(days) < 45:
         if _is_trading_day(d):
             days.append(d.strftime("%Y-%m-%d"))
         d -= timedelta(days=1)
 
-    symbols = _fetch_symbols()
+    symbols = _fetch_symbols() or ["MES", "MNQ", "MYM", "M2K"]
 
-    with get_db(_get_db_path()) as con:
-        rows = con.execute(
-            "SELECT symbol, date, file_type, status, rows_fetched, error_msg"
-            " FROM fetch_log ORDER BY fetched_at DESC"
-        ).fetchall()
+    # Build lookup from june fetch_progress.db
+    lookup: dict = {}  # (sym, date, dtype) -> {status, rows, pct, rate_ks, age_s}
+    june_db   = _june_fetch_db()
+    hist_dir  = _june_history_dir()
+    now_utc   = datetime.now(timezone.utc)
 
-    # Build lookup: (symbol, date, file_type) -> best status
-    lookup: dict = {}
-    for r in rows:
-        key = (r["symbol"], r["date"], r["file_type"])
-        if key not in lookup:   # newest first, so first wins
-            lookup[key] = {"status": r["status"],
-                           "rows": r["rows_fetched"],
-                           "error": r["error_msg"]}
+    # Scan CSV files in history dir for completed files
+    csv_present: set = set()
+    csv_rows: dict   = {}
+    if hist_dir.exists():
+        for f in hist_dir.glob("*.csv"):
+            if f.stat().st_size < 100:
+                continue
+            parts = f.stem.split("_")
+            if len(parts) >= 3:
+                sym  = parts[0]
+                ftyp = parts[1]      # "trades" or "bidask"
+                dc   = parts[2]
+                ds   = f"{dc[:4]}-{dc[4:6]}-{dc[6:]}"
+                csv_present.add((sym, ds, ftyp))
 
-    result = {}
+    if june_db.exists():
+        try:
+            con = _sq3.connect(str(june_db))
+            con.row_factory = _sq3.Row
+            rows = con.execute(
+                "SELECT symbol, date, data_type, records_fetched, finished, updated_at"
+                " FROM fetch_progress"
+            ).fetchall()
+            con.close()
+            for r in rows:
+                sym   = r["symbol"]
+                ds    = r["date"]
+                dtype = r["data_type"].lower()   # TRADES -> trades
+                rec   = r["records_fetched"] or 0
+                done  = bool(r["finished"])
+                age_s = None
+                try:
+                    upd = r["updated_at"]
+                    if upd:
+                        dt_obj = datetime.fromisoformat(upd.replace("Z", "+00:00"))
+                        if dt_obj.tzinfo is None:
+                            dt_obj = dt_obj.replace(tzinfo=timezone.utc)
+                        age_s = round((now_utc - dt_obj).total_seconds())
+                except Exception:
+                    pass
+
+                is_csv = (sym, ds, dtype) in csv_present
+                if done or is_csv:
+                    status = "ok"
+                elif rec > 0 and age_s is not None and age_s < 90:
+                    status = "active"
+                elif rec > 0:
+                    status = "stale"
+                else:
+                    status = "missing"
+
+                key = (sym, ds, dtype)
+                lookup[key] = {
+                    "status": status,
+                    "rows": rec,
+                    "age_s": age_s,
+                    "error": None,
+                }
+        except Exception as exc:
+            log.warning("fetch-status DB error: %s", exc)
+
+    # Also mark CSVs present but not in DB as ok
+    for (sym, ds, dtype) in csv_present:
+        if (sym, ds, dtype) not in lookup:
+            lookup[(sym, ds, dtype)] = {"status": "ok", "rows": None, "age_s": None, "error": None}
+
+    result: dict = {}
     for ds in days:
         result[ds] = {}
         for sym in symbols:
-            trades = lookup.get((sym, ds, "trades"))
-            bidask = lookup.get((sym, ds, "bidask"))
-            result[ds][sym] = {"trades": trades, "bidask": bidask}
+            result[ds][sym] = {
+                "trades": lookup.get((sym, ds, "trades")),
+                "bidask": lookup.get((sym, ds, "bidask")),
+            }
 
     return jsonify({"days": days, "symbols": symbols, "grid": result})
 
@@ -1180,6 +1247,192 @@ def api_fetch_now():
         cwd=str(Path(__file__).parent.parent)
     )
     return jsonify({"started": True, "symbol": symbol, "date": date_str})
+
+
+def _june_fetch_db():
+    return Path(__file__).parent.parent.parent / "june" / "trader" / "data" / "fetch_progress.db"
+
+
+def _june_history_dir():
+    return Path(__file__).parent.parent.parent / "june" / "trader" / "data" / "history"
+
+
+@app.route("/api/fetch-live")
+def api_fetch_live():
+    """
+    Per-slot live progress: track the most recently active row for each
+    (symbol, data_type) so rate reflects the currently downloading date.
+    """
+    import sqlite3 as _sq3, time as _time
+    from datetime import datetime, timezone
+
+    symbols = _fetch_symbols() or ["MES", "MNQ", "MYM", "M2K"]
+    dtypes  = ["TRADES", "BID_ASK"]
+    result  = {sym: {} for sym in symbols}
+
+    june_db = _june_fetch_db()
+    if not june_db.exists():
+        for sym in symbols:
+            for dtype in dtypes:
+                result[sym][dtype] = {"status": "missing", "records": 0, "pct": None,
+                                      "finished": False, "rate_ks": None, "age_s": None}
+        return jsonify({"data": result, "symbols": symbols})
+
+    now_mono = _time.monotonic()
+    now_utc  = datetime.now(timezone.utc)
+    _FALLBACK = {"TRADES": 400_000, "BID_ASK": 600_000}
+
+    try:
+        con = _sq3.connect(str(june_db))
+        con.row_factory = _sq3.Row
+        all_rows = con.execute(
+            "SELECT symbol, date, data_type, records_fetched, finished, updated_at"
+            " FROM fetch_progress"
+        ).fetchall()
+        con.close()
+
+        def _age(upd):
+            try:
+                dt_obj = datetime.fromisoformat((upd or "").replace("Z", "+00:00"))
+                if dt_obj.tzinfo is None:
+                    dt_obj = dt_obj.replace(tzinfo=timezone.utc)
+                return round((now_utc - dt_obj).total_seconds())
+            except Exception:
+                return None
+
+        # Group by (symbol, data_type)
+        from collections import defaultdict
+        by_slot = defaultdict(list)
+        for r in all_rows:
+            by_slot[(r["symbol"], r["data_type"])].append(r)
+
+        for sym in symbols:
+            for dtype in dtypes:
+                rows = by_slot.get((sym, dtype), [])
+                n_total = len(rows)
+                n_done  = sum(1 for r in rows if r["finished"])
+
+                # Find the most recently updated unfinished row (what's being fetched now)
+                active_rows = [r for r in rows if not r["finished"]]
+                active_rows.sort(key=lambda r: r["updated_at"] or "", reverse=True)
+                active_row = active_rows[0] if active_rows else None
+
+                # Per-date target from median of finished rows
+                finished_counts = [r["records_fetched"] for r in rows
+                                   if r["finished"] and r["records_fetched"] > 1000]
+                if finished_counts:
+                    finished_counts.sort()
+                    target = finished_counts[len(finished_counts) // 2]
+                else:
+                    target = _FALLBACK.get(dtype, 400_000)
+
+                if active_row:
+                    rec   = active_row["records_fetched"] or 0
+                    age_s = _age(active_row["updated_at"])
+                    pct   = min(100, round(rec / target * 100)) if target > 0 else 0
+
+                    # Rate: rolling 90-second history so bursts between polls are captured
+                    key = f"{sym}_{dtype}"
+                    if key not in _fetch_rate_state:
+                        _fetch_rate_state[key] = []
+                    hist = _fetch_rate_state[key]
+                    if isinstance(hist, dict):          # migrate old format
+                        hist = []
+                        _fetch_rate_state[key] = hist
+                    cur_date = active_row["date"]
+                    # Reset history if fetcher moved to a new date
+                    if hist and hist[-1].get("date") != cur_date:
+                        hist.clear()
+                    hist.append({"ts": now_mono, "records": rec, "date": cur_date})
+                    # Keep last 90 seconds
+                    cutoff = now_mono - 90
+                    while len(hist) > 1 and hist[0]["ts"] < cutoff:
+                        hist.pop(0)
+                    rate_ks = None
+                    if len(hist) >= 2:
+                        dt_sec = hist[-1]["ts"] - hist[0]["ts"]
+                        dr     = hist[-1]["records"] - hist[0]["records"]
+                        if dt_sec > 1.0:
+                            rate_ks = round(max(0.0, dr / dt_sec / 1000), 2)
+
+                    is_active = age_s is not None and age_s < 90
+                    status    = "active" if is_active else "stale"
+                    result[sym][dtype] = {
+                        "status":   status,
+                        "records":  rec,
+                        "pct":      pct,
+                        "finished": False,
+                        "dates":    f"{n_done}/{n_total}",
+                        "cur_date": active_row["date"],
+                        "rate_ks":  rate_ks,
+                        "age_s":    age_s,
+                    }
+                elif n_done > 0:
+                    result[sym][dtype] = {
+                        "status":  "done",
+                        "records": sum(r["records_fetched"] for r in rows),
+                        "pct":     100,
+                        "finished": True,
+                        "dates":   f"{n_done}/{n_total}",
+                        "rate_ks": None, "age_s": None,
+                    }
+                else:
+                    result[sym][dtype] = {
+                        "status": "missing", "records": 0, "pct": None,
+                        "finished": False, "rate_ks": None, "age_s": None,
+                    }
+
+    except Exception as exc:
+        log.warning("fetch-live error: %s", exc)
+
+    for sym in symbols:
+        for dtype in dtypes:
+            if dtype not in result[sym]:
+                result[sym][dtype] = {"status": "missing", "records": 0, "pct": None,
+                                      "finished": False, "rate_ks": None, "age_s": None}
+
+    return jsonify({"data": result, "symbols": symbols})
+
+
+@app.route("/api/fetch-start", methods=["POST"])
+def api_fetch_start():
+    global _fetch_proc
+    import subprocess as _sp
+    if _fetch_proc and _fetch_proc.poll() is None:
+        return jsonify({"status": "already_running", "pid": _fetch_proc.pid})
+    june_trader = Path(__file__).parent.parent.parent / "june" / "trader"
+    scheduler = june_trader / "fetch_scheduler.py"
+    if not scheduler.exists():
+        return jsonify({"error": "fetch_scheduler.py not found"}), 404
+    _fetch_proc = _sp.Popen(
+        [sys.executable, str(scheduler), "--backfill"],
+        cwd=str(june_trader),
+    )
+    return jsonify({"status": "started", "pid": _fetch_proc.pid})
+
+
+@app.route("/api/fetch-stop", methods=["POST"])
+def api_fetch_stop():
+    global _fetch_proc
+    if _fetch_proc is None or _fetch_proc.poll() is not None:
+        return jsonify({"status": "not_running"})
+    _fetch_proc.terminate()
+    try:
+        _fetch_proc.wait(timeout=5)
+    except Exception:
+        _fetch_proc.kill()
+    pid = _fetch_proc.pid
+    _fetch_proc = None
+    return jsonify({"status": "stopped", "pid": pid})
+
+
+@app.route("/api/fetch-proc-status")
+def api_fetch_proc_status():
+    global _fetch_proc
+    if _fetch_proc is None:
+        return jsonify({"running": False})
+    running = _fetch_proc.poll() is None
+    return jsonify({"running": running, "pid": _fetch_proc.pid if running else None})
 
 
 @app.route("/fetch-status")
@@ -1421,11 +1674,89 @@ def self_test() -> bool:
         return False
 
 
+def _cmdline_running(script_path: str) -> bool:
+    """Return True if a python process with script_path in its command line is running."""
+    import subprocess as _sp
+    try:
+        import psutil
+        for p in psutil.process_iter(["cmdline"]):
+            try:
+                if any(script_path in (c or "") for c in (p.info["cmdline"] or [])):
+                    return True
+            except Exception:
+                pass
+        return False
+    except ImportError:
+        pass
+    try:
+        r = _sp.run(
+            ["wmic", "process", "where", "name='python.exe'", "get", "CommandLine"],
+            capture_output=True, text=True, timeout=8,
+        )
+        return script_path in (r.stdout or "")
+    except Exception:
+        return False
+
+
+def _auto_start_bg():
+    """Start this project's broker + decider if not already running."""
+    import subprocess as _sp
+    trader_dir = Path(__file__).parent.parent  # C:\Projects\Galgo2026\trader
+
+    for script in ("broker.py", "decider.py"):
+        path = trader_dir / script
+        if not path.exists():
+            log.warning("auto-start: %s not found", path)
+            continue
+        if _cmdline_running(str(path)):
+            log.info("auto-start: %s already running", script)
+            continue
+        try:
+            _sp.Popen(
+                [sys.executable, str(path)],
+                cwd=str(trader_dir),
+                creationflags=_sp.CREATE_NEW_CONSOLE,
+            )
+            log.info("auto-start: launched %s", script)
+        except Exception as exc:
+            log.warning("auto-start: could not launch %s: %s", script, exc)
+
+
+def _auto_start_fetcher():
+    """Start backfill fetcher if not already running. Tracks process in _fetch_proc."""
+    global _fetch_proc
+    import subprocess as _sp
+    june_trader = Path(__file__).parent.parent.parent / "june" / "trader"
+    scheduler   = june_trader / "fetch_scheduler.py"
+    if not scheduler.exists():
+        log.warning("auto-start fetcher: fetch_scheduler.py not found")
+        return
+
+    # Already running (tracked process or external)
+    if _fetch_proc and _fetch_proc.poll() is None:
+        log.info("auto-start fetcher: already tracked (pid %s)", _fetch_proc.pid)
+        return
+    if _cmdline_running(str(scheduler)):
+        log.info("auto-start fetcher: already running (external process)")
+        return
+
+    try:
+        _fetch_proc = _sp.Popen(
+            [sys.executable, str(scheduler), "--backfill"],
+            cwd=str(june_trader),
+        )
+        log.info("auto-start fetcher: launched --backfill (pid %s)", _fetch_proc.pid)
+    except Exception as exc:
+        log.warning("auto-start fetcher: could not launch: %s", exc)
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Galao visualizer")
     parser.add_argument("--self-test", action="store_true")
     parser.add_argument("--no-price-feed", action="store_true",
                         help="Skip IB price feed thread (useful for testing)")
+    parser.add_argument("--no-auto-start", action="store_true",
+                        help="Skip auto-starting broker/decider")
     args = parser.parse_args()
 
     if args.self_test:
@@ -1433,6 +1764,10 @@ if __name__ == "__main__":
 
     cfg = get_config()
     init_db(Path(cfg.paths.db))
+
+    if not args.no_auto_start:
+        _auto_start_bg()
+        _auto_start_fetcher()
 
     if not args.no_price_feed:
         import atexit

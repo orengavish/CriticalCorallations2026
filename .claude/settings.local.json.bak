@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(pip *)",
+      "PowerShell(winget *)",
+      "PowerShell($env:PATH = [System.Environment]::GetEnvironmentVariable\\(\"PATH\",\"Machine\"\\) + \";\" + [System.Environment]::GetEnvironmentVariable\\(\"PATH\",\"User\"\\); python --version; git --version)",
+      "PowerShell(git clone *)",
+      "PowerShell($env:PATH = [System.Environment]::GetEnvironmentVariable\\(\"PATH\",\"Machine\"\\) + \";\" + [System.Environment]::GetEnvironmentVariable\\(\"PATH\",\"User\"\\); cd C:\\\\Projects\\\\galgo2026; git status 2>&1; Get-ChildItem -Depth 1 | Select-Object Name)",
+      "PowerShell(git *)",
+      "PowerShell(git fetch *)",
+      "PowerShell(git checkout *)",
+      "Skill(update-config)",
+      "PowerShell(Copy-Item *)"
+    ]
+  }
+}

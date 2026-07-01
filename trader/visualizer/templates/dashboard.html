@@ -163,15 +163,110 @@
   </div>
 </div>
 
-<div style="display:flex;gap:16px;align-items:flex-start">
+<style>
+.fetch-sym-card{background:#0d1117;border:1px solid #21262d;border-radius:4px;padding:6px 8px;display:flex;flex-direction:column;gap:4px;min-height:0;overflow:hidden}
+.fetch-sym-name{font-size:11px;font-weight:bold;color:#58a6ff;margin-bottom:1px}
+.fsl{font-size:9px;color:#8b949e;font-weight:bold;min-width:9px}
+.fbar-wrap{flex:1;height:5px;background:#21262d;border-radius:3px;overflow:hidden}
+.fbar-fill{height:100%;width:0%;background:#d29922;border-radius:3px;transition:width .6s}
+.fbar-fill.fdone{background:#3fb950}
+.fpct{font-size:9px;color:#8b949e;min-width:28px;text-align:right;font-family:monospace}
+.fdetail{display:flex;justify-content:space-between;padding-left:13px}
+.fcount{font-size:9px;color:#c9d1d9;font-family:monospace}
+.frate{font-size:9px;font-family:monospace}
+@keyframes fpulse{0%,100%{opacity:1}50%{opacity:.3}}
+.fbar-fill.factive{animation:fpulse 1.8s ease-in-out infinite}
+</style>
 
-  <!-- ── Price Ladder ───────────────────────────────────────────── -->
-  <div class="card" style="min-width:380px;flex:0 0 380px">
-    <h2>Price Ladder <span id="refresh-indicator" style="font-size:10px;color:#6e7681"></span></h2>
-    <div id="ladder" class="ladder" style="margin-top:8px">
-      <div style="color:#6e7681;font-size:11px">Loading...</div>
+<div style="display:flex;gap:16px;align-items:stretch">
+
+  <!-- ── Left column: Price Ladder + Fetch Panel ────────────────── -->
+  <div style="flex:0 0 380px;min-width:380px;display:flex;flex-direction:column;gap:10px">
+
+    <!-- Price Ladder -->
+    <div class="card">
+      <h2>Price Ladder <span id="refresh-indicator" style="font-size:10px;color:#6e7681"></span></h2>
+      <div id="ladder" class="ladder" style="margin-top:8px">
+        <div style="color:#6e7681;font-size:11px">Loading...</div>
+      </div>
     </div>
-  </div>
+
+    <!-- Fetch Panel -->
+    <div class="card" style="flex:1;overflow:hidden;display:flex;flex-direction:column;padding:10px 12px">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+        <span style="font-size:11px;font-weight:bold;color:#8b949e;text-transform:uppercase;letter-spacing:.5px">
+          Fetch Progress <span id="fetch-running-dot" style="display:none;width:6px;height:6px;border-radius:50%;background:#d29922;display:inline-block;vertical-align:middle;animation:fpulse 1.5s infinite"></span>
+        </span>
+        <span style="display:flex;gap:4px;align-items:center">
+          <span id="fetch-ts" style="font-size:9px;color:#6e7681;margin-right:4px"></span>
+          <button id="btn-fetch-start" onclick="doFetchStart()"
+            style="font-size:9px;padding:2px 7px;background:#1a2d1a;color:#3fb950;border:1px solid #3fb950;border-radius:3px;cursor:pointer;font-family:monospace">
+            ▶ Fetch
+          </button>
+          <button id="btn-fetch-stop" onclick="doFetchStop()"
+            style="font-size:9px;padding:2px 7px;background:#2d1a1a;color:#f85149;border:1px solid #f85149;border-radius:3px;cursor:pointer;font-family:monospace;display:none">
+            ■ Stop
+          </button>
+        </span>
+      </div>
+      <div id="fetch-grid" style="flex:1;display:grid;grid-template-columns:1fr 1fr;grid-template-rows:1fr 1fr;gap:8px;overflow:hidden">
+
+        <!-- MES -->
+        <div class="fetch-sym-card" data-sym="MES">
+          <div class="fetch-sym-name">MES</div>
+          <div class="fetch-slot" data-dtype="TRADES">
+            <div style="display:flex;align-items:center;gap:4px"><span class="fsl">T</span><div class="fbar-wrap"><div class="fbar-fill"></div></div><span class="fpct">—</span></div>
+            <div class="fdetail"><span class="fcount">—</span><span class="frate" style="color:#6e7681">—</span></div>
+          </div>
+          <div class="fetch-slot" data-dtype="BID_ASK">
+            <div style="display:flex;align-items:center;gap:4px"><span class="fsl">B</span><div class="fbar-wrap"><div class="fbar-fill"></div></div><span class="fpct">—</span></div>
+            <div class="fdetail"><span class="fcount">—</span><span class="frate" style="color:#6e7681">—</span></div>
+          </div>
+        </div>
+
+        <!-- MNQ -->
+        <div class="fetch-sym-card" data-sym="MNQ">
+          <div class="fetch-sym-name">MNQ</div>
+          <div class="fetch-slot" data-dtype="TRADES">
+            <div style="display:flex;align-items:center;gap:4px"><span class="fsl">T</span><div class="fbar-wrap"><div class="fbar-fill"></div></div><span class="fpct">—</span></div>
+            <div class="fdetail"><span class="fcount">—</span><span class="frate" style="color:#6e7681">—</span></div>
+          </div>
+          <div class="fetch-slot" data-dtype="BID_ASK">
+            <div style="display:flex;align-items:center;gap:4px"><span class="fsl">B</span><div class="fbar-wrap"><div class="fbar-fill"></div></div><span class="fpct">—</span></div>
+            <div class="fdetail"><span class="fcount">—</span><span class="frate" style="color:#6e7681">—</span></div>
+          </div>
+        </div>
+
+        <!-- MYM -->
+        <div class="fetch-sym-card" data-sym="MYM">
+          <div class="fetch-sym-name">MYM</div>
+          <div class="fetch-slot" data-dtype="TRADES">
+            <div style="display:flex;align-items:center;gap:4px"><span class="fsl">T</span><div class="fbar-wrap"><div class="fbar-fill"></div></div><span class="fpct">—</span></div>
+            <div class="fdetail"><span class="fcount">—</span><span class="frate" style="color:#6e7681">—</span></div>
+          </div>
+          <div class="fetch-slot" data-dtype="BID_ASK">
+            <div style="display:flex;align-items:center;gap:4px"><span class="fsl">B</span><div class="fbar-wrap"><div class="fbar-fill"></div></div><span class="fpct">—</span></div>
+            <div class="fdetail"><span class="fcount">—</span><span class="frate" style="color:#6e7681">—</span></div>
+          </div>
+        </div>
+
+        <!-- M2K -->
+        <div class="fetch-sym-card" data-sym="M2K">
+          <div class="fetch-sym-name">M2K</div>
+          <div class="fetch-slot" data-dtype="TRADES">
+            <div style="display:flex;align-items:center;gap:4px"><span class="fsl">T</span><div class="fbar-wrap"><div class="fbar-fill"></div></div><span class="fpct">—</span></div>
+            <div class="fdetail"><span class="fcount">—</span><span class="frate" style="color:#6e7681">—</span></div>
+          </div>
+          <div class="fetch-slot" data-dtype="BID_ASK">
+            <div style="display:flex;align-items:center;gap:4px"><span class="fsl">B</span><div class="fbar-wrap"><div class="fbar-fill"></div></div><span class="fpct">—</span></div>
+            <div class="fdetail"><span class="fcount">—</span><span class="frate" style="color:#6e7681">—</span></div>
+          </div>
+        </div>
+
+      </div><!-- /fetch-grid -->
+    </div><!-- /fetch panel -->
+
+  </div><!-- /left-col -->
 
   <!-- ── Active commands ───────────────────────────────────────── -->
   <div class="card" style="flex:1;overflow-x:auto">
@@ -514,5 +609,90 @@ function doFlattenAll(){
     .catch(e=>{ st.style.color='#f85149'; st.textContent='✗ '+e; })
     .finally(()=>{ btn.disabled=false; });
 }
+
+// ── Fetch Start / Stop ───────────────────────────────────────────────────────
+function doFetchStart() {
+  fetch('/api/fetch-start', {method:'POST'}).then(r=>r.json()).then(d=>{
+    console.log('fetch start:', d);
+    _updateFetchButtons(true);
+  }).catch(()=>{});
+}
+function doFetchStop() {
+  fetch('/api/fetch-stop', {method:'POST'}).then(r=>r.json()).then(d=>{
+    console.log('fetch stop:', d);
+    _updateFetchButtons(false);
+  }).catch(()=>{});
+}
+function _updateFetchButtons(running) {
+  document.getElementById('btn-fetch-start').style.display = running ? 'none' : '';
+  document.getElementById('btn-fetch-stop').style.display  = running ? '' : 'none';
+  const dot = document.getElementById('fetch-running-dot');
+  if (dot) dot.style.display = running ? 'inline-block' : 'none';
+}
+(function pollFetchProc() {
+  fetch('/api/fetch-proc-status').then(r=>r.json()).then(d=>_updateFetchButtons(d.running)).catch(()=>{});
+  setTimeout(pollFetchProc, 8000);
+})();
+
+// ── Fetch Progress Panel ─────────────────────────────────────────────────────
+function _fUpdate(d) {
+  document.getElementById('fetch-ts').textContent = new Date().toLocaleTimeString();
+  const syms = ['MES','MNQ','MYM','M2K'];
+  const dtypes = ['TRADES','BID_ASK'];
+  for (const sym of syms) {
+    const card = document.querySelector(`.fetch-sym-card[data-sym="${sym}"]`);
+    if (!card) continue;
+    for (const dtype of dtypes) {
+      const slot = card.querySelector(`.fetch-slot[data-dtype="${dtype}"]`);
+      if (!slot) continue;
+      const sd = ((d.data||{})[sym]||{})[dtype] || null;
+      const bar   = slot.querySelector('.fbar-fill');
+      const pctEl = slot.querySelector('.fpct');
+      const cntEl = slot.querySelector('.fcount');
+      const rateEl= slot.querySelector('.frate');
+
+      if (!sd || sd.status==='missing' || sd.status==='idle') {
+        bar.style.width='0%'; bar.className='fbar-fill';
+        pctEl.textContent='—'; cntEl.textContent='—';
+        rateEl.textContent='—'; rateEl.style.color='#6e7681'; continue;
+      }
+
+      const rec  = sd.records||0;
+      const pct  = sd.pct!=null ? sd.pct : 0;
+      const done = sd.finished;
+      const active = sd.status==='active';
+      const stale  = sd.status==='stale';
+
+      bar.style.width = Math.min(pct,100)+'%';
+      bar.className = 'fbar-fill'+(done?' fdone':active?' factive':'');
+      if (done) bar.style.background='#3fb950';
+      else if (stale) bar.style.background='#9e6a03';
+      else bar.style.background='#d29922';
+
+      pctEl.textContent = sd.pct!=null ? pct+'%' : '?%';
+      const dates = sd.dates ? ` (${sd.dates})` : '';
+      const dateHint = sd.cur_date ? ' '+sd.cur_date.slice(5) : (dates||'');
+      cntEl.textContent = rec>0 ? (rec/1000).toFixed(1)+'k'+dateHint : '—';
+
+      if (done) {
+        rateEl.textContent='✓'; rateEl.style.color='#3fb950';
+      } else if (sd.rate_ks!==null && sd.rate_ks!==undefined && sd.rate_ks>0) {
+        rateEl.textContent='+'+sd.rate_ks.toFixed(1)+'k/s'; rateEl.style.color='#d29922';
+      } else if (stale) {
+        const age = sd.age_s!=null ? Math.round(sd.age_s/60)+'m ago' : '';
+        rateEl.textContent='stale'+( age?' '+age:''); rateEl.style.color='#9e6a03';
+      } else if (active) {
+        rateEl.textContent='calc…'; rateEl.style.color='#d29922';
+      } else {
+        rateEl.textContent='idle'; rateEl.style.color='#6e7681';
+      }
+    }
+  }
+}
+
+(function pollFetch() {
+  fetch('/api/fetch-live').then(r=>r.json()).then(_fUpdate).catch(()=>{});
+  setTimeout(pollFetch, 3000);
+})();
 </script>
 {% endblock %}

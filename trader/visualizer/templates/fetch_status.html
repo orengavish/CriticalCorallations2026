@@ -2,15 +2,28 @@
 {% block title %}Fetch Status — Galao{% endblock %}
 
 {% block content %}
-<h2>Fetch Status <span id="refresh-indicator"></span></h2>
+<div style="display:flex;align-items:center;gap:14px;margin-bottom:12px;flex-wrap:wrap">
+  <h2 style="margin:0">Fetch Status <span id="refresh-indicator" style="font-size:10px;color:#6e7681"></span></h2>
+  <button id="btn-fetch-all" onclick="doFetchAll()"
+    style="font-family:monospace;font-size:12px;padding:5px 16px;background:#1a2d1a;color:#3fb950;
+           border:1px solid #3fb950;border-radius:4px;cursor:pointer;font-weight:bold">
+    ▶ Fetch All Missing
+  </button>
+  <button id="btn-fetch-stop" onclick="doFetchStop()"
+    style="font-family:monospace;font-size:12px;padding:5px 16px;background:#2d1a1a;color:#f85149;
+           border:1px solid #f85149;border-radius:4px;cursor:pointer;font-weight:bold;display:none">
+    ■ Stop Fetch
+  </button>
+  <span id="fetch-msg" style="font-size:12px;color:#8b949e;min-height:18px"></span>
+</div>
 
-<div class="card" style="margin-bottom:12px">
-  <div style="display:flex;gap:16px;align-items:center;font-size:12px">
-    <span><span class="dot ok"></span> Both files OK</span>
-    <span><span class="dot partial"></span> Partial (one missing)</span>
-    <span><span class="dot err"></span> Error</span>
-    <span><span class="dot pending"></span> Not fetched</span>
-    <span><span class="dot holiday"></span> Non-trading day</span>
+<div class="card" style="margin-bottom:12px;padding:8px 14px">
+  <div style="display:flex;gap:20px;align-items:center;font-size:11px;flex-wrap:wrap">
+    <span><span class="dot ok"></span> Complete (CSV)</span>
+    <span><span class="dot active"></span> Fetching now</span>
+    <span><span class="dot stale"></span> Interrupted</span>
+    <span><span class="dot partial"></span> Partial (one type)</span>
+    <span><span class="dot pending"></span> Missing</span>
   </div>
 </div>
 
@@ -20,122 +33,157 @@
     <tbody id="grid-body"></tbody>
   </table>
 </div>
-
-<div id="fetch-msg" style="margin-top:10px;font-size:12px;color:#3fb950;min-height:18px"></div>
 {% endblock %}
 
 {% block scripts %}
 <style>
   .dot{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:4px;vertical-align:middle}
-  .dot.ok{background:#3fb950}
-  .dot.partial{background:#d29922}
-  .dot.err{background:#f85149}
-  .dot.pending{background:#30363d}
-  .dot.holiday{background:#21262d;border:1px solid #30363d}
+  .dot.ok      {background:#3fb950}
+  .dot.active  {background:#d29922;animation:fpulse 1.5s infinite}
+  .dot.stale   {background:#9e6a03}
+  .dot.partial {background:#58a6ff}
+  .dot.pending {background:#30363d}
 
-  #fetch-grid th{font-size:11px;padding:4px 6px;white-space:nowrap}
-  #fetch-grid td{padding:3px 5px;text-align:center;white-space:nowrap}
+  #fetch-grid th{font-size:11px;padding:4px 8px;white-space:nowrap;color:#8b949e}
+  #fetch-grid td{padding:3px 5px;text-align:center;white-space:nowrap;font-size:11px}
 
   .cell-ok      {background:#0f2d1a;color:#3fb950}
-  .cell-partial {background:#2d2a0f;color:#d29922}
-  .cell-err     {background:#2d0f0f;color:#f85149}
+  .cell-active  {background:#2d2200;color:#d29922}
+  .cell-stale   {background:#1a1600;color:#9e6a03}
+  .cell-partial {background:#0d1d2d;color:#58a6ff}
   .cell-pending {background:#161b22;color:#6e7681}
-  .cell-holiday {background:#0d1117;color:#30363d}
+  .cell-err     {background:#2d0f0f;color:#f85149}
+
+  @keyframes fpulse{0%,100%{opacity:1}50%{opacity:.35}}
+  .cell-active td {animation:fpulse 1.8s ease-in-out infinite}
 
   .fetch-btn{background:#21262d;border:1px solid #30363d;color:#8b949e;
-             font-size:10px;padding:1px 5px;border-radius:3px;cursor:pointer}
+             font-size:10px;padding:1px 5px;border-radius:3px;cursor:pointer;font-family:monospace}
   .fetch-btn:hover{background:#30363d;color:#c9d1d9}
+
+  .mini-bar-wrap{width:100%;height:3px;background:#21262d;border-radius:2px;margin-top:2px}
+  .mini-bar-fill{height:100%;border-radius:2px;background:#d29922}
 </style>
 
 <script>
-let _days = [], _symbols = [], _grid = {};
+let _days=[], _symbols=[], _grid={};
+let _autoRefreshActive = false;
 
-function cellClass(trades, bidask) {
-  if (!trades && !bidask) return 'cell-pending';
-  const tok = trades && trades.status === 'ok';
-  const bok = bidask && bidask.status === 'ok';
-  if (tok && bok)  return 'cell-ok';
-  if (tok || bok)  return 'cell-partial';
-  return 'cell-err';
+function statusPriority(s){ return {ok:0,active:1,stale:2,partial:3,missing:4,err:5}[s]??9; }
+
+function cellInfo(trades, bidask){
+  const tOk = trades && trades.status === 'ok';
+  const bOk = bidask && bidask.status === 'ok';
+  const tAct = trades && trades.status === 'active';
+  const bAct = bidask && bidask.status === 'active';
+  const tSt  = trades && trades.status === 'stale';
+  const bSt  = bidask && bidask.status === 'stale';
+
+  if (!trades && !bidask) return {cls:'cell-pending', lbl:'—', title:'not fetched'};
+  if (tOk && bOk) return {cls:'cell-ok', lbl:rowLabel(trades,'T')+' '+rowLabel(bidask,'B'), title:''};
+  if (tOk && !bidask) return {cls:'cell-partial', lbl:rowLabel(trades,'T')+' B:—', title:'bidask missing'};
+  if (bOk && !trades) return {cls:'cell-partial', lbl:'T:— '+rowLabel(bidask,'B'), title:'trades missing'};
+  if (tAct || bAct) return {cls:'cell-active',
+    lbl:rowLabel(trades,'T')+'<br>'+rowLabel(bidask,'B'),
+    title:'fetching', active:true, trades, bidask};
+  if (tSt || bSt) return {cls:'cell-stale', lbl:rowLabel(trades,'T')+' '+rowLabel(bidask,'B'), title:'interrupted'};
+  return {cls:'cell-pending', lbl:'—', title:'not fetched'};
 }
 
-function cellLabel(trades, bidask) {
-  if (!trades && !bidask) return '—';
-  const tr = trades ? (trades.status === 'ok' ? `T:${(trades.rows/1000).toFixed(0)}k` : 'T:err') : 'T:–';
-  const ba = bidask ? (bidask.status === 'ok' ? `B:${(bidask.rows/1000).toFixed(0)}k` : 'B:err') : 'B:–';
-  return tr + ' ' + ba;
+function rowLabel(r, prefix){
+  if (!r) return prefix+':—';
+  if (r.status==='ok')     return prefix+':'+(r.rows?((r.rows/1000).toFixed(0)+'k'):'✓');
+  if (r.status==='active') return prefix+':'+(r.rows?((r.rows/1000).toFixed(1)+'k'):'...');
+  if (r.status==='stale')  return prefix+':'+(r.rows?((r.rows/1000).toFixed(1)+'k⚠'):'?');
+  return prefix+':—';
 }
 
-function cellTitle(trades, bidask) {
-  let parts = [];
-  if (trades) parts.push('trades: ' + trades.status + (trades.error ? ' (' + trades.error + ')' : ''));
-  if (bidask) parts.push('bidask: ' + bidask.status + (bidask.error ? ' (' + bidask.error + ')' : ''));
-  return parts.join('\n') || 'not fetched';
-}
-
-function renderGrid() {
+function renderGrid(){
   const head = document.getElementById('grid-head');
   const body = document.getElementById('grid-body');
+  let hasActive = false;
 
-  // Header: Date | sym1 | sym2 ...
   head.innerHTML = '<th>Date</th>' +
-    _symbols.map(s => `<th>${s}</th>`).join('') + '<th></th>';
+    _symbols.map(s=>`<th>${s}</th>`).join('') + '<th></th>';
 
-  // Rows: one per day
   body.innerHTML = _days.map(d => {
     const cells = _symbols.map(sym => {
       const info = _grid[d] && _grid[d][sym];
       const t = info && info.trades;
       const b = info && info.bidask;
-      const cls = cellClass(t, b);
-      const lbl = cellLabel(t, b);
-      const title = cellTitle(t, b);
-      return `<td class="${cls}" title="${title}">${lbl}</td>`;
+      const ci = cellInfo(t, b);
+      if (ci.cls==='cell-active') hasActive = true;
+
+      let inner = ci.lbl;
+      if (ci.active) {
+        // mini progress bar for active cells
+        const pcts = [];
+        if (t && t.status==='active') pcts.push(Math.min((t.rows||0)/300000*100, 100));
+        if (b && b.status==='active') pcts.push(Math.min((b.rows||0)/100000*100, 100));
+        const avgPct = pcts.length ? pcts.reduce((a,b)=>a+b,0)/pcts.length : 0;
+        inner += `<div class="mini-bar-wrap"><div class="mini-bar-fill" style="width:${avgPct.toFixed(0)}%"></div></div>`;
+      }
+
+      return `<td class="${ci.cls}" title="${ci.title}">${inner}</td>`;
     }).join('');
     const btn = `<td><button class="fetch-btn" onclick="fetchNow('${d}')">Fetch</button></td>`;
     return `<tr><td class="ts">${d}</td>${cells}${btn}</tr>`;
   }).join('');
+
+  // Auto-refresh faster when active
+  if (hasActive !== _autoRefreshActive) {
+    _autoRefreshActive = hasActive;
+  }
 }
 
-function load() {
-  fetch('/api/fetch-status').then(r => r.json()).then(data => {
-    _days = data.days;
-    _symbols = data.symbols;
-    _grid = data.grid;
+function load(){
+  fetch('/api/fetch-status').then(r=>r.json()).then(data=>{
+    _days=data.days; _symbols=data.symbols; _grid=data.grid;
     renderGrid();
     const ind = document.getElementById('refresh-indicator');
-    if (ind) ind.textContent = new Date().toTimeString().slice(0,8);
-  }).catch(() => {});
+    if (ind) ind.textContent = new Date().toLocaleTimeString();
+  }).catch(()=>{});
+  fetch('/api/fetch-proc-status').then(r=>r.json()).then(d=>updateButtons(d.running)).catch(()=>{});
 }
 
-function fetchNow(date) {
+function updateButtons(running){
+  document.getElementById('btn-fetch-all').style.display  = running ? 'none' : '';
+  document.getElementById('btn-fetch-stop').style.display = running ? '' : 'none';
   const msg = document.getElementById('fetch-msg');
-  const syms = _symbols;
-  let pending = syms.length;
-  msg.style.color = '#d29922';
-  msg.textContent = `Starting fetch for ${date}...`;
+  if (running && !msg.textContent.startsWith('Started')) msg.textContent = 'Fetcher running…';
+}
 
-  syms.forEach(sym => {
-    fetch('/api/fetch-now', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({symbol: sym, date: date})
-    }).then(r => r.json()).then(() => {
-      pending--;
-      if (pending === 0) {
-        msg.style.color = '#3fb950';
-        msg.textContent = `Fetch started for all symbols on ${date}. Refresh in ~30s.`;
-        setTimeout(load, 5000);
-      }
-    }).catch(() => {
-      pending--;
-      msg.style.color = '#f85149';
-      msg.textContent = 'Error starting fetch.';
-    });
-  });
+function doFetchAll(){
+  const msg = document.getElementById('fetch-msg');
+  msg.style.color='#d29922'; msg.textContent='Starting backfill…';
+  fetch('/api/fetch-start',{method:'POST'}).then(r=>r.json()).then(d=>{
+    if (d.error){ msg.style.color='#f85149'; msg.textContent='Error: '+d.error; return; }
+    if (d.status==='already_running'){ msg.textContent='Already running (pid '+d.pid+')'; return; }
+    msg.style.color='#3fb950'; msg.textContent='Started (pid '+d.pid+') — fetching all missing dates…';
+    updateButtons(true);
+    setTimeout(load, 3000);
+  }).catch(()=>{ msg.style.color='#f85149'; msg.textContent='Request failed'; });
+}
+
+function doFetchStop(){
+  fetch('/api/fetch-stop',{method:'POST'}).then(r=>r.json()).then(()=>{
+    updateButtons(false);
+    document.getElementById('fetch-msg').textContent='Stopped.';
+  }).catch(()=>{});
+}
+
+function fetchNow(date){
+  const msg = document.getElementById('fetch-msg');
+  msg.style.color='#d29922'; msg.textContent='Starting fetch for '+date+'…';
+  fetch('/api/fetch-now',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({symbol:'all',date:date})
+  }).then(r=>r.json()).then(()=>{
+    msg.style.color='#3fb950'; msg.textContent='Started for '+date;
+    setTimeout(load, 4000);
+  }).catch(()=>{ msg.style.color='#f85149'; msg.textContent='Error'; });
 }
 
 load();
-setInterval(load, 30000);
+setInterval(load, 5000);
 </script>
 {% endblock %}

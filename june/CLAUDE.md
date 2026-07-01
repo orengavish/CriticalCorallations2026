@@ -111,6 +111,45 @@ C:\IBC\StartGateway.bat
 ```
 Wait ~30s for "Server Version" in logs before connecting.
 
+### Fetcher dashboard (browser UI) — run on trading PC
+```
+cd C:\Projects\Galgo2026\june
+python fetcher_dashboard.py --real     # real mode, port 5050
+python fetcher_dashboard.py            # mock mode (no gateway needed, for testing)
+```
+- **On this PC:** http://localhost:5050
+- **From any device on home network:** http://192.168.1.132:5050
+
+First-time firewall setup (run once in admin PowerShell):
+```powershell
+New-NetFirewallRule -DisplayName "Galao Dashboard" -Direction Inbound -Protocol TCP -LocalPort 5050 -Action Allow
+```
+
+Dashboard features:
+- 4 process cards (one per symbol) with live progress bars + % complete
+- Last price / H / L from most recent CSV (refreshes every 60s)
+- Per-cell verify status: ✓ pass (green) / ⚠ warn (yellow) / ✗ fail (red)
+- "Fetch All Missing" → launches 4 parallel fetcher processes
+- "Verify All" → background verify run on all finished files
+- Gateway Start/Stop with uptime counter
+
+### Run all components in parallel (normal session)
+Each in its own terminal, all from `C:\Projects\Galgo2026\june`:
+```
+# Terminal 1 — gateway watchdog (keep running 24/7)
+python trader/gateway_watchdog.py
+
+# Terminal 2 — fetcher dashboard
+python fetcher_dashboard.py --real
+
+# Terminal 3 — broker (submits IB brackets, monitors fills)
+python trader/broker.py
+
+# Terminal 4 — decider (generates commands from critical lines)
+python trader/decider.py
+```
+Client ID allocation: fetcher=801-804, broker=101-120. No conflicts.
+
 ### Fetch tick data (manual)
 ```
 cd june
@@ -128,6 +167,7 @@ Task Scheduler entry: `scripts/run_fetcher.bat` → daily 23:30 UTC
 ### Verify fetched data
 ```
 python trader/verify_data.py --symbol MES --date 2026-06-02
+python trader/verify_data.py --all-pending    # verify everything not yet checked
 ```
 
 ### Run backtrader on one command

@@ -56,7 +56,7 @@ UTC = ZoneInfo("UTC")
 _TICK_TIMEOUT  = 45   # seconds per reqHistoricalTicks call
 _TICKS_PER_REQ = 1000
 _PROGRESS_LOG_INTERVAL = 15  # seconds between telemetry lines
-_N_WORKERS     = 8    # parallel async windows for paginate_ticks
+_N_WORKERS     = 4    # parallel async windows (reduced from 8 to avoid IB pacing cascade)
 
 _EXCHANGE_MAP = {"MES": "CME", "MNQ": "CME", "M2K": "CME", "MYM": "CBOT"}
 
@@ -148,6 +148,22 @@ def _is_finished(conn, symbol, date_str, dtype) -> bool:
         (symbol, date_str, dtype)
     ).fetchone()
     return bool(row and row[0])
+
+
+def _is_actively_running(conn, symbol, date_str, dtype, grace_seconds=120) -> bool:
+    """Return True if another process updated this row within the last grace_seconds."""
+    row = conn.execute(
+        "SELECT finished, updated_at FROM fetch_progress WHERE symbol=? AND date=? AND data_type=?",
+        (symbol, date_str, dtype)
+    ).fetchone()
+    if not row or row[0]:
+        return False
+    try:
+        updated = datetime.fromisoformat(row[1]).replace(tzinfo=timezone.utc)
+        age = (datetime.now(timezone.utc) - updated).total_seconds()
+        return age < grace_seconds
+    except Exception:
+        return False
 
 
 def _mark_started(conn, symbol, date_str, dtype):
@@ -394,6 +410,11 @@ def fetch_day(ib: IB, symbol: str, target_date: date,
         if _is_finished(progress_conn, symbol, date_str, dtype):
             log.info(f"[SKIP] {symbol} {dtype} {date_str} — already finished")
             results[dtype] = "skipped"
+            continue
+
+        if _is_actively_running(progress_conn, symbol, date_str, dtype):
+            log.warning(f"[SKIP] {symbol} {dtype} {date_str} — another process is actively fetching (updated <120s ago)")
+            results[dtype] = "skipped_active"
             continue
 
         suffix    = "trades" if dtype == "TRADES" else "bidask"
