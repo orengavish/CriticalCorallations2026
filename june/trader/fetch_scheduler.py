@@ -201,6 +201,24 @@ def _get_priority_dates(cfg, symbols: list) -> list:
                 seen.add(key)
                 pairs.append((sym, yesterday))
 
+    # Priority 3: backfill — last BACKFILL_DAYS trading days, most recent first
+    # Skips weekends; adds any (sym, date) missing from history
+    backfill_days = int(getattr(cfg.fetcher, "backfill_days", 180))
+    if backfill_days > 0:
+        scan_date = yesterday - timedelta(days=1)
+        days_checked = 0
+        while days_checked < backfill_days:
+            if scan_date.weekday() < 5:  # Mon-Fri only
+                d_str = scan_date.strftime("%Y-%m-%d")
+                for sym in symbols:
+                    if _is_missing(sym, d_str):
+                        key = (sym, d_str)
+                        if key not in seen:
+                            seen.add(key)
+                            pairs.append((sym, scan_date))
+                days_checked += 1
+            scan_date -= timedelta(days=1)
+
     return pairs
 
 
