@@ -1262,10 +1262,11 @@ def api_fetch_status():
                     pass
 
                 is_csv = (sym, ds, dtype) in csv_present
-                if done or is_csv:
-                    status = "ok"
-                elif rec > 0 and age_s is not None and age_s < 90:
+                # Check active FIRST: DB says currently downloading → show active even if CSV exists
+                if not done and rec > 0 and age_s is not None and age_s < 90:
                     status = "active"
+                elif done or is_csv:
+                    status = "ok"
                 elif rec > 0:
                     status = "stale"
                 else:
@@ -1847,15 +1848,29 @@ def api_fetch_eta():
     active = unfinished[0] if unfinished else None
 
     # ── Fetch rate (rec/sec) ───────────────────────────────────────────────────
+    # Prefer the rolling throughput history (maintained by api_fetch_live polls).
+    # Fall back to the per-slot rolling window from _fetch_rate_state.
+    import time as _time2
     rate = DEFAULT_RATE
-    if active and lock_path.exists():
-        try:
-            lock_age = now_ts - _os.path.getmtime(str(lock_path))
-            rec = active["records_fetched"] or 0
-            if lock_age > 120 and rec > 0:
-                rate = max(rec / lock_age, 50)
-        except Exception:
-            pass
+    now_mono = _time2.monotonic()
+    # Source 1: global throughput history (populated by api_fetch_live every 5s)
+    if _fetch_throughput_hist and len(_fetch_throughput_hist) >= 2:
+        cutoff = now_mono - 300  # last 5 min
+        recent = [h for h in _fetch_throughput_hist if h["ts"] >= cutoff]
+        if len(recent) >= 2:
+            dt2 = recent[-1]["ts"] - recent[0]["ts"]
+            dr2 = recent[-1]["total_dl"] - recent[0]["total_dl"]
+            if dt2 > 10 and dr2 > 0:
+                rate = max(dr2 / dt2, 10)
+    # Source 2: per-slot rate from rolling window (falls back to DEFAULT if no history)
+    if rate == DEFAULT_RATE and active:
+        slot_key = f"{active['symbol']}_{active['data_type']}"
+        hist = _fetch_rate_state.get(slot_key, [])
+        if len(hist) >= 2:
+            dt2 = hist[-1]["ts"] - hist[0]["ts"]
+            dr2 = hist[-1]["records"] - hist[0]["records"]
+            if dt2 > 1 and dr2 > 0:
+                rate = max(dr2 / dt2, 10)
 
     # ── Finished file sizes ────────────────────────────────────────────────────
     trades_sz = {(r["symbol"], r["date"]): r["records_fetched"]
@@ -1891,7 +1906,12 @@ def api_fetch_eta():
     bidask_done = {(r["symbol"], r["date"])
                    for r in rows if r["finished"] and r["data_type"] == "BID_ASK"}
 
-    # ── Also count done from CSV presence (for any not in progress DB) ─────────
+    # ── Supplement trades_done from CSV presence (for files predating DB tracking) ─
+    # Do NOT include BID_ASK CSVs: they can be partial (in-progress writes) and
+    # would incorrectly mark an active fetch as complete.
+    active_bidask_keys = {(r["symbol"], r["date"])
+                          for r in rows if not r["finished"] and r["data_type"] == "BID_ASK"
+                          and (r["records_fetched"] or 0) > 0}
     if history_dir.exists():
         for f in history_dir.glob("*.csv"):
             parts = f.stem.split("_")
@@ -1900,7 +1920,8 @@ def api_fetch_eta():
                 date_s = f"{dc[:4]}-{dc[4:6]}-{dc[6:]}"
                 if ftype == "trades":
                     trades_done.add((sym, date_s))
-                elif ftype == "bidask":
+                elif ftype == "bidask" and (sym, date_s) not in active_bidask_keys:
+                    # Only count a BID_ASK CSV as done if the scheduler isn't actively writing it
                     bidask_done.add((sym, date_s))
 
     # ── Already complete dates ─────────────────────────────────────────────────
