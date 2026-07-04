@@ -62,6 +62,12 @@ _fetch_throughput_hist = []  # [{ts: monotonic, wall_ts: float, total_dl: int}]
 _fetch_last_db_total  = 0   # last total_rec seen from DB (detects resets)
 _fetch_running_dl     = 0   # monotonically increasing downloaded-records counter
 
+# ── Auto-fill: generate commands until target reached per symbol per day ──────
+_auto_fill_enabled  = False
+_auto_fill_target   = 400   # commands per symbol per UTC day
+_auto_fill_batch    = 10    # generated per loop iteration
+_auto_fill_counts   = {}    # {sym: today_count} — updated each loop
+
 
 def _get_cfg():
     global _cfg
@@ -1212,11 +1218,12 @@ def api_fetch_status():
     now_utc   = datetime.now(timezone.utc)
 
     # Scan CSV files in history dir for completed files
-    csv_present: set = set()
-    csv_rows: dict   = {}
+    csv_present: set  = set()
+    csv_file_mb: dict = {}   # (sym, ds, ftyp) -> file size in MB
     if hist_dir.exists():
         for f in hist_dir.glob("*.csv"):
-            if f.stat().st_size < 100:
+            sz = f.stat().st_size
+            if sz < 100:
                 continue
             parts = f.stem.split("_")
             if len(parts) >= 3:
@@ -1224,7 +1231,9 @@ def api_fetch_status():
                 ftyp = parts[1]      # "trades" or "bidask"
                 dc   = parts[2]
                 ds   = f"{dc[:4]}-{dc[4:6]}-{dc[6:]}"
-                csv_present.add((sym, ds, ftyp))
+                key  = (sym, ds, ftyp)
+                csv_present.add(key)
+                csv_file_mb[key] = round(sz / 1_048_576, 1)
 
     if june_db.exists():
         try:
@@ -1264,18 +1273,26 @@ def api_fetch_status():
 
                 key = (sym, ds, dtype)
                 lookup[key] = {
-                    "status": status,
-                    "rows": rec,
-                    "age_s": age_s,
-                    "error": None,
+                    "status":  status,
+                    "rows":    rec,
+                    "age_s":   age_s,
+                    "error":   None,
+                    "file_mb": csv_file_mb.get(key),
                 }
         except Exception as exc:
             log.warning("fetch-status DB error: %s", exc)
 
     # Also mark CSVs present but not in DB as ok
-    for (sym, ds, dtype) in csv_present:
-        if (sym, ds, dtype) not in lookup:
-            lookup[(sym, ds, dtype)] = {"status": "ok", "rows": None, "age_s": None, "error": None}
+    for key in csv_present:
+        sym, ds, dtype = key
+        if key not in lookup:
+            lookup[key] = {
+                "status":  "ok",
+                "rows":    None,
+                "age_s":   None,
+                "error":   None,
+                "file_mb": csv_file_mb.get(key),
+            }
 
     result: dict = {}
     for ds in days:
@@ -1562,6 +1579,214 @@ def fetch_status_page():
     return render_template("fetch_status.html", active="fetch_status")
 
 
+@app.route("/api/fetch-queue")
+def api_fetch_queue():
+    """
+    Returns the current file being fetched, the next 5 in priority order,
+    IB connection status (derived from fetch_progress freshness), and watchdog status.
+    Priority mirrors fetch_scheduler._get_priority_dates:
+      P1 CRITICAL  — verified trade dates with any symbol missing CSV
+      P2 RESUME    — partial files (finished=0, records>0) not covered by P1
+      P3 STANDARD  — recent backfill dates
+    """
+    import sqlite3 as _sq3, socket as _sock, time as _time, yaml as _yaml
+    from datetime import timezone, timedelta
+    from pathlib import Path as _P
+    from collections import defaultdict
+
+    june_db    = _june_fetch_db()
+    hist_dir   = _june_history_dir()
+    galao_db   = _P(__file__).parent.parent.parent / "june" / "trader" / "data" / "galao.db"
+    june_cfg   = _P(__file__).parent.parent.parent / "june" / "trader" / "config.yaml"
+
+    try:
+        with open(june_cfg) as _f:
+            _jy = _yaml.safe_load(_f)
+        symbols    = (_jy.get("fetcher") or {}).get("symbols", ["MES", "MNQ", "MYM"])
+        do_bid_ask = bool((_jy.get("fetcher") or {}).get("fetch_bid_ask", False))
+    except Exception:
+        symbols, do_bid_ask = ["MES", "MNQ", "MYM"], False
+
+    now_utc = datetime.now(timezone.utc)
+
+    # ── Gather what files are present ────────────────────────────────────────
+    present = set()
+    if hist_dir.exists():
+        for f in hist_dir.glob("*.csv"):
+            if f.stat().st_size > 100:
+                parts = f.stem.split("_")
+                if len(parts) >= 3:
+                    sym, ftype, dc = parts[0], parts[1], parts[2]
+                    present.add((sym, f"{dc[:4]}-{dc[4:6]}-{dc[6:]}", ftype))
+
+    def _is_missing(sym, d):
+        if (sym, d, "trades") not in present:
+            return True
+        if do_bid_ask and (sym, d, "bidask") not in present:
+            return True
+        return False
+
+    # ── Current active + partial rows from progress DB ────────────────────────
+    active_row = None
+    partial_keys = set()
+    total_done = total_entries = 0
+    db_age_s = None
+
+    if june_db.exists():
+        try:
+            con = _sq3.connect(str(june_db), timeout=5)
+            con.row_factory = _sq3.Row
+            all_rows = con.execute(
+                "SELECT symbol, date, data_type, records_fetched, finished, updated_at FROM fetch_progress"
+            ).fetchall()
+            con.close()
+
+            total_done    = sum(1 for r in all_rows if r["finished"])
+            total_entries = len(all_rows)
+
+            # Most recently updated unfinished row = what's being fetched right now
+            unfinished = [r for r in all_rows if not r["finished"]]
+            unfinished.sort(key=lambda r: r["updated_at"] or "", reverse=True)
+            if unfinished:
+                r = unfinished[0]
+                try:
+                    upd = datetime.fromisoformat((r["updated_at"] or "").replace("Z", "+00:00"))
+                    if upd.tzinfo is None:
+                        upd = upd.replace(tzinfo=timezone.utc)
+                    db_age_s = (now_utc - upd).total_seconds()
+                    is_active = db_age_s < 90
+                except Exception:
+                    is_active = False
+                    db_age_s  = None
+
+                rec = r["records_fetched"] or 0
+                # Estimate total from median of finished rows of same dtype
+                finished_counts = [
+                    fr["records_fetched"] for fr in all_rows
+                    if fr["finished"] and fr["data_type"] == r["data_type"]
+                    and fr["records_fetched"] > 1000
+                ]
+                if finished_counts:
+                    finished_counts.sort()
+                    est_total = finished_counts[len(finished_counts) // 2]
+                else:
+                    est_total = 400_000 if r["data_type"] == "TRADES" else 600_000
+                pct = min(99, round(rec / est_total * 100)) if est_total > 0 else 0
+
+                # Find paired bidask row for the same sym/date (if it exists)
+                paired_bidask = next(
+                    (fr["records_fetched"] for fr in all_rows
+                     if fr["symbol"] == r["symbol"] and fr["date"] == r["date"]
+                     and fr["data_type"] in ("BID_ASK", "bidask")
+                     and fr["data_type"] != r["data_type"]),
+                    None
+                )
+                active_row = {
+                    "symbol":          r["symbol"],
+                    "date":            r["date"],
+                    "dtype":           r["data_type"],
+                    "records":         rec,
+                    "bidask_records":  paired_bidask,
+                    "pct":             pct,
+                    "est_total":       est_total,
+                    "is_active":       is_active,
+                    "age_s":           round(db_age_s) if db_age_s is not None else None,
+                }
+
+            # Partial keys for P2 (finished=0, records>0)
+            for r in all_rows:
+                if not r["finished"] and (r["records_fetched"] or 0) > 0:
+                    partial_keys.add((r["symbol"], r["date"]))
+
+        except Exception as e:
+            log.warning("fetch-queue progress read error: %s", e)
+
+    # ── Verified trade dates for P1 ────────────────────────────────────────────
+    vt_dates = []
+    if galao_db.exists():
+        try:
+            gcon = _sq3.connect(str(galao_db), timeout=5)
+            gcon.row_factory = _sq3.Row
+            vt_dates = [
+                r[0] for r in gcon.execute(
+                    "SELECT DISTINCT DATE(fill_time) FROM verified_trades ORDER BY DATE(fill_time) ASC"
+                ).fetchall()
+            ]
+            gcon.close()
+        except Exception:
+            pass
+
+    # ── Build priority queue ───────────────────────────────────────────────────
+    queue = []
+    seen  = set()
+
+    for d_str in vt_dates:
+        for sym in symbols:
+            # CRITICAL if CSV missing -OR- CSV exists but unfinished (partial)
+            is_partial = (sym, d_str) in partial_keys
+            if _is_missing(sym, d_str) or is_partial:
+                key = (sym, d_str)
+                if key not in seen:
+                    seen.add(key)
+                    queue.append({"symbol": sym, "date": d_str, "tier": "CRITICAL"})
+
+    for sym, d_str in sorted(partial_keys):
+        key = (sym, d_str)
+        if key not in seen:
+            seen.add(key)
+            queue.append({"symbol": sym, "date": d_str, "tier": "RESUME"})
+
+    # A few standard backfill entries so user sees what's coming next
+    try:
+        from zoneinfo import ZoneInfo as _ZI
+        _CT = _ZI("America/Chicago")
+        yesterday = (datetime.now(_CT) - timedelta(days=1)).date()
+        scan = yesterday
+        added = 0
+        while added < 30 and len(queue) < 50:
+            if scan.weekday() < 5:
+                d_str = scan.strftime("%Y-%m-%d")
+                for sym in symbols:
+                    if _is_missing(sym, d_str):
+                        key = (sym, d_str)
+                        if key not in seen:
+                            seen.add(key)
+                            queue.append({"symbol": sym, "date": d_str, "tier": "STANDARD"})
+                added += 1
+            scan -= timedelta(days=1)
+    except Exception:
+        pass
+
+    # Skip entries that match the active row (it's already being fetched)
+    if active_row:
+        queue = [q for q in queue
+                 if not (q["symbol"] == active_row["symbol"] and q["date"] == active_row["date"])]
+
+    # ── IB status ─────────────────────────────────────────────────────────────
+    try:
+        gw_host = "127.0.0.1"
+        gw_port = 4002
+        _s = _sock.create_connection((gw_host, gw_port), timeout=1)
+        _s.close()
+        gw_reachable = True
+    except OSError:
+        gw_reachable = False
+
+    ib_status = {
+        "gw_reachable": gw_reachable,
+        "db_age_s":     round(db_age_s) if db_age_s is not None else None,
+        "fetching":     active_row is not None and (active_row.get("is_active") or False),
+    }
+
+    return jsonify({
+        "current":       active_row,
+        "queue":         queue[:6],
+        "ib_status":     ib_status,
+        "total_done":    total_done,
+        "total_entries": total_entries,
+    })
+
+
 # ── Traceback ─────────────────────────────────────────────────────────────────
 
 @app.route("/api/traceback-stats")
@@ -1796,6 +2021,127 @@ def self_test() -> bool:
         return False
 
 
+# ── Auto-fill helpers ─────────────────────────────────────────────────────────
+
+def _auto_fill_count_today(symbol: str) -> int:
+    """Commands created today (UTC) for symbol, excluding cancelled/error."""
+    try:
+        from datetime import timezone as _tz
+        today = datetime.now(_tz.utc).strftime("%Y-%m-%d")
+        with get_db(_get_db_path()) as con:
+            return con.execute(
+                "SELECT COUNT(*) FROM commands WHERE symbol=?"
+                " AND DATE(created_at)=? AND status NOT IN ('CANCELLED','ERROR')",
+                (symbol, today)
+            ).fetchone()[0]
+    except Exception:
+        return 0
+
+
+def _auto_fill_generate(symbol: str, count: int, price: float) -> int:
+    """Insert `count` random PENDING bracket commands for symbol near price."""
+    import random as _rnd
+    from datetime import timezone as _tz
+    cfg  = _get_cfg()
+    tick = cfg.orders.tick_size
+
+    # Read bracket from june config if available, else fall back to 4 ticks
+    try:
+        import yaml as _yaml
+        june_cfg_path = Path(__file__).parent.parent.parent / "june" / "trader" / "config.yaml"
+        _jy = _yaml.safe_load(open(june_cfg_path))
+        bkt_ticks = int((_jy.get("orders") or {}).get("tp_ticks", 4))
+    except Exception:
+        bkt_ticks = 4
+    bracket = bkt_ticks * tick   # e.g. 4 × 0.25 = 1.0 point
+
+    def rt(p):
+        return round(round(p / tick) * tick, 10)
+
+    inserted = 0
+    with get_db(_get_db_path()) as con:
+        for _ in range(count):
+            direction  = _rnd.choice(["BUY", "SELL"])
+            entry_type = _rnd.choice(["MKT", "LMT", "STP"])
+            offset = _rnd.randint(1, 3) * tick
+            if entry_type == "MKT":
+                ep = rt(price)
+            elif entry_type == "LMT":
+                ep = rt(price - offset) if direction == "BUY" else rt(price + offset)
+            else:  # STP
+                ep = rt(price + offset) if direction == "BUY" else rt(price - offset)
+            tp = rt(ep + bracket) if direction == "BUY" else rt(ep - bracket)
+            sl = rt(ep - bracket) if direction == "BUY" else rt(ep + bracket)
+            con.execute(
+                "INSERT INTO commands"
+                " (symbol, line_price, line_type, line_strength,"
+                "  direction, entry_type, entry_price, tp_price, sl_price,"
+                "  bracket_size, source, quantity, status)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'PENDING')",
+                (symbol, price,
+                 "SUPPORT" if direction == "BUY" else "RESISTANCE", 1,
+                 direction, entry_type, ep, tp, sl,
+                 bkt_ticks, "auto_fill", 1)
+            )
+            inserted += 1
+    return inserted
+
+
+def _auto_fill_worker():
+    """Daemon thread: every 30 s check counts, generate batches until target."""
+    import time as _t
+    global _auto_fill_counts
+    while True:
+        _t.sleep(30)
+        if not _auto_fill_enabled:
+            continue
+        try:
+            from visualizer.price_feed import get_latest
+            price, _ = get_latest()
+        except Exception:
+            price = None
+        if price is None:
+            continue
+
+        symbols = _fetch_symbols() or ["MES", "MNQ", "MYM"]
+        for sym in symbols:
+            today_count = _auto_fill_count_today(sym)
+            _auto_fill_counts[sym] = today_count
+            if today_count < _auto_fill_target:
+                needed = min(_auto_fill_batch, _auto_fill_target - today_count)
+                n = _auto_fill_generate(sym, needed, price)
+                _auto_fill_counts[sym] = today_count + n
+                log.info("[auto-fill] %s: %d today → +%d (target %d)",
+                         sym, today_count, n, _auto_fill_target)
+
+
+# ── Auto-fill API ──────────────────────────────────────────────────────────────
+
+@app.route("/api/auto-fill", methods=["GET", "POST"])
+def api_auto_fill():
+    global _auto_fill_enabled, _auto_fill_target, _auto_fill_batch
+    if request.method == "POST":
+        body = request.get_json(force=True) or {}
+        if "enabled" in body:
+            _auto_fill_enabled = bool(body["enabled"])
+        if "target" in body:
+            _auto_fill_target = max(1, int(body["target"]))
+        if "batch" in body:
+            _auto_fill_batch  = max(1, int(body["batch"]))
+
+    symbols = _fetch_symbols() or ["MES", "MNQ", "MYM"]
+    counts  = {sym: _auto_fill_count_today(sym) for sym in symbols}
+    # update cached counts too
+    global _auto_fill_counts
+    _auto_fill_counts = counts
+    return jsonify({
+        "enabled": _auto_fill_enabled,
+        "target":  _auto_fill_target,
+        "batch":   _auto_fill_batch,
+        "counts":  counts,
+    })
+
+
 def _cmdline_running(script_path: str) -> bool:
     """Return True if a python process with script_path in its command line is running."""
     import subprocess as _sp
@@ -1872,6 +2218,155 @@ def _auto_start_fetcher():
         log.warning("auto-start fetcher: could not launch: %s", exc)
 
 
+# ── Critical Lines Algo API ───────────────────────────────────────────────────
+
+@app.route("/cl-algo")
+def cl_algo_page():
+    cfg  = _get_cfg()
+    syms = list(cfg.symbols) if hasattr(cfg, "symbols") else ["MES"]
+    return render_template("cl_algo.html", active="cl_algo", symbols=syms)
+
+
+@app.route("/api/cl-lines")
+def api_cl_lines():
+    """GET /api/cl-lines?symbol=MES&date=2026-07-04  → armed critical lines"""
+    symbol = request.args.get("symbol", "MES")
+    date   = request.args.get("date",
+                datetime.now(timezone.utc).strftime("%Y-%m-%d"))
+    with get_db(_get_db_path()) as con:
+        rows = con.execute(
+            "SELECT * FROM critical_lines WHERE symbol=? AND date=? AND armed=1"
+            " ORDER BY price DESC",
+            (symbol, date)
+        ).fetchall()
+    return jsonify(_rows_to_list(rows))
+
+
+@app.route("/api/cl-algo-types")
+def api_cl_algo_types():
+    """Return algo type metadata."""
+    from lib.algo_engine import AlgoType, ALGO_DESCRIPTIONS
+    return jsonify([
+        {"type": t, "description": ALGO_DESCRIPTIONS[t]}
+        for t in AlgoType.ALL
+    ])
+
+
+@app.route("/api/cl-algo-preview", methods=["POST"])
+def api_cl_algo_preview():
+    """
+    POST body (JSON):
+      symbol, date, algo_type, tp_ticks_list, sl_ticks_list,
+      direction_filter, strength_max
+
+    Returns {combos: [{tp, sl, count}, ...], total}
+    No DB writes.
+    """
+    from lib.algo_engine import AlgoType, AlgoParams, preview_cl_commands
+    body   = request.get_json(force=True) or {}
+    symbol = body.get("symbol", "MES")
+    date_s = body.get("date", datetime.now(timezone.utc).strftime("%Y-%m-%d"))
+    algo_type        = body.get("algo_type", AlgoType.BOTH)
+    tp_list          = [int(x) for x in body.get("tp_ticks_list", [4])]
+    sl_list          = [int(x) for x in body.get("sl_ticks_list", [4])]
+    direction_filter = body.get("direction_filter", "ALL")
+    strength_max     = int(body.get("strength_max", 3))
+
+    try:
+        price, _ = _get_current_price()
+    except Exception:
+        price = None
+
+    db = _get_db_path()
+    combos = []
+    for tp in tp_list:
+        for sl in sl_list:
+            params = AlgoParams(
+                algo_type=algo_type,
+                tp_ticks=tp, sl_ticks=sl,
+                direction_filter=direction_filter,
+                strength_max=strength_max,
+            )
+            cnt = preview_cl_commands(symbol, date_s, price or 0.0, params, db)
+            combos.append({"tp_ticks": tp, "sl_ticks": sl, "count": cnt})
+
+    return jsonify({
+        "combos": combos,
+        "total": sum(c["count"] for c in combos),
+        "current_price": price,
+    })
+
+
+@app.route("/api/cl-algo-run", methods=["POST"])
+def api_cl_algo_run():
+    """
+    POST body (JSON):
+      symbol, date, algo_type, tp_ticks_list, sl_ticks_list,
+      direction_filter, strength_max, quantity
+
+    Generates and inserts PENDING commands for all selected combos.
+    Returns {runs: [{tp, sl, count, run_id}], total}
+    """
+    from lib.algo_engine import AlgoType, AlgoParams, generate_cl_commands, record_algo_run
+    body   = request.get_json(force=True) or {}
+    symbol = body.get("symbol", "MES")
+    date_s = body.get("date", datetime.now(timezone.utc).strftime("%Y-%m-%d"))
+    algo_type        = body.get("algo_type", AlgoType.BOTH)
+    tp_list          = [int(x) for x in body.get("tp_ticks_list", [4])]
+    sl_list          = [int(x) for x in body.get("sl_ticks_list", [4])]
+    direction_filter = body.get("direction_filter", "ALL")
+    strength_max     = int(body.get("strength_max", 3))
+    qty              = int(body.get("quantity", 1))
+
+    try:
+        price, _ = _get_current_price()
+    except Exception:
+        price = None
+
+    db   = _get_db_path()
+    runs = []
+    for tp in tp_list:
+        for sl in sl_list:
+            params = AlgoParams(
+                algo_type=algo_type,
+                tp_ticks=tp, sl_ticks=sl,
+                direction_filter=direction_filter,
+                strength_max=strength_max,
+            )
+            cnt = generate_cl_commands(
+                symbol, date_s, price or 0.0, params, db, quantity=qty
+            )
+            run_id = record_algo_run(
+                db, symbol, date_s, algo_type, tp, sl,
+                direction_filter, strength_max, cnt, price
+            )
+            runs.append({"tp_ticks": tp, "sl_ticks": sl,
+                         "count": cnt, "run_id": run_id})
+
+    total = sum(r["count"] for r in runs)
+    log.info("[cl-algo-run] %s %s %s tp=%s sl=%s → %d commands",
+             symbol, date_s, algo_type, tp_list, sl_list, total)
+    return jsonify({"runs": runs, "total": total, "current_price": price})
+
+
+@app.route("/api/cl-algo-runs")
+def api_cl_algo_runs():
+    """GET /api/cl-algo-runs?limit=30  → recent algo_runs rows"""
+    from lib.algo_engine import get_algo_runs
+    limit = min(int(request.args.get("limit", 30)), 200)
+    rows  = get_algo_runs(_get_db_path(), limit)
+    return jsonify(rows)
+
+
+def _get_current_price():
+    """Return (price, ts) from price feed, or (None, None)."""
+    try:
+        from visualizer.price_feed import get_latest
+        return get_latest()
+    except Exception:
+        return None, None
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Galao visualizer")
     parser.add_argument("--self-test", action="store_true")
@@ -1890,6 +2385,12 @@ if __name__ == "__main__":
     if not args.no_auto_start:
         _auto_start_bg()
         _auto_start_fetcher()
+
+    import threading as _threading
+    _t = _threading.Thread(target=_auto_fill_worker, name="auto-fill", daemon=True)
+    _t.start()
+    log.info("Auto-fill worker started (target=%d/sym/day, batch=%d, interval=30s)",
+             _auto_fill_target, _auto_fill_batch)
 
     if not args.no_price_feed:
         import atexit

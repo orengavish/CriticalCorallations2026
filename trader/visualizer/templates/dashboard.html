@@ -304,9 +304,20 @@
 
   <!-- ── Active commands ───────────────────────────────────────── -->
   <div class="card" style="flex:1;overflow-x:auto">
-    <h2>Commands &nbsp;<span id="filter-label" style="font-size:11px;color:#58a6ff"></span>
+    <h2 style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
+      <span>Commands</span>
+      <span id="filter-label" style="font-size:11px;color:#58a6ff"></span>
       <span id="filter-clear" onclick="setFilter(null)"
-        style="display:none;font-size:11px;color:#8b949e;cursor:pointer;margin-left:6px">✕ clear</span>
+        style="display:none;font-size:11px;color:#8b949e;cursor:pointer">✕ clear</span>
+      <span style="margin-left:auto;display:flex;align-items:center;gap:6px">
+        <span id="af-counts" style="font-size:10px;color:#8b949e;font-family:monospace"></span>
+        <span id="af-target-lbl" style="font-size:10px;color:#6e7681"></span>
+        <button id="af-btn" onclick="afToggle()"
+          style="font-size:10px;padding:2px 8px;border-radius:3px;cursor:pointer;font-family:monospace;
+                 border:1px solid #30363d;background:#21262d;color:#8b949e">
+          Auto-Fill: OFF
+        </button>
+      </span>
     </h2>
     <table>
       <thead><tr>
@@ -796,6 +807,40 @@ function _btUpdate(data) {
 (function pollBtScores() {
   fetch('/api/bt-scores?limit=10').then(r=>r.json()).then(_btUpdate).catch(()=>{});
   setTimeout(pollBtScores, 30000);
+})();
+
+// ── Auto-fill ──────────────────────────────────────────────────────────────
+let _afEnabled = false;
+let _afTarget  = 400;
+
+function _afRender(d) {
+  _afEnabled = d.enabled;
+  _afTarget  = d.target || 400;
+  const btn = document.getElementById('af-btn');
+  const lbl = document.getElementById('af-target-lbl');
+  const cnt = document.getElementById('af-counts');
+  if (!btn) return;
+  btn.textContent = 'Auto-Fill: ' + (_afEnabled ? 'ON' : 'OFF');
+  btn.style.background = _afEnabled ? '#1a2d1a' : '#21262d';
+  btn.style.color      = _afEnabled ? '#3fb950' : '#8b949e';
+  btn.style.borderColor= _afEnabled ? '#3fb950' : '#30363d';
+  if (lbl) lbl.textContent = '/' + _afTarget;
+  if (cnt && d.counts) {
+    cnt.textContent = Object.entries(d.counts)
+      .map(([s,n]) => s+':'+n).join('  ');
+  }
+}
+
+function afToggle() {
+  fetch('/api/auto-fill', {method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({enabled: !_afEnabled})
+  }).then(r=>r.json()).then(_afRender).catch(()=>{});
+}
+
+(function pollAutoFill() {
+  fetch('/api/auto-fill').then(r=>r.json()).then(_afRender).catch(()=>{});
+  setTimeout(pollAutoFill, 10000);
 })();
 </script>
 {% endblock %}

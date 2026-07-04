@@ -86,13 +86,17 @@ def _load_trades_csv(csv_path: Path) -> pd.DataFrame | None:
         return None
     try:
         df = pd.read_csv(csv_path)
-        # Normalise column names (fetcher may use different cases)
         df.columns = [c.strip().lower() for c in df.columns]
-        ts_col = next((c for c in df.columns if "time" in c), None)
+        # Prefer explicit time_utc column; fall back to first column containing "time"
+        if "time_utc" in df.columns:
+            ts_col = "time_utc"
+        else:
+            ts_col = next((c for c in df.columns if "time" in c), None)
         price_col = next((c for c in df.columns if "price" in c), None)
         if ts_col is None or price_col is None:
             return None
-        df = df.rename(columns={ts_col: "time_utc", price_col: "price"})
+        # Keep only needed columns to avoid duplicate-rename collisions
+        df = df[[ts_col, price_col]].rename(columns={ts_col: "time_utc", price_col: "price"})
         df["time_utc"] = pd.to_datetime(df["time_utc"], utc=True)
         df["price"] = pd.to_numeric(df["price"], errors="coerce")
         df = df.dropna(subset=["time_utc", "price"]).sort_values("time_utc").reset_index(drop=True)
@@ -133,21 +137,20 @@ def _get_verified_trades(galao_db: Path) -> list[dict]:
     conn = sqlite3.connect(str(galao_db))
     conn.row_factory = sqlite3.Row
     try:
-        # Try verified_trades VIEW first
+        # Try verified_trades VIEW first — order DESC so dates with CSVs run first
         try:
             rows = conn.execute(
                 "SELECT id, symbol, direction, fill_price, fill_time, "
                 "exit_price, exit_time, exit_reason, pnl_points, bracket_size "
-                "FROM verified_trades ORDER BY fill_time"
+                "FROM verified_trades ORDER BY fill_time DESC"
             ).fetchall()
         except Exception:
-            # Fall back to completed_trades directly
             rows = conn.execute(
                 "SELECT id, symbol, direction, fill_price, fill_time, "
                 "exit_price, exit_time, exit_reason, pnl_points, bracket_size "
                 "FROM completed_trades "
                 "WHERE fill_price IS NOT NULL AND exit_price IS NOT NULL "
-                "ORDER BY fill_time"
+                "ORDER BY fill_time DESC"
             ).fetchall()
         return [dict(r) for r in rows]
     finally:
@@ -224,16 +227,7 @@ def run(bt_db_path: Path, galao_db: Path, history_dir: Path,
 
         trades_df = csv_cache[cache_key]
         if trades_df is None:
-            # No tick data for this day — record EXPIRED for all param_sets
-            for ps in param_sets:
-                ps_id = ps["id"] if isinstance(ps, dict) else ps[0]
-                bt_conn.execute(
-                    "INSERT OR IGNORE INTO bt_matrix_results "
-                    "(trade_id, param_set_id, symbol, trade_date, direction, "
-                    "exit_reason, pnl_ticks) VALUES (?,?,?,?,?,'NO_DATA',NULL)",
-                    (trade_id, ps_id, symbol, trade_date, direction)
-                )
-            bt_conn.commit()
+            # CSV not available yet — leave unprocessed so a future run picks it up
             skipped += len(param_sets)
             continue
 

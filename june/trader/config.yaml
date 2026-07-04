@@ -22,8 +22,8 @@ symbols:
 
 fetcher:
   auto_fetch_enabled: true
-  fetch_bid_ask: false          # BID_ASK not needed for backtrader; re-enable after backfill complete
-  backfill_bid_ask: false       # keep false until 6-month backfill is done (~7 days)
+  fetch_bid_ask: true           # BID_ASK enabled — needed for accurate fill simulation
+  backfill_bid_ask: true        # backfill BID_ASK for all existing TRADES-only dates
   backfill_days: 180            # how many trading days back to fill (Mon-Fri, most recent first)
   fetch_on_startup: true
   symbols_override:

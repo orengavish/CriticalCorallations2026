@@ -283,14 +283,25 @@ def poll_fills(ibc: IBClient, db_path) -> int:
         log.error(f"Error fetching trades: {e}")
         return 0
 
-    # Build lookup: ib_order_id → fill status
+    # Build lookup: ib_order_id → (status, fill_price, fill_time_utc)
     filled_ids = {}
     for trade in trades:
         oid = trade.order.orderId
         status = trade.orderStatus.status
         fill_price = trade.orderStatus.avgFillPrice
         if status in ("Filled", "PartiallyFilled"):
-            filled_ids[oid] = (status, fill_price)
+            ft_str = None
+            try:
+                if trade.fills:
+                    ft = trade.fills[-1].time
+                    if ft is not None:
+                        from datetime import timezone as _tz
+                        if ft.tzinfo is None:
+                            ft = ft.replace(tzinfo=_tz.utc)
+                        ft_str = ft.strftime("%Y-%m-%dT%H:%M:%SZ")
+            except Exception:
+                pass
+            filled_ids[oid] = (status, fill_price, ft_str or _now_utc())
 
     if not filled_ids:
         return 0
@@ -305,15 +316,14 @@ def poll_fills(ibc: IBClient, db_path) -> int:
     for cmd in submitted:
         entry_oid = cmd["ib_order_id"]
         if entry_oid in filled_ids:
-            status, fill_price = filled_ids[entry_oid]
+            status, fill_price, fill_time_ib = filled_ids[entry_oid]
             # R-ORD-13: treat all fills as complete (partial fills ignored in V1)
-            now = _now_utc()
             log.info(f"Command {cmd['id']} FILLED — price={fill_price}")
             with get_db(db_path) as con:
                 update_command_status(
                     con, cmd["id"], "FILLED",
                     fill_price = fill_price,
-                    fill_time  = now,
+                    fill_time  = fill_time_ib,
                 )
             fills += 1
 
@@ -335,11 +345,22 @@ def poll_tp_sl_fills(ibc: IBClient, db_path) -> int:
         log.error(f"poll_tp_sl_fills: error fetching trades: {e}")
         return 0
 
-    # Build map of filled order IDs → avg fill price
-    ib_filled: dict[int, float] = {}
+    # Build map of filled order IDs → (avg fill price, fill time from IB)
+    ib_filled: dict[int, tuple[float, str]] = {}
     for trade in trades:
         if trade.orderStatus.status == "Filled":
-            ib_filled[trade.order.orderId] = trade.orderStatus.avgFillPrice
+            ft_str = None
+            try:
+                if trade.fills:
+                    ft = trade.fills[-1].time
+                    if ft is not None:
+                        from datetime import timezone as _tz
+                        if ft.tzinfo is None:
+                            ft = ft.replace(tzinfo=_tz.utc)
+                        ft_str = ft.strftime("%Y-%m-%dT%H:%M:%SZ")
+            except Exception:
+                pass
+            ib_filled[trade.order.orderId] = (trade.orderStatus.avgFillPrice, ft_str or _now_utc())
 
     if not ib_filled:
         return 0
@@ -351,7 +372,6 @@ def poll_tp_sl_fills(ibc: IBClient, db_path) -> int:
         return 0
 
     closed = 0
-    now = _now_utc()
     for cmd in filled_cmds:
         tp_oid = cmd["ib_tp_order_id"]
         sl_oid = cmd["ib_sl_order_id"]
@@ -360,11 +380,12 @@ def poll_tp_sl_fills(ibc: IBClient, db_path) -> int:
             continue
 
         exit_price = None
+        exit_time  = None
 
         if tp_oid and tp_oid in ib_filled:
-            exit_price = ib_filled[tp_oid]
+            exit_price, exit_time = ib_filled[tp_oid]
         elif sl_oid and sl_oid in ib_filled:
-            exit_price = ib_filled[sl_oid]
+            exit_price, exit_time = ib_filled[sl_oid]
 
         if exit_price is None:
             continue
@@ -391,7 +412,7 @@ def poll_tp_sl_fills(ibc: IBClient, db_path) -> int:
         with get_db(db_path) as con:
             update_command_status(con, cmd["id"], "CLOSED",
                                   exit_price=exit_price,
-                                  exit_time=now,
+                                  exit_time=exit_time,
                                   exit_reason=exit_reason,
                                   pnl_points=round(pnl, 4))
             record_completed_trade(con, cmd["id"])

@@ -56,7 +56,9 @@ _LOCK_FILE = _ROOT / "data" / "fetch_scheduler.lock"
 
 
 def _acquire_lock() -> bool:
-    """Write PID lock file. Returns True if we got the lock, False if another instance is running."""
+    """Atomically write PID lock file using O_CREAT|O_EXCL. Returns True if we got the lock."""
+    _LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    # First: if lock exists, check if owning process is actually alive
     if _LOCK_FILE.exists():
         try:
             pid = int(_LOCK_FILE.read_text().strip())
@@ -66,11 +68,19 @@ def _acquire_lock() -> bool:
                 if any("fetch_scheduler" in " ".join(p) for p in [proc.cmdline()]):
                     log.warning("Another fetch_scheduler is already running (pid=%d) — exiting", pid)
                     return False
+            # Stale lock (process dead or not fetch_scheduler) — remove it
+            _LOCK_FILE.unlink(missing_ok=True)
         except Exception:
-            pass  # stale lock — overwrite it
-    _LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
-    _LOCK_FILE.write_text(str(os.getpid()))
-    return True
+            _LOCK_FILE.unlink(missing_ok=True)
+    # Atomic create: fails if another process just created it between our check and now
+    try:
+        fd = os.open(str(_LOCK_FILE), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.write(fd, str(os.getpid()).encode())
+        os.close(fd)
+        return True
+    except FileExistsError:
+        log.warning("Lost lock race — another fetch_scheduler grabbed it first")
+        return False
 
 
 def _release_lock():
@@ -149,22 +159,41 @@ def _present_files(cfg) -> set:
 
 MIN_TRADES_FOR_PRIORITY = 20  # dates with more verified trades than this go first
 
+def _ensure_progress_db(cfg):
+    """Create fetch_progress.db and its table if they don't exist yet."""
+    import sqlite3 as _sq3
+    from pathlib import Path as P
+    pdb = P(cfg.paths.db).parent / "fetch_progress.db"
+    pdb.parent.mkdir(parents=True, exist_ok=True)
+    with _sq3.connect(str(pdb)) as con:
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS fetch_progress (
+                symbol TEXT, date TEXT, data_type TEXT,
+                records_fetched INTEGER DEFAULT 0,
+                finished INTEGER DEFAULT 0,
+                updated_at TEXT,
+                PRIMARY KEY (symbol, date, data_type)
+            )
+        """)
+
+
 def _get_priority_dates(cfg, symbols: list) -> list:
     """
     Return list of (symbol, date) pairs to fetch, priority order:
-      P1. Verified-trade dates with n > MIN_TRADES_FOR_PRIORITY — scored immediately by backtrader
-      P2. Yesterday per symbol
-      P3. Verified-trade dates with n <= MIN_TRADES_FOR_PRIORITY — lower value, fetch after yesterday
-      P4. Backfill — last backfill_days trading days, Mon-Fri, most recent first
+      P1. CRITICAL  — dates in verified_trades (ANY symbol), missing CSV for each symbol.
+                      All symbols are fetched for each critical date (needed for correlation).
+      P2. RESUME    — partial files in fetch_progress (finished=0, records>0) not covered by P1.
+      P3. STANDARD  — backfill last backfill_days trading days, most recent first.
     Only considers BID_ASK as missing if fetch_bid_ask is enabled in config.
     Called repeatedly during the fetch loop so priority stays current.
     """
+    import sqlite3 as _sq3
     from pathlib import Path as P
+    _ensure_progress_db(cfg)   # guarantee table exists before querying
     present    = _present_files(cfg)
     do_bid_ask = bool(getattr(cfg.fetcher, "fetch_bid_ask", True))
     pairs      = []
     seen       = set()
-    _p3_pairs  = []  # verified dates with n <= threshold — inserted after P2
 
     def _is_missing(sym, d):
         if (sym, d, "trades") not in present:
@@ -173,62 +202,83 @@ def _get_priority_dates(cfg, symbols: list) -> list:
             return True
         return False
 
-    # P1 + collect P3: verified_trades dates, sorted by count DESC
+    # ── P1: CRITICAL — verified trade dates, all symbols ─────────────────────
+    # Key insight: MNQ/MYM have no verified trades themselves but we need their
+    # tick data on the same dates as MES verified trades for correlation backtests.
+    # Query dates only (not date+symbol), then add ALL symbols for each date.
+    vt_dates = []
     try:
         from lib.db import get_db
         db_path = P(cfg.paths.db)
         with get_db(db_path) as con:
             rows = con.execute(
-                "SELECT DATE(fill_time) AS d, symbol, COUNT(*) AS n "
-                "FROM verified_trades "
-                "GROUP BY DATE(fill_time), symbol "
-                "ORDER BY n DESC, d DESC"
+                "SELECT DISTINCT DATE(fill_time) AS d FROM verified_trades ORDER BY d ASC"
             ).fetchall()
-        for r in rows:
-            sym, d, n = r["symbol"], r["d"], r["n"]
-            if sym not in symbols:
-                continue
-            if _is_missing(sym, d):
-                key = (sym, d)
-                if key not in seen:
-                    seen.add(key)
-                    if n > MIN_TRADES_FOR_PRIORITY:
-                        pairs.append((sym, date.fromisoformat(d)))
-                    else:
-                        _p3_pairs.append((sym, date.fromisoformat(d)))
+        vt_dates = [r["d"] for r in rows]
     except Exception as e:
         log.warning("Could not query verified_trades: %s", e)
 
-    # P2: yesterday per symbol
-    yesterday = (datetime.now(CT) - timedelta(days=1)).date()
-    yd_str = yesterday.strftime("%Y-%m-%d")
-    for sym in symbols:
-        if _is_missing(sym, yd_str):
-            key = (sym, yd_str)
-            if key not in seen:
-                seen.add(key)
-                pairs.append((sym, yesterday))
+    # Partial files (finished=0, records>0) — needed to promote CRITICAL partials to P1
+    partial_keys: set = set()
+    try:
+        pdb = P(cfg.paths.db).parent / "fetch_progress.db"
+        with _sq3.connect(str(pdb)) as pcon:
+            pcon.row_factory = _sq3.Row
+            partial_rows = pcon.execute(
+                "SELECT symbol, date FROM fetch_progress "
+                "WHERE finished=0 AND records_fetched > 0 ORDER BY updated_at DESC"
+            ).fetchall()
+        for r in partial_rows:
+            if r["symbol"] in symbols:
+                partial_keys.add((r["symbol"], r["date"]))
+    except Exception as e:
+        log.warning("Could not query partial files: %s", e)
 
-    # P3: verified dates with n <= threshold (context, not yet fully scoreable)
-    pairs.extend(_p3_pairs)
+    for d_str in vt_dates:
+        for sym in symbols:
+            # CRITICAL if CSV missing -OR- CSV exists but fetch is unfinished
+            is_unfinished = (sym, d_str) in partial_keys
+            if _is_missing(sym, d_str) or is_unfinished:
+                key = (sym, d_str)
+                if key not in seen:
+                    seen.add(key)
+                    pairs.append((sym, date.fromisoformat(d_str)))
 
-    # P4: backfill — last backfill_days trading days, most recent first
+    # ── P2: RESUME — partial files not already covered by P1 ─────────────────
+    for sym, d_str in sorted(partial_keys):
+        key = (sym, d_str)
+        if key not in seen:
+            seen.add(key)
+            pairs.append((sym, date.fromisoformat(d_str)))
+
+    # ── P3: STANDARD — backfill recent trading days, most recent first ──────────
+    # P3a: trades CSV already present, only bidask missing — fast path, completes
+    #      the day without re-fetching trades (fetcher resumes from last tick instantly).
+    # P3b: trades missing — full fetch needed.
+    # P3a before P3b maximises number of fully complete days produced per unit time.
+    yesterday     = (datetime.now(CT) - timedelta(days=1)).date()
     backfill_days = int(getattr(cfg.fetcher, "backfill_days", 180))
-    if backfill_days > 0:
-        scan_date = yesterday - timedelta(days=1)
-        days_checked = 0
-        while days_checked < backfill_days:
-            if scan_date.weekday() < 5:  # Mon-Fri only
-                d_str = scan_date.strftime("%Y-%m-%d")
-                for sym in symbols:
-                    if _is_missing(sym, d_str):
-                        key = (sym, d_str)
-                        if key not in seen:
-                            seen.add(key)
-                            pairs.append((sym, scan_date))
-                days_checked += 1
-            scan_date -= timedelta(days=1)
+    scan_date     = yesterday
+    days_checked  = 0
+    p3a = []  # bidask-only (trades done)
+    p3b = []  # full fetch  (trades missing)
+    while days_checked < backfill_days:
+        if scan_date.weekday() < 5:  # Mon-Fri only
+            d_str = scan_date.strftime("%Y-%m-%d")
+            for sym in symbols:
+                if _is_missing(sym, d_str):
+                    key = (sym, d_str)
+                    if key not in seen:
+                        seen.add(key)
+                        if (sym, d_str, "trades") in present:
+                            p3a.append((sym, scan_date))
+                        else:
+                            p3b.append((sym, scan_date))
+            days_checked += 1
+        scan_date -= timedelta(days=1)
 
+    pairs.extend(p3a)
+    pairs.extend(p3b)
     return pairs
 
 
@@ -273,24 +323,51 @@ def run(specific_date: date = None, backfill: bool = False,
     prog_db_path = Path(cfg.paths.db).parent / "fetch_progress.db"
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # Ensure fetch_progress table exists before first _get_priority_dates call.
+    _ensure_progress_db(cfg)
+
     ib            = _connect(cfg)
     progress_conn = _init_progress_db(prog_db_path)
 
     all_ok = True
     _runner_path = Path(__file__).parent.parent / "back-trading" / "bt_matrix_runner.py"
 
+    # Cooldown map: (sym, date_str) → unix timestamp after which the target may be retried.
+    # Used when fetch_day returns skipped_active — we move on to other targets instead of
+    # spinning, and come back once the grace period (_is_actively_running = 120 s) expires.
+    _active_cooldowns: dict = {}
+
     def _next_target():
-        """Return next (sym, day) to fetch, or None if done."""
+        """Return next (sym, day) to fetch, skipping targets in active cooldown."""
         if not dynamic_mode:
             return static_pairs.pop(0) if static_pairs else None
         pairs = _get_priority_dates(cfg, symbols)
-        return pairs[0] if pairs else None
+        now = time.time()
+        # Evict expired cooldowns so they become eligible again
+        for k in [k for k, v in _active_cooldowns.items() if v <= now]:
+            del _active_cooldowns[k]
+        # Return first pair not in cooldown
+        for pair in pairs:
+            if (pair[0], str(pair[1])) not in _active_cooldowns:
+                return pair
+        # All current targets are in cooldown — signal caller to wait
+        return None
 
     try:
         while True:
             target = _next_target()
+
             if target is None:
-                break
+                # Truly done (no pairs left) or all pairs in cooldown
+                if not _active_cooldowns:
+                    break   # nothing left to fetch
+                # Wait until the nearest cooldown expires, then re-check
+                wait = max(min(_active_cooldowns.values()) - time.time(), 1)
+                log.info("All %d remaining target(s) in cooldown — waiting %.0fs",
+                         len(_active_cooldowns), wait)
+                time.sleep(wait)
+                continue
+
             sym, target_day = target
             log.info("--- %s  %s ---", sym, target_day)
             try:
@@ -299,14 +376,47 @@ def run(specific_date: date = None, backfill: bool = False,
                                     output_dir=output_dir,
                                     progress_conn=progress_conn)
                 log.info("fetch_day results: %s", results)
+
+                # Another process is actively fetching this (sym, date).
+                # Put it in cooldown (120 s = grace_seconds in _is_actively_running) and
+                # move on to other targets rather than blocking the whole queue.
+                if results and all(v == "skipped_active" for v in results.values()):
+                    key = (sym, str(target_day))
+                    _active_cooldowns[key] = time.time() + 120
+                    log.warning("%s %s — active in another process; "
+                                "cooldown 120s, moving to next target", sym, target_day)
+                    continue   # skip verification — nothing was written
+
             except Exception as e:
                 log.error("fetch_day %s %s failed: %s", sym, target_day, e)
                 all_ok = False
+                err_str = str(e).lower()
+                if "not connected" in err_str or "connection" in err_str or "disconnect" in err_str:
+                    log.warning("IB disconnected — trying to reconnect in 60 s...")
+                    time.sleep(60)
+                    try:
+                        ib.disconnect()
+                    except Exception:
+                        pass
+                    try:
+                        ib = _connect(cfg)
+                        log.info("Reconnected to IB")
+                    except Exception as re:
+                        log.error("Reconnect failed: %s — will retry in 120 s", re)
+                        time.sleep(120)
                 continue
 
-            # Verify + upload each completed file
+            # ── Verify + upload only dtypes that were actually fetched this pass ─
+            # results keys are uppercase ("TRADES", "BID_ASK"); values are int counts
+            # when fetched, or the strings "skipped" / "skipped_active" otherwise.
+            dtype_map = {"trades": "TRADES", "bidask": "BID_ASK"}
+            newly_fetched = {lc for lc, uc in dtype_map.items()
+                             if isinstance(results.get(uc), int)}
+
             date_compact = target_day.strftime("%Y%m%d")
             for dtype in ("trades", "bidask"):
+                if dtype not in newly_fetched:
+                    continue
                 file_path = output_dir / f"{sym}_{dtype}_{date_compact}.csv"
                 if not file_path.exists():
                     continue
@@ -323,8 +433,8 @@ def run(specific_date: date = None, backfill: bool = False,
                     log.warning("Verification FAILED for %s %s %s", sym, dtype, target_day)
                     all_ok = False
 
-            # Trigger matrix runner for newly completed (sym, date) in background
-            if _runner_path.exists():
+            # Trigger matrix runner only when at least one file was newly completed
+            if newly_fetched and _runner_path.exists():
                 try:
                     import subprocess as _sp
                     date_str = target_day.strftime("%Y-%m-%d")
@@ -438,30 +548,34 @@ def _self_test():
         _libdb.get_db = _fake_get_db
 
         try:
-            # Test 1: MES 2026-06-20 (25 trades, P1) must come before yesterday (P2)
+            # Test 1: MES 2026-06-20 (P1 critical) must be the first pair
             pairs = _get_priority_dates(cfg, ["MES", "MNQ", "MYM", "M2K"])
             assert len(pairs) > 0, "Expected at least 1 pair"
             assert pairs[0][0] == "MES", \
-                f"Expected MES first (P1 with 25 trades), got {pairs[0][0]}"
+                f"Expected MES first (oldest P1 date), got {pairs[0][0]}"
             assert pairs[0][1].isoformat() == "2026-06-20", \
                 f"Expected 2026-06-20 (P1), got {pairs[0][1]}"
 
-            # Test 2: MES 2026-06-27 (3 trades, P3) must come AFTER yesterday entries
+            # Test 2: ALL verified-trade dates are P1 regardless of trade count.
+            # Both 2026-06-20 (25 trades) and 2026-06-27 (3 trades) must come
+            # BEFORE any standard backfill (yesterday / recent) entries.
             yesterday_str = (datetime.now(CT) - timedelta(days=1)).date().isoformat()
-            p1_idx   = next(i for i,p in enumerate(pairs) if p[1].isoformat()=="2026-06-20")
-            p3_idx   = next((i for i,p in enumerate(pairs) if p[1].isoformat()=="2026-06-27"), None)
-            yd_idx   = next((i for i,p in enumerate(pairs) if p[1].isoformat()==yesterday_str), None)
-            assert p3_idx is None or (yd_idx is None or p3_idx > yd_idx), \
-                f"P3 date should come after yesterday in queue"
+            idx_jun20 = next(i for i,p in enumerate(pairs) if p[1].isoformat()=="2026-06-20")
+            idx_jun27 = next((i for i,p in enumerate(pairs) if p[1].isoformat()=="2026-06-27"), None)
+            idx_yd    = next((i for i,p in enumerate(pairs) if p[1].isoformat()==yesterday_str), None)
+            assert idx_jun20 == 0, f"2026-06-20 should be first, got index {idx_jun20}"
+            if idx_jun27 is not None and idx_yd is not None:
+                assert idx_jun27 < idx_yd, \
+                    f"P1 date 2026-06-27 (idx {idx_jun27}) should come before yesterday P3 (idx {idx_yd})"
 
-            # Test 3: after MES Jun-20 CSV added, MNQ should still appear
+            # Test 3: after MES Jun-20 CSV added, MNQ should still appear (same date still missing)
             mes_csv = Path(tmp_dir) / "MES_trades_20260620.csv"
             mes_csv.write_text("time_utc,price,size\n" + "x" * 200)
             pairs2 = _get_priority_dates(cfg, ["MES", "MNQ", "MYM", "M2K"])
             found_mnq = any(p[0] == "MNQ" for p in pairs2)
-            assert found_mnq, "MNQ should appear in priority list"
+            assert found_mnq, "MNQ should appear in priority list after MES CSV added"
 
-            print("PASS -- P1 (n>20) before P2 (yesterday) before P3 (n<=20), "
+            print("PASS -- P1 (all verified-trade dates) before P3 (standard backfill), "
                   "dynamic re-priority confirmed")
             return True
         finally:

@@ -263,8 +263,8 @@ WHERE
     AND ct.pnl_points  IS NOT NULL
     AND ct.fill_time   IS NOT NULL
     AND ct.exit_time   IS NOT NULL
-    -- exclude instant fill+exit (mass-reconnect / stale-data artifacts)
-    AND ct.fill_time != ct.exit_time
+    -- exit must not precede entry (pnl check catches artifacts)
+    AND ct.exit_time >= ct.fill_time
     -- pnl_points must match price arithmetic (catches any write-path bugs)
     AND ABS(ct.pnl_points - CASE c.direction
             WHEN 'BUY'  THEN ct.exit_price - ct.fill_price

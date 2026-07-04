@@ -177,12 +177,36 @@ CREATE TABLE IF NOT EXISTS completed_trades (
 );
 
 CREATE INDEX IF NOT EXISTS idx_commands_status      ON commands(status);
+CREATE TABLE IF NOT EXISTS price_cache (
+    symbol          TEXT PRIMARY KEY,
+    last_price      REAL    NOT NULL,
+    last_fill_ts    TEXT    NOT NULL,
+    source          TEXT    NOT NULL DEFAULT 'fill',
+    updated_at      TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+);
+
+CREATE TABLE IF NOT EXISTS algo_runs (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol              TEXT    NOT NULL,
+    date                TEXT    NOT NULL,           -- YYYY-MM-DD
+    algo_type           TEXT    NOT NULL,           -- BOUNCE | BREAKOUT | DIRECTIONAL | FADE | BOTH
+    tp_ticks            INTEGER NOT NULL,
+    sl_ticks            INTEGER NOT NULL,
+    direction_filter    TEXT    NOT NULL DEFAULT 'ALL',   -- ALL | BUY_ONLY | SELL_ONLY
+    strength_max        INTEGER NOT NULL DEFAULT 3,       -- 1=strong only 2=+medium 3=all
+    commands_generated  INTEGER NOT NULL DEFAULT 0,
+    current_price       REAL,
+    created_at          TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_commands_status      ON commands(status);
 CREATE INDEX IF NOT EXISTS idx_commands_symbol      ON commands(symbol);
 CREATE INDEX IF NOT EXISTS idx_positions_status     ON positions(status);
 CREATE INDEX IF NOT EXISTS idx_critical_lines_sd    ON critical_lines(symbol, date);
 CREATE INDEX IF NOT EXISTS idx_fetch_log_sd         ON fetch_log(symbol, date);
 CREATE INDEX IF NOT EXISTS idx_completed_source     ON completed_trades(source);
 CREATE INDEX IF NOT EXISTS idx_completed_exit_time  ON completed_trades(exit_time);
+CREATE INDEX IF NOT EXISTS idx_algo_runs_sym_date   ON algo_runs(symbol, date);
 """
 
 
@@ -275,6 +299,28 @@ def _migrate(path: Path = None):
         "ALTER TABLE commands ADD COLUMN source TEXT",
         "ALTER TABLE commands ADD COLUMN parent_command_id INTEGER",
         "ALTER TABLE commands ADD COLUMN critical_line_id INTEGER REFERENCES critical_lines(id)",
+        # Idempotent CREATE IF NOT EXISTS for tables added after initial schema
+        """CREATE TABLE IF NOT EXISTS price_cache (
+            symbol       TEXT PRIMARY KEY,
+            last_price   REAL NOT NULL,
+            last_fill_ts TEXT NOT NULL,
+            source       TEXT NOT NULL DEFAULT 'fill',
+            updated_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+        )""",
+        """CREATE TABLE IF NOT EXISTS algo_runs (
+            id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol             TEXT    NOT NULL,
+            date               TEXT    NOT NULL,
+            algo_type          TEXT    NOT NULL,
+            tp_ticks           INTEGER NOT NULL,
+            sl_ticks           INTEGER NOT NULL,
+            direction_filter   TEXT    NOT NULL DEFAULT 'ALL',
+            strength_max       INTEGER NOT NULL DEFAULT 3,
+            commands_generated INTEGER NOT NULL DEFAULT 0,
+            current_price      REAL,
+            created_at         TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+        )""",
+        "CREATE INDEX IF NOT EXISTS idx_algo_runs_sym_date ON algo_runs(symbol, date)",
     ]
     with get_db(path) as con:
         for stmt in alter_stmts:

@@ -2,188 +2,411 @@
 {% block title %}Fetch Status — Galao{% endblock %}
 
 {% block content %}
-<div style="display:flex;align-items:center;gap:14px;margin-bottom:12px;flex-wrap:wrap">
-  <h2 style="margin:0">Fetch Status <span id="refresh-indicator" style="font-size:10px;color:#6e7681"></span></h2>
+
+{# ── IB Status Strip ───────────────────────────────────────────────────────── #}
+<div id="ib-strip" style="display:flex;align-items:center;gap:18px;padding:8px 14px;
+     border-radius:6px;margin-bottom:12px;background:#161b22;border:1px solid #21262d;
+     font-size:12px;font-family:monospace;flex-wrap:wrap">
+  <span><span id="ib-dot" class="dot pending"></span><span id="ib-label">IB …</span></span>
+  <span id="ib-db-age" style="color:#8b949e"></span>
+  <span id="ib-gw"    style="color:#8b949e"></span>
+  <span style="flex:1"></span>
+  <span id="done-label" style="color:#8b949e"></span>
+  <span id="refresh-indicator" style="color:#484f58;font-size:10px"></span>
   <button id="btn-fetch-all" onclick="doFetchAll()"
-    style="font-family:monospace;font-size:12px;padding:5px 16px;background:#1a2d1a;color:#3fb950;
+    style="font-family:monospace;font-size:11px;padding:3px 12px;background:#1a2d1a;color:#3fb950;
            border:1px solid #3fb950;border-radius:4px;cursor:pointer;font-weight:bold">
-    ▶ Fetch All Missing
+    ▶ Start Fetcher
   </button>
   <button id="btn-fetch-stop" onclick="doFetchStop()"
-    style="font-family:monospace;font-size:12px;padding:5px 16px;background:#2d1a1a;color:#f85149;
+    style="font-family:monospace;font-size:11px;padding:3px 12px;background:#2d1a1a;color:#f85149;
            border:1px solid #f85149;border-radius:4px;cursor:pointer;font-weight:bold;display:none">
-    ■ Stop Fetch
+    ■ Stop Fetcher
   </button>
-  <span id="fetch-msg" style="font-size:12px;color:#8b949e;min-height:18px"></span>
+  <span id="fetch-msg" style="font-size:11px;color:#8b949e"></span>
 </div>
 
-<div class="card" style="margin-bottom:12px;padding:8px 14px">
+{# ── Split: Current File + Queue ───────────────────────────────────────────── #}
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px">
+
+  {# Current file card #}
+  <div class="card" id="current-card" style="padding:14px 16px;min-height:140px">
+    <div style="font-size:10px;color:#8b949e;text-transform:uppercase;letter-spacing:.08em;
+                margin-bottom:8px">Currently Fetching</div>
+    <div id="cur-nothing" style="color:#484f58;font-size:12px;margin-top:30px;text-align:center">
+      — idle —
+    </div>
+    <div id="cur-content" style="display:none">
+      <div style="display:flex;align-items:baseline;gap:10px;margin-bottom:6px">
+        <span id="cur-sym"  style="font-size:22px;font-weight:700;color:#c9d1d9;font-family:monospace"></span>
+        <span id="cur-date" style="font-size:14px;color:#8b949e;font-family:monospace"></span>
+        <span id="cur-tier" class="tier-badge"></span>
+      </div>
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px">
+        <div style="flex:1;height:6px;background:#21262d;border-radius:3px">
+          <div id="cur-bar" style="height:100%;border-radius:3px;background:#3fb950;transition:width .5s"></div>
+        </div>
+        <span id="cur-pct" style="font-size:13px;font-weight:bold;color:#3fb950;font-family:monospace;min-width:36px"></span>
+      </div>
+      <div style="display:flex;gap:20px;font-size:11px;font-family:monospace;color:#8b949e">
+        <span>
+          <span style="color:#6e7681;font-size:10px">T</span>
+          <span id="cur-trades-rec" style="color:#c9d1d9"></span>
+        </span>
+        <span id="cur-bidask-line" style="display:none">
+          <span style="color:#484f58;font-size:10px">B</span>
+          <span id="cur-bidask-rec" style="color:#6e7681"></span>
+        </span>
+        <span>of <span id="cur-est" style="color:#8b949e"></span></span>
+        <span id="cur-status"></span>
+      </div>
+    </div>
+  </div>
+
+  {# Queue card #}
+  <div class="card" style="padding:14px 16px">
+    <div style="font-size:10px;color:#8b949e;text-transform:uppercase;letter-spacing:.08em;
+                margin-bottom:8px">Next in Queue</div>
+    <div id="queue-list" style="font-family:monospace;font-size:11px"></div>
+    <div id="queue-empty" style="color:#484f58;font-size:12px;margin-top:30px;text-align:center">
+      — queue empty —
+    </div>
+  </div>
+
+</div>
+
+{# ── Legend ──────────────────────────────────────────────────────────────────── #}
+<div class="card" style="margin-bottom:12px;padding:6px 14px">
   <div style="display:flex;gap:20px;align-items:center;font-size:11px;flex-wrap:wrap">
-    <span><span class="dot ok"></span> Complete (CSV)</span>
+    <span><span class="dot ok"></span> Complete</span>
     <span><span class="dot active"></span> Fetching now</span>
-    <span><span class="dot stale"></span> Interrupted</span>
-    <span><span class="dot partial"></span> Partial (one type)</span>
+    <span><span class="dot recover"></span> Partial — will resume
+      <span style="color:#484f58;font-size:10px;margin-left:4px">(scheduler appends from last tick)</span>
+    </span>
     <span><span class="dot pending"></span> Missing</span>
+    <span style="margin-left:auto;color:#484f58;font-size:10px">
+      T = TRADES &nbsp; B = BID_ASK
+    </span>
   </div>
 </div>
 
+{# ── Compact grid ────────────────────────────────────────────────────────────── #}
 <div id="grid-wrap" style="overflow-x:auto">
   <table id="fetch-grid">
     <thead><tr id="grid-head"></tr></thead>
     <tbody id="grid-body"></tbody>
   </table>
 </div>
+
 {% endblock %}
 
 {% block scripts %}
 <style>
   .dot{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:4px;vertical-align:middle}
   .dot.ok      {background:#3fb950}
-  .dot.active  {background:#d29922;animation:fpulse 1.5s infinite}
-  .dot.stale   {background:#9e6a03}
-  .dot.partial {background:#58a6ff}
+  .dot.active  {background:#58a6ff;animation:fpulse 1.2s infinite}
+  .dot.recover {background:#d29922}
   .dot.pending {background:#30363d}
 
   #fetch-grid th{font-size:11px;padding:4px 8px;white-space:nowrap;color:#8b949e}
-  #fetch-grid td{padding:3px 5px;text-align:center;white-space:nowrap;font-size:11px}
+  #fetch-grid td{padding:3px 6px;text-align:center;white-space:nowrap;font-size:11px;
+                 vertical-align:middle;line-height:1.4}
 
-  .cell-ok      {background:#0f2d1a;color:#3fb950}
-  .cell-active  {background:#2d2200;color:#d29922}
-  .cell-stale   {background:#1a1600;color:#9e6a03}
-  .cell-partial {background:#0d1d2d;color:#58a6ff}
-  .cell-pending {background:#161b22;color:#6e7681}
-  .cell-err     {background:#2d0f0f;color:#f85149}
+  /* ── Three core cell states ── */
+  .cell-ok      {background:#0a1f10;color:#3fb950}
+  .cell-active  {background:#0d1d33;color:#58a6ff;animation:fpulse 1.2s ease-in-out infinite}
+  .cell-recover {background:#201800;color:#d29922}
+  .cell-pending {background:#0d1117;color:#30363d}
+
+  /* partial = one type done, other missing */
+  .cell-partial-t {background:#0a1f10;color:#3fb950}  /* trades ok, no bidask */
+  .cell-partial-b {background:#0d1117;color:#484f58}  /* bidask ok, no trades — rare */
+
+  .tier-badge{font-size:9px;padding:1px 5px;border-radius:3px;font-family:monospace;font-weight:700;
+              text-transform:uppercase;letter-spacing:.05em}
+  .tier-CRITICAL{background:#2d1a0f;color:#d29922;border:1px solid #9e6a03}
+  .tier-RESUME  {background:#0d1d2d;color:#58a6ff;border:1px solid #1f6feb}
+  .tier-STANDARD{background:#161b22;color:#6e7681;border:1px solid #30363d}
+  .tier-PARTIAL {background:#0d1d2d;color:#58a6ff;border:1px solid #1f6feb}
+
+  .queue-row{display:flex;align-items:center;gap:8px;padding:4px 0;border-bottom:1px solid #21262d}
+  .queue-row:last-child{border-bottom:none}
+  .queue-num{color:#484f58;min-width:18px;font-size:10px}
 
   @keyframes fpulse{0%,100%{opacity:1}50%{opacity:.35}}
-  .cell-active td {animation:fpulse 1.8s ease-in-out infinite}
 
-  .fetch-btn{background:#21262d;border:1px solid #30363d;color:#8b949e;
-             font-size:10px;padding:1px 5px;border-radius:3px;cursor:pointer;font-family:monospace}
-  .fetch-btn:hover{background:#30363d;color:#c9d1d9}
+  .mini-bar-wrap{width:100%;height:3px;background:#21262d;border-radius:2px;margin-top:3px}
+  .mini-bar-fill{height:100%;border-radius:2px;background:#58a6ff}
 
-  .mini-bar-wrap{width:100%;height:3px;background:#21262d;border-radius:2px;margin-top:2px}
-  .mini-bar-fill{height:100%;border-radius:2px;background:#d29922}
+  /* cell sub-labels */
+  .cell-t{font-size:10px;color:#6e7681;vertical-align:middle}
+  .cell-b{font-size:10px;color:#484f58;vertical-align:middle}
+  .cell-recover .cell-t{color:#9e6a03}
+  .cell-recover .cell-b{color:#6e4f00}
+  .cell-active  .cell-t{color:#3b7abf}
+  .cell-active  .cell-b{color:#2a5680}
 </style>
 
 <script>
-let _days=[], _symbols=[], _grid={};
-let _autoRefreshActive = false;
+let _days=[], _symbols=[], _grid={}, _bidaskEnabled=false;
 
-function statusPriority(s){ return {ok:0,active:1,stale:2,partial:3,missing:4,err:5}[s]??9; }
-
-function cellInfo(trades, bidask){
-  const tOk = trades && trades.status === 'ok';
-  const bOk = bidask && bidask.status === 'ok';
-  const tAct = trades && trades.status === 'active';
-  const bAct = bidask && bidask.status === 'active';
-  const tSt  = trades && trades.status === 'stale';
-  const bSt  = bidask && bidask.status === 'stale';
-
-  if (!trades && !bidask) return {cls:'cell-pending', lbl:'—', title:'not fetched'};
-  if (tOk && bOk) return {cls:'cell-ok', lbl:rowLabel(trades,'T')+' '+rowLabel(bidask,'B'), title:''};
-  if (tOk && !bidask) return {cls:'cell-partial', lbl:rowLabel(trades,'T')+' B:—', title:'bidask missing'};
-  if (bOk && !trades) return {cls:'cell-partial', lbl:'T:— '+rowLabel(bidask,'B'), title:'trades missing'};
-  if (tAct || bAct) return {cls:'cell-active',
-    lbl:rowLabel(trades,'T')+'<br>'+rowLabel(bidask,'B'),
-    title:'fetching', active:true, trades, bidask};
-  if (tSt || bSt) return {cls:'cell-stale', lbl:rowLabel(trades,'T')+' '+rowLabel(bidask,'B'), title:'interrupted'};
-  return {cls:'cell-pending', lbl:'—', title:'not fetched'};
+function _fmt(n){
+  if(n==null || n===0) return '—';
+  if(n>=1000000) return (n/1000000).toFixed(1)+'M';
+  if(n>=1000)    return (n/1000).toFixed(0)+'k';
+  return n;
 }
 
-function rowLabel(r, prefix){
-  if (!r) return prefix+':—';
-  if (r.status==='ok')     return prefix+':'+(r.rows?((r.rows/1000).toFixed(0)+'k'):'✓');
-  if (r.status==='active') return prefix+':'+(r.rows?((r.rows/1000).toFixed(1)+'k'):'...');
-  if (r.status==='stale')  return prefix+':'+(r.rows?((r.rows/1000).toFixed(1)+'k⚠'):'?');
-  return prefix+':—';
+function _fmtAge(s){
+  if(s==null) return '—';
+  if(s<90)   return `${s}s ago`;
+  if(s<3600) return `${Math.round(s/60)}m ago`;
+  return `${(s/3600).toFixed(1)}h ago`;
 }
 
+// ── IB strip + current file + queue ────────────────────────────────────────
+function updateQueue(){
+  fetch('/api/fetch-queue').then(r=>r.json()).then(d=>{
+    updateIBStrip(d.ib_status, d.total_done, d.total_entries);
+    updateCurrentCard(d.current);
+    updateQueueList(d.queue);
+  }).catch(()=>{});
+}
+
+function updateIBStrip(ib, done, total){
+  const dot   = document.getElementById('ib-dot');
+  const label = document.getElementById('ib-label');
+  const age   = document.getElementById('ib-db-age');
+  const gw    = document.getElementById('ib-gw');
+  const doneL = document.getElementById('done-label');
+
+  if(ib.fetching){
+    dot.className='dot active'; label.textContent='IB fetching';
+  } else if(ib.gw_reachable){
+    dot.className='dot ok'; label.textContent='IB gateway up';
+  } else {
+    dot.className='dot pending'; label.textContent='IB gateway DOWN';
+  }
+
+  const ageS = ib.db_age_s;
+  if(ageS!=null){
+    if(ageS < 90)
+      age.textContent = `last tick ${_fmtAge(ageS)}`;
+    else if(ageS < 300)
+      age.innerHTML  = `<span style="color:#d29922">⚠ stale ${_fmtAge(ageS)}</span>`;
+    else
+      age.innerHTML  = `<span style="color:#f85149">✗ stuck ${_fmtAge(ageS)}</span>`;
+  } else {
+    age.textContent = 'no active fetch';
+  }
+
+  gw.textContent = ib.gw_reachable ? 'port 4002 ✓' : 'port 4002 ✗';
+  gw.style.color  = ib.gw_reachable ? '#3fb950' : '#f85149';
+
+  if(done!=null && total!=null)
+    doneL.textContent = `${done}/${total} fetched`;
+}
+
+function updateCurrentCard(cur){
+  const nothing = document.getElementById('cur-nothing');
+  const content = document.getElementById('cur-content');
+  if(!cur){ nothing.style.display=''; content.style.display='none'; return; }
+
+  nothing.style.display='none'; content.style.display='';
+  document.getElementById('cur-sym').textContent  = cur.symbol;
+  document.getElementById('cur-date').textContent = cur.date;
+  document.getElementById('cur-pct').textContent  = `${cur.pct||0}%`;
+  document.getElementById('cur-bar').style.width  = `${cur.pct||0}%`;
+  document.getElementById('cur-trades-rec').textContent = _fmt(cur.records);
+  document.getElementById('cur-est').textContent         = _fmt(cur.est_total);
+
+  // Bidask line
+  const bLine = document.getElementById('cur-bidask-line');
+  if(cur.bidask_records != null){
+    bLine.style.display = '';
+    document.getElementById('cur-bidask-rec').textContent = _fmt(cur.bidask_records);
+  } else {
+    bLine.style.display = 'none';
+  }
+
+  const tier = cur.tier || 'STANDARD';
+  const tierEl = document.getElementById('cur-tier');
+  tierEl.textContent  = tier;
+  tierEl.className    = `tier-badge tier-${tier}`;
+
+  const stEl = document.getElementById('cur-status');
+  if(cur.is_active){
+    stEl.innerHTML = `<span style="color:#3fb950">● active</span>`;
+  } else if(cur.age_s!=null && cur.age_s < 300){
+    stEl.innerHTML = `<span style="color:#d29922">⚠ stale ${_fmtAge(cur.age_s)}</span>`;
+  } else if(cur.age_s!=null){
+    stEl.innerHTML = `<span style="color:#f85149">✗ stuck ${_fmtAge(cur.age_s)}</span>`;
+  } else {
+    stEl.textContent='';
+  }
+}
+
+function updateQueueList(queue){
+  const listEl  = document.getElementById('queue-list');
+  const emptyEl = document.getElementById('queue-empty');
+  if(!queue || queue.length===0){
+    listEl.innerHTML=''; emptyEl.style.display='';
+    return;
+  }
+  emptyEl.style.display='none';
+  listEl.innerHTML = queue.map((q,i) =>
+    `<div class="queue-row">
+       <span class="queue-num">${i+1}.</span>
+       <span style="color:#c9d1d9;min-width:36px">${q.symbol}</span>
+       <span style="color:#8b949e">${q.date}</span>
+       <span style="flex:1"></span>
+       <span class="tier-badge tier-${q.tier}">${q.tier}</span>
+     </div>`
+  ).join('');
+}
+
+// ── Grid cell rendering ───────────────────────────────────────────────────────
+
+function _cellState(t, b){
+  const tSt = t ? t.status : null;
+  const bSt = b ? b.status : null;
+  if(!t && !b)                             return 'pending';
+  if(tSt==='active' || bSt==='active')     return 'active';
+  if(tSt==='stale'  || bSt==='stale')      return 'recover';
+  if(tSt==='ok')                           return 'ok';
+  if(bSt==='ok' && !t)                     return 'ok';   // bidask only (unlikely)
+  return 'pending';
+}
+
+const _CLS = {
+  ok:      'cell-ok',
+  active:  'cell-active',
+  recover: 'cell-recover',
+  pending: 'cell-pending',
+};
+
+function _rowsLabel(r, active){
+  if(r==null || r===0) return '—';
+  const s = r>=1000000 ? (r/1000000).toFixed(1)+'M'
+          : r>=1000    ? (r/1000).toFixed(0)+'k'
+          : String(r);
+  return active ? s+'…' : s;
+}
+
+function renderCell(t, b){
+  const state = _cellState(t, b);
+  const cls   = _CLS[state];
+
+  if(state==='pending' && !t && !b)
+    return `<td class="${cls}">—</td>`;
+
+  const tAct = t && t.status==='active';
+  const bAct = b && b.status==='active';
+
+  // Trades line
+  const tLabel = t ? _rowsLabel(t.rows, tAct) : '—';
+
+  let inner = `<span class="cell-t">T</span>&nbsp;${tLabel}`;
+
+  // Bidask line — always show if enabled or if there's data
+  if(_bidaskEnabled || b){
+    const bLabel = b ? _rowsLabel(b.rows, bAct) : '—';
+    inner += `<br><span class="cell-b">B</span>&nbsp;<span style="color:inherit;opacity:.7">${bLabel}</span>`;
+  }
+
+  // Progress bar for active cell
+  if(state==='active'){
+    const rec = (t && t.rows) || 0;
+    const pct = Math.min(Math.round(rec/400000*100), 100);
+    inner += `<div class="mini-bar-wrap"><div class="mini-bar-fill" style="width:${pct}%"></div></div>`;
+  }
+
+  // Recovery indicator
+  if(state==='recover'){
+    const tPartial = t && t.rows > 0 && t.status==='stale';
+    const bPartial = b && b.rows > 0 && b.status==='stale';
+    const parts = [];
+    if(tPartial) parts.push('T');
+    if(bPartial) parts.push('B');
+    inner += `<div style="font-size:9px;color:#9e6a03;margin-top:1px">↻ ${parts.join('+')||'partial'}</div>`;
+  }
+
+  return `<td class="${cls}">${inner}</td>`;
+}
+
+// ── Build full grid ───────────────────────────────────────────────────────────
 function renderGrid(){
   const head = document.getElementById('grid-head');
   const body = document.getElementById('grid-body');
-  let hasActive = false;
 
-  head.innerHTML = '<th>Date</th>' +
-    _symbols.map(s=>`<th>${s}</th>`).join('') + '<th></th>';
+  head.innerHTML = '<th>Date</th>' + _symbols.map(s=>`<th>${s}</th>`).join('');
+
+  // Detect if any bidask data exists in grid
+  _bidaskEnabled = _days.some(d =>
+    _symbols.some(sym => {
+      const info = _grid[d] && _grid[d][sym];
+      return info && info.bidask;
+    })
+  );
 
   body.innerHTML = _days.map(d => {
     const cells = _symbols.map(sym => {
       const info = _grid[d] && _grid[d][sym];
       const t = info && info.trades;
       const b = info && info.bidask;
-      const ci = cellInfo(t, b);
-      if (ci.cls==='cell-active') hasActive = true;
-
-      let inner = ci.lbl;
-      if (ci.active) {
-        // mini progress bar for active cells
-        const pcts = [];
-        if (t && t.status==='active') pcts.push(Math.min((t.rows||0)/300000*100, 100));
-        if (b && b.status==='active') pcts.push(Math.min((b.rows||0)/100000*100, 100));
-        const avgPct = pcts.length ? pcts.reduce((a,b)=>a+b,0)/pcts.length : 0;
-        inner += `<div class="mini-bar-wrap"><div class="mini-bar-fill" style="width:${avgPct.toFixed(0)}%"></div></div>`;
-      }
-
-      return `<td class="${ci.cls}" title="${ci.title}">${inner}</td>`;
+      return renderCell(t, b);
     }).join('');
-    const btn = `<td><button class="fetch-btn" onclick="fetchNow('${d}')">Fetch</button></td>`;
-    return `<tr><td class="ts">${d}</td>${cells}${btn}</tr>`;
+    return `<tr><td class="ts">${d}</td>${cells}</tr>`;
   }).join('');
-
-  // Auto-refresh faster when active
-  if (hasActive !== _autoRefreshActive) {
-    _autoRefreshActive = hasActive;
-  }
 }
 
-function load(){
+function loadGrid(){
   fetch('/api/fetch-status').then(r=>r.json()).then(data=>{
     _days=data.days; _symbols=data.symbols; _grid=data.grid;
+    // Hide M2K if no data
+    if(_symbols.includes('M2K')){
+      const hasM2K = _days.some(d=>_grid[d] && _grid[d]['M2K'] &&
+        (_grid[d]['M2K'].trades || _grid[d]['M2K'].bidask));
+      if(!hasM2K) _symbols=_symbols.filter(s=>s!=='M2K');
+    }
     renderGrid();
-    const ind = document.getElementById('refresh-indicator');
-    if (ind) ind.textContent = new Date().toLocaleTimeString();
+    const ind=document.getElementById('refresh-indicator');
+    if(ind) ind.textContent=new Date().toLocaleTimeString();
   }).catch(()=>{});
-  fetch('/api/fetch-proc-status').then(r=>r.json()).then(d=>updateButtons(d.running)).catch(()=>{});
 }
 
-function updateButtons(running){
-  document.getElementById('btn-fetch-all').style.display  = running ? 'none' : '';
-  document.getElementById('btn-fetch-stop').style.display = running ? '' : 'none';
-  const msg = document.getElementById('fetch-msg');
-  if (running && !msg.textContent.startsWith('Started')) msg.textContent = 'Fetcher running…';
+function loadProcStatus(){
+  fetch('/api/fetch-proc-status').then(r=>r.json()).then(d=>{
+    document.getElementById('btn-fetch-all').style.display  = d.running ? 'none' : '';
+    document.getElementById('btn-fetch-stop').style.display = d.running ? '' : 'none';
+  }).catch(()=>{});
 }
 
 function doFetchAll(){
-  const msg = document.getElementById('fetch-msg');
-  msg.style.color='#d29922'; msg.textContent='Starting backfill…';
+  const msg=document.getElementById('fetch-msg');
+  msg.style.color='#d29922'; msg.textContent='Starting…';
   fetch('/api/fetch-start',{method:'POST'}).then(r=>r.json()).then(d=>{
-    if (d.error){ msg.style.color='#f85149'; msg.textContent='Error: '+d.error; return; }
-    if (d.status==='already_running'){ msg.textContent='Already running (pid '+d.pid+')'; return; }
-    msg.style.color='#3fb950'; msg.textContent='Started (pid '+d.pid+') — fetching all missing dates…';
-    updateButtons(true);
-    setTimeout(load, 3000);
-  }).catch(()=>{ msg.style.color='#f85149'; msg.textContent='Request failed'; });
+    if(d.error){msg.style.color='#f85149';msg.textContent='Error: '+d.error;return;}
+    if(d.status==='already_running'){msg.textContent='Already running (pid '+d.pid+')';return;}
+    msg.style.color='#3fb950'; msg.textContent='Started (pid '+d.pid+')';
+    loadProcStatus();
+    setTimeout(()=>{updateQueue();loadGrid();}, 3000);
+  }).catch(()=>{msg.style.color='#f85149';msg.textContent='Request failed';});
 }
 
 function doFetchStop(){
   fetch('/api/fetch-stop',{method:'POST'}).then(r=>r.json()).then(()=>{
-    updateButtons(false);
+    loadProcStatus();
     document.getElementById('fetch-msg').textContent='Stopped.';
   }).catch(()=>{});
 }
 
-function fetchNow(date){
-  const msg = document.getElementById('fetch-msg');
-  msg.style.color='#d29922'; msg.textContent='Starting fetch for '+date+'…';
-  fetch('/api/fetch-now',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({symbol:'all',date:date})
-  }).then(r=>r.json()).then(()=>{
-    msg.style.color='#3fb950'; msg.textContent='Started for '+date;
-    setTimeout(load, 4000);
-  }).catch(()=>{ msg.style.color='#f85149'; msg.textContent='Error'; });
-}
-
-load();
-setInterval(load, 5000);
+// ── Polling ──────────────────────────────────────────────────────────────────
+updateQueue();
+loadGrid();
+loadProcStatus();
+setInterval(updateQueue,    5000);
+setInterval(loadGrid,       8000);
+setInterval(loadProcStatus, 10000);
 </script>
 {% endblock %}

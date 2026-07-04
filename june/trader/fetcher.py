@@ -246,21 +246,20 @@ async def _progress_reporter(progress: list, what: str, interval: float = 15.0,
 async def _paginate_window_async(ib: IB, contract,
                                   win_start: datetime, win_end: datetime,
                                   what: str, win_idx: int,
-                                  progress: list) -> list:
+                                  progress: list,
+                                  write_row) -> int:
     """
-    Fetch all ticks in [win_start, win_end) for one parallel window.
-    Returns list of raw tuples:
-      TRADES:  (t_utc, price, size)
-      BID_ASK: (t_utc, bid_p, bid_s, ask_p, ask_s)
-    Storing primitives instead of tick objects keeps memory ~4× lower.
+    Fetch all ticks in [win_start, win_end).
+    Writes each tick to disk immediately via write_row — zero in-memory accumulation.
+    IB pages are sequential in time so no sort needed; dedup handles exact boundaries.
+    Returns total tick count for this window.
     """
-    ticks: list = []
+    count  = 0
     cursor = win_start
     last_processed_ts = None
     last_batch_fps: set = set()
 
     while _running and cursor < win_end:
-        # Stop cleanly on disconnect rather than hammering a dead connection
         if not ib.isConnected():
             log.warning(f"W{win_idx} {what}: IB not connected — waiting for reconnect")
             while not ib.isConnected() and _running:
@@ -294,9 +293,9 @@ async def _paginate_window_async(ib: IB, contract,
             break
 
         new_ticks = 0
-        batch_end_ts = None
+        batch_end_ts  = None
         batch_end_fps: set = set()
-        reached_end = False
+        reached_end   = False
 
         for tick in batch:
             t_u = tick.time
@@ -323,11 +322,12 @@ async def _paginate_window_async(ib: IB, contract,
 
             if t_u >= cursor:
                 if not (t_u == last_processed_ts and fp in last_batch_fps):
-                    ticks.append(row)
+                    write_row(*row)   # write immediately — no list accumulation
+                    count     += 1
                     new_ticks += 1
 
             if batch_end_ts is None or t_u > batch_end_ts:
-                batch_end_ts = t_u
+                batch_end_ts  = t_u
                 batch_end_fps = {fp}
             elif t_u == batch_end_ts:
                 batch_end_fps.add(fp)
@@ -343,64 +343,78 @@ async def _paginate_window_async(ib: IB, contract,
 
         last_processed_ts = batch_end_ts
         last_batch_fps    = batch_end_fps
-        progress[win_idx] = len(ticks)   # reporter reads this every 15 s
+        progress[win_idx] = count   # reporter reads this every 15s
 
-        # Brief yield — lets GC run and avoids IB pacing violations
         await asyncio.sleep(0.05)
 
     ct_str = cursor.astimezone(CT).strftime("%H:%M CT")
-    print(f"    W{win_idx} done: {len(ticks):,} ticks  last={ct_str}", flush=True)
-    return ticks
+    print(f"    W{win_idx} done: {count:,} ticks  last={ct_str}", flush=True)
+    return count
 
 
 def paginate_ticks(ib: IB, contract, start_utc: datetime, end_utc: datetime,
                    what: str, write_row, conn, symbol, date_str) -> int:
     """
-    Fetch all ticks for [start_utc, end_utc) using _N_WORKERS parallel async windows.
-    Each window paginates its sub-range independently via asyncio.gather.
-    All ticks are collected into lists, merged and sorted in memory, then written once.
+    Fetch all ticks for [start_utc, end_utc) using _N_WORKERS sequential windows.
+    write_row is called inline inside each window — max ~1000 ticks ever in memory.
+    A background reporter task updates the DB every 15s so the dashboard stays live.
     Returns total tick count.
     """
     duration = (end_utc - start_utc) / _N_WORKERS
     windows  = [(start_utc + i * duration, start_utc + (i + 1) * duration, i)
                 for i in range(_N_WORKERS)]
 
-    t0 = time.time()
-    print(f"\n    [{what}] {_N_WORKERS} parallel windows × "
+    t0                = time.time()
+    total             = 0
+    progress          = [0] * _N_WORKERS
+    completed_total   = [0]  # mutable ref so reporter sees updates
+
+    print(f"\n    [{what}] {_N_WORKERS} sequential windows × "
           f"{duration.total_seconds() / 3600:.1f}h each", flush=True)
 
-    async def _run_all():
-        progress = [0] * _N_WORKERS
-        reporter = asyncio.create_task(
-            _progress_reporter(progress, what, db_conn=conn, symbol=symbol, date_str=date_str)
-        )
-        try:
-            tasks = [_paginate_window_async(ib, contract, ws, we, what, wi, progress)
-                     for ws, we, wi in windows]
-            return await asyncio.gather(*tasks)
-        finally:
-            reporter.cancel()
+    async def _reporter():
+        """Update DB + print every 15s; runs concurrently inside the event loop."""
+        loop_ref = asyncio.get_event_loop()
+        t_start  = loop_ref.time()
+        while True:
+            await asyncio.sleep(_PROGRESS_LOG_INTERVAL)
+            current = completed_total[0] + sum(progress)
+            elapsed = loop_ref.time() - t_start
+            speed   = current / max(elapsed, 0.001)
+            print(f"    [{what}] {elapsed:5.0f}s  {current:>8,} ticks  {speed:5.0f} t/s",
+                  flush=True)
+            try:
+                _update_progress(conn, symbol, date_str, what, current)
+            except Exception:
+                pass
 
     loop = asyncio.get_event_loop()
-    results = loop.run_until_complete(_run_all())
+    reporter = loop.create_task(_reporter())
 
-    # Merge: windows are non-overlapping → extend then sort to guarantee order
-    all_ticks: list = []
-    for window_ticks in results:
-        all_ticks.extend(window_ticks)
-    all_ticks.sort(key=lambda x: x[0])
+    for ws, we, wi in windows:
+        if not _running:
+            break
+        w_count = loop.run_until_complete(
+            _paginate_window_async(ib, contract, ws, we, what, wi, progress, write_row)
+        )
+        total              += w_count
+        completed_total[0]  = total
+        progress[wi]        = 0   # reset so reporter doesn't double-count
+        _update_progress(conn, symbol, date_str, what, total)
+        elapsed = time.time() - t0
+        speed   = total / max(elapsed, 0.001)
+        print(f"    W{wi} done: {w_count:,} ticks  cumulative={total:,}  {speed:.0f} t/s",
+              flush=True)
+        log.info(f"{symbol} {what} W{wi} | {w_count:,} ticks | cumulative={total:,}")
 
-    total = len(all_ticks)
+    reporter.cancel()
+    try:
+        loop.run_until_complete(asyncio.gather(reporter, return_exceptions=True))
+    except Exception:
+        pass
+
     elapsed_fetch = time.time() - t0
-    speed = total / max(elapsed_fetch, 0.001)
-    print(f"\n    {what} collected: {total:,} ticks in {elapsed_fetch:.1f}s"
-          f"  ({speed:.0f} t/s) — writing to disk...", flush=True)
     log.info(f"{symbol} {what} | {date_str} | {total:,} ticks in {elapsed_fetch:.1f}s")
-
-    for row in all_ticks:
-        write_row(*row)
-
-    _update_progress(conn, symbol, date_str, what, total)
     return total
 
 

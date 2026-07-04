@@ -1,0 +1,543 @@
+{% extends "base.html" %}
+{% block title %}CL Algo — Galao{% endblock %}
+
+{% block content %}
+<style>
+/* ── CL Algo specific styles ────────────────────────────────────────────── */
+.cl-grid{display:grid;grid-template-columns:280px 1fr;gap:16px;align-items:start}
+.line-card{padding:6px 10px;border-radius:4px;border:1px solid #30363d;
+           display:flex;justify-content:space-between;align-items:center;
+           margin-bottom:4px;font-size:12px}
+.line-card.SUPPORT{border-left:3px solid #3fb950}
+.line-card.RESISTANCE{border-left:3px solid #f85149}
+.line-card.near{background:#1a2940}
+.algo-btn{padding:5px 14px;border:1px solid #30363d;border-radius:4px;
+          cursor:pointer;font-family:monospace;font-size:12px;
+          background:#161b22;color:#8b949e;margin-right:6px;margin-bottom:6px}
+.algo-btn:hover{background:#21262d;color:#c9d1d9}
+.algo-btn.selected{background:#1a2940;border-color:#58a6ff;color:#58a6ff;font-weight:bold}
+.param-matrix{border-collapse:collapse;font-size:12px}
+.param-matrix th{background:#161b22;color:#8b949e;padding:6px 10px;
+                  text-align:center;border:1px solid #30363d;font-size:11px}
+.param-matrix td{text-align:center;border:1px solid #21262d;padding:4px}
+.param-matrix td label{display:flex;align-items:center;justify-content:center;
+                        gap:4px;cursor:pointer;padding:6px 8px;border-radius:4px}
+.param-matrix td label:hover{background:#21262d}
+.param-matrix td.selected label{background:#0f2d1a}
+.param-matrix td.selected{background:#0a1f12}
+.param-matrix input[type=checkbox]{accent-color:#3fb950;width:14px;height:14px}
+.run-history td{font-size:11px}
+.strength-btn{padding:3px 10px;border:1px solid #30363d;border-radius:4px;
+              cursor:pointer;font-family:monospace;font-size:11px;
+              background:#161b22;color:#8b949e;margin-right:4px}
+.strength-btn.selected{background:#1a2940;border-color:#58a6ff;color:#58a6ff}
+.dir-btn{padding:3px 10px;border:1px solid #30363d;border-radius:4px;
+         cursor:pointer;font-family:monospace;font-size:11px;
+         background:#161b22;color:#8b949e;margin-right:4px}
+.dir-btn.selected{background:#1a2940;border-color:#58a6ff;color:#58a6ff}
+#preview-box{background:#161b22;border:1px solid #30363d;border-radius:4px;
+             padding:10px 14px;margin-top:10px;font-size:12px;min-height:40px}
+#preview-box .combo-row{display:flex;justify-content:space-between;
+                         padding:2px 0;border-bottom:1px solid #21262d}
+.run-badge{display:inline-block;padding:1px 8px;border-radius:10px;
+           font-size:11px;background:#1a4731;color:#3fb950;font-weight:bold}
+</style>
+
+<h2 style="margin-bottom:4px">Critical Lines Algo</h2>
+<div style="color:#6e7681;font-size:11px;margin-bottom:14px">
+  Select lines, algorithm, and parameter matrix — then run to generate PENDING commands.
+</div>
+
+<!-- ── Top controls ─────────────────────────────────────────────────────── -->
+<div class="filters" style="margin-bottom:14px">
+  <label style="color:#8b949e;font-size:12px">Symbol:</label>
+  <select id="sym-sel">
+    {% for s in symbols %}<option value="{{ s }}">{{ s }}</option>{% endfor %}
+    <option value="MES">MES</option>
+    <option value="MNQ">MNQ</option>
+    <option value="MYM">MYM</option>
+  </select>
+  <label style="color:#8b949e;font-size:12px">Date:</label>
+  <input type="date" id="date-sel">
+  <label style="color:#8b949e;font-size:12px">Qty/symbol:</label>
+  <input type="number" id="qty-inp" value="1" min="1" max="10"
+         style="width:50px;text-align:center">
+  <button id="load-lines-btn">Load Lines</button>
+  <span id="lines-status" style="font-size:11px;color:#8b949e"></span>
+</div>
+
+<div class="cl-grid">
+  <!-- ── Left: Critical Lines Panel ────────────────────────────────────── -->
+  <div>
+    <div class="card" style="padding:10px">
+      <div style="font-size:12px;color:#8b949e;margin-bottom:8px;font-weight:bold">
+        Critical Lines
+        <span id="line-count" style="color:#6e7681;font-weight:normal;margin-left:6px">—</span>
+      </div>
+      <div id="lines-list" style="max-height:480px;overflow-y:auto">
+        <div style="color:#6e7681;font-size:11px;padding:8px 0">Load lines above</div>
+      </div>
+    </div>
+
+    <!-- Recent Runs -->
+    <div class="card" style="padding:10px;margin-top:0">
+      <div style="font-size:12px;color:#8b949e;margin-bottom:8px;font-weight:bold">
+        Recent Runs
+      </div>
+      <div id="run-history-wrap">
+        <div style="color:#6e7681;font-size:11px">—</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Right: Algorithm Controls ──────────────────────────────────────── -->
+  <div>
+    <!-- Algorithm type -->
+    <div class="card" style="padding:12px">
+      <div style="font-size:12px;color:#8b949e;margin-bottom:8px;font-weight:bold">
+        Algorithm Type
+      </div>
+      <div id="algo-btns">
+        <button class="algo-btn" data-type="BOUNCE">BOUNCE</button>
+        <button class="algo-btn" data-type="BREAKOUT">BREAKOUT</button>
+        <button class="algo-btn selected" data-type="BOTH">BOTH</button>
+        <button class="algo-btn" data-type="DIRECTIONAL">DIRECTIONAL</button>
+        <button class="algo-btn" data-type="FADE">FADE</button>
+      </div>
+      <div id="algo-desc" style="margin-top:8px;font-size:11px;color:#6e7681;
+                                  background:#0d1117;border-radius:4px;padding:8px">
+        Full coverage: BUY+SELL × LMT+STP at every line. Maximum exposure, equivalent to the classic decider.
+      </div>
+    </div>
+
+    <!-- Filters -->
+    <div class="card" style="padding:12px">
+      <div style="display:flex;gap:24px;flex-wrap:wrap">
+        <div>
+          <div style="font-size:11px;color:#8b949e;margin-bottom:6px">Direction Filter</div>
+          <div id="dir-btns">
+            <button class="dir-btn selected" data-dir="ALL">ALL</button>
+            <button class="dir-btn" data-dir="BUY_ONLY">BUY ONLY</button>
+            <button class="dir-btn" data-dir="SELL_ONLY">SELL ONLY</button>
+          </div>
+        </div>
+        <div>
+          <div style="font-size:11px;color:#8b949e;margin-bottom:6px">Line Strength</div>
+          <div id="strength-btns">
+            <button class="strength-btn" data-strength="1">STRONG only</button>
+            <button class="strength-btn" data-strength="2">+MEDIUM</button>
+            <button class="strength-btn selected" data-strength="3">ALL</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Parameter Matrix -->
+    <div class="card" style="padding:12px">
+      <div style="font-size:12px;color:#8b949e;margin-bottom:10px;font-weight:bold">
+        Parameter Matrix
+        <span style="font-weight:normal;color:#6e7681;margin-left:8px;font-size:11px">
+          TP ticks (rows) × SL ticks (columns) — check combos to run
+        </span>
+      </div>
+
+      <div style="overflow-x:auto">
+        <table class="param-matrix" id="matrix-table">
+          <thead>
+            <tr>
+              <th>TP \ SL</th>
+              <th>2</th><th>3</th><th>4</th><th>5</th><th>6</th>
+              <th>8</th><th>10</th><th>12</th><th>16</th><th>20</th>
+            </tr>
+          </thead>
+          <tbody id="matrix-body">
+          </tbody>
+        </table>
+      </div>
+
+      <div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+        <button id="select-preset-fast" class="filters" style="padding:3px 8px;font-size:11px">
+          Preset: Fast (4×4, 4×6)
+        </button>
+        <button id="select-preset-swing" class="filters" style="padding:3px 8px;font-size:11px">
+          Preset: Swing (6×4, 8×4, 8×6)
+        </button>
+        <button id="select-preset-wide" class="filters" style="padding:3px 8px;font-size:11px">
+          Preset: Wide (10×6, 12×6, 12×8)
+        </button>
+        <button id="clear-matrix" class="filters" style="padding:3px 8px;font-size:11px;color:#f85149">
+          Clear
+        </button>
+        <span id="selected-count" style="font-size:11px;color:#6e7681"></span>
+      </div>
+    </div>
+
+    <!-- Preview + Run -->
+    <div class="card" style="padding:12px">
+      <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+        <button id="preview-btn"
+          style="background:#21262d;color:#c9d1d9;border:1px solid #30363d;
+                 padding:6px 18px;border-radius:4px;cursor:pointer;font-family:monospace;font-size:13px">
+          Preview
+        </button>
+        <button id="run-btn"
+          style="background:#1a4731;color:#3fb950;border:1px solid #2ea043;
+                 padding:6px 22px;border-radius:4px;cursor:pointer;
+                 font-family:monospace;font-size:13px;font-weight:bold">
+          RUN ALGO
+        </button>
+        <span id="run-msg" style="font-size:12px;color:#8b949e"></span>
+      </div>
+
+      <div id="preview-box" style="display:none">
+        <div style="color:#8b949e;font-size:11px;margin-bottom:6px">Preview (no DB writes)</div>
+        <div id="preview-combos"></div>
+        <div id="preview-total" style="margin-top:6px;font-weight:bold;color:#58a6ff"></div>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+// ── State ────────────────────────────────────────────────────────────────────
+const TP_VALS = [2, 3, 4, 5, 6, 8, 10, 12, 16, 20];
+const SL_VALS = [2, 3, 4, 5, 6, 8, 10, 12, 16, 20];
+let _algoType        = 'BOTH';
+let _dirFilter       = 'ALL';
+let _strengthMax     = 3;
+let _selectedCombos  = new Set();  // "tp,sl" strings
+let _algoDescs       = {};
+let _currentLines    = [];
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+function todayLocal(){
+  const d = new Date();
+  return d.getFullYear()+'-'
+    +String(d.getMonth()+1).padStart(2,'0')+'-'
+    +String(d.getDate()).padStart(2,'0');
+}
+
+function strKey(tp, sl){ return tp+','+sl; }
+
+function strengthLabel(s){
+  return s===1 ? '<span class="FILLED">●</span>' :
+         s===2 ? '<span class="PENDING">●</span>' :
+                 '<span style="color:#6e7681">●</span>';
+}
+
+// ── Build matrix table ────────────────────────────────────────────────────────
+function buildMatrix(){
+  const tbody = document.getElementById('matrix-body');
+  tbody.innerHTML = TP_VALS.map(tp =>
+    `<tr><th class="param-matrix" style="background:#161b22;color:#8b949e;padding:6px 8px;
+       border:1px solid #30363d;font-size:11px;white-space:nowrap">TP ${tp}t</th>` +
+    SL_VALS.map(sl => {
+      const key = strKey(tp, sl);
+      const checked = _selectedCombos.has(key);
+      return `<td id="cell-${tp}-${sl}" class="${checked?'selected':''}">
+        <label>
+          <input type="checkbox" id="chk-${tp}-${sl}"
+            ${checked?'checked':''} onchange="onCellToggle(${tp},${sl})">
+          <span style="font-size:10px;color:#6e7681">${tp}/${sl}</span>
+        </label>
+      </td>`;
+    }).join('')+`</tr>`
+  ).join('');
+  updateSelectedCount();
+}
+
+function onCellToggle(tp, sl){
+  const key = strKey(tp, sl);
+  const chk = document.getElementById(`chk-${tp}-${sl}`);
+  const cell = document.getElementById(`cell-${tp}-${sl}`);
+  if(chk.checked){
+    _selectedCombos.add(key);
+    cell.classList.add('selected');
+  } else {
+    _selectedCombos.delete(key);
+    cell.classList.remove('selected');
+  }
+  updateSelectedCount();
+}
+
+function updateSelectedCount(){
+  document.getElementById('selected-count').textContent =
+    _selectedCombos.size > 0
+      ? `${_selectedCombos.size} combo${_selectedCombos.size>1?'s':''} selected`
+      : 'no selection';
+}
+
+function selectCombos(combos){
+  _selectedCombos = new Set(combos.map(([tp,sl])=>strKey(tp,sl)));
+  buildMatrix();
+}
+
+// Preset buttons
+document.getElementById('select-preset-fast').addEventListener('click', ()=>{
+  selectCombos([[4,4],[4,6]]);
+});
+document.getElementById('select-preset-swing').addEventListener('click', ()=>{
+  selectCombos([[6,4],[8,4],[8,6]]);
+});
+document.getElementById('select-preset-wide').addEventListener('click', ()=>{
+  selectCombos([[10,6],[12,6],[12,8]]);
+});
+document.getElementById('clear-matrix').addEventListener('click', ()=>{
+  selectCombos([]);
+});
+
+// ── Algo type buttons ─────────────────────────────────────────────────────────
+function loadAlgoTypes(){
+  fetch('/api/cl-algo-types').then(r=>r.json()).then(types=>{
+    types.forEach(t=>{ _algoDescs[t.type] = t.description; });
+    updateAlgoDesc();
+  }).catch(()=>{});
+}
+
+document.getElementById('algo-btns').addEventListener('click', e=>{
+  const btn = e.target.closest('.algo-btn');
+  if(!btn) return;
+  document.querySelectorAll('.algo-btn').forEach(b=>b.classList.remove('selected'));
+  btn.classList.add('selected');
+  _algoType = btn.dataset.type;
+  updateAlgoDesc();
+});
+
+function updateAlgoDesc(){
+  const el = document.getElementById('algo-desc');
+  el.textContent = _algoDescs[_algoType] || '...';
+}
+
+// ── Direction filter buttons ──────────────────────────────────────────────────
+document.getElementById('dir-btns').addEventListener('click', e=>{
+  const btn = e.target.closest('.dir-btn');
+  if(!btn) return;
+  document.querySelectorAll('.dir-btn').forEach(b=>b.classList.remove('selected'));
+  btn.classList.add('selected');
+  _dirFilter = btn.dataset.dir;
+});
+
+// ── Strength buttons ──────────────────────────────────────────────────────────
+document.getElementById('strength-btns').addEventListener('click', e=>{
+  const btn = e.target.closest('.strength-btn');
+  if(!btn) return;
+  document.querySelectorAll('.strength-btn').forEach(b=>b.classList.remove('selected'));
+  btn.classList.add('selected');
+  _strengthMax = parseInt(btn.dataset.strength);
+});
+
+// ── Load critical lines ───────────────────────────────────────────────────────
+function loadLines(sym, date){
+  document.getElementById('lines-status').textContent = 'Loading…';
+  fetch(`/api/cl-lines?symbol=${encodeURIComponent(sym)}&date=${encodeURIComponent(date)}`)
+    .then(r=>r.json())
+    .then(rows=>{
+      _currentLines = rows;
+      renderLines(rows, sym);
+      document.getElementById('lines-status').textContent =
+        rows.length ? `${rows.length} lines` : '⚠ no lines in DB for this date';
+    })
+    .catch(e=>{
+      document.getElementById('lines-status').textContent = '✗ error: '+e;
+    });
+}
+
+function renderLines(lines, sym){
+  const el = document.getElementById('lines-list');
+  const count = document.getElementById('line-count');
+  if(!lines.length){
+    el.innerHTML = `<div style="color:#6e7681;font-size:11px;padding:8px 0">
+      No armed lines in DB. Go to <a href="/lines">Lines</a> to add them.
+    </div>`;
+    count.textContent = '0 lines';
+    return;
+  }
+  count.textContent = lines.length + ' line' + (lines.length>1?'s':'');
+
+  // Get current price for distance display
+  fetch('/api/price').then(r=>r.json()).then(priceData=>{
+    const price = priceData.price;
+    const res = lines.filter(l=>l.line_type==='RESISTANCE');
+    const sup = lines.filter(l=>l.line_type==='SUPPORT');
+    const all = [...res, ...sup];  // descending price (API already ordered DESC)
+
+    el.innerHTML = all.map(l=>{
+      const dist = price ? (l.price - price) : null;
+      const distStr = dist === null ? ''
+        : `<span class="${dist>=0?'ladder-dist above':'ladder-dist below'}">${dist>=0?'+':''}${dist.toFixed(2)}</span>`;
+      const sLabel = l.strength===1?'<span class="FILLED" title="strong">S</span>'
+                   : l.strength===2?'<span class="PENDING" title="medium">M</span>'
+                   : '<span style="color:#6e7681" title="weak">W</span>';
+      const isNear = price && Math.abs(dist) < 5.0;
+      return `<div class="line-card ${l.line_type}${isNear?' near':''}">
+        <span class="${l.line_type==='SUPPORT'?'PASS':'SELL'}">${l.price.toFixed(2)}</span>
+        <span style="font-size:10px;color:#6e7681">${l.line_type.slice(0,3)}</span>
+        ${sLabel}
+        ${distStr}
+      </div>`;
+    }).join('');
+
+    // Insert "current price" divider
+    if(price){
+      const items = el.querySelectorAll('.line-card');
+      let inserted = false;
+      for(let i=0; i<items.length; i++){
+        const lPrice = parseFloat(items[i].querySelector('span').textContent);
+        if(!inserted && lPrice < price){
+          const div = document.createElement('div');
+          div.style.cssText = 'text-align:center;color:#58a6ff;font-size:11px;padding:3px 0;border-top:1px dashed #30363d;border-bottom:1px dashed #30363d;margin:2px 0';
+          div.textContent = `▶ ${price.toFixed(2)}`;
+          items[i].parentNode.insertBefore(div, items[i]);
+          inserted = true;
+        }
+      }
+    }
+  }).catch(()=>{});
+}
+
+document.getElementById('load-lines-btn').addEventListener('click', ()=>{
+  const sym  = document.getElementById('sym-sel').value;
+  const date = document.getElementById('date-sel').value;
+  loadLines(sym, date);
+});
+
+// ── Preview ───────────────────────────────────────────────────────────────────
+document.getElementById('preview-btn').addEventListener('click', ()=>{
+  const combos = getSelectedCombos();
+  if(!combos.length){ showMsg('Select at least one TP/SL combo first.', '#d29922'); return; }
+
+  const sym  = document.getElementById('sym-sel').value;
+  const date = document.getElementById('date-sel').value;
+
+  showMsg('Previewing…', '#8b949e');
+  fetch('/api/cl-algo-preview', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({
+      symbol: sym, date, algo_type: _algoType,
+      tp_ticks_list: combos.map(c=>c[0]),
+      sl_ticks_list: combos.map(c=>c[1]),
+      direction_filter: _dirFilter,
+      strength_max: _strengthMax,
+    })
+  })
+  .then(r=>r.json())
+  .then(d=>{
+    showMsg('', '');
+    const box = document.getElementById('preview-box');
+    const combosEl = document.getElementById('preview-combos');
+    const totalEl  = document.getElementById('preview-total');
+
+    combosEl.innerHTML = d.combos.map(c=>
+      `<div class="combo-row">
+        <span style="color:#8b949e">TP ${c.tp_ticks}t / SL ${c.sl_ticks}t</span>
+        <span style="color:#c9d1d9">${c.count} commands</span>
+      </div>`
+    ).join('');
+    totalEl.textContent = `Total: ${d.total} commands will be inserted`;
+    if(d.current_price) totalEl.textContent += ` @ price ${d.current_price.toFixed(2)}`;
+    box.style.display = '';
+  })
+  .catch(e=>{ showMsg('✗ '+e, '#f85149'); });
+});
+
+// ── Run ───────────────────────────────────────────────────────────────────────
+document.getElementById('run-btn').addEventListener('click', ()=>{
+  const combos = getSelectedCombos();
+  if(!combos.length){ showMsg('Select at least one TP/SL combo first.', '#d29922'); return; }
+  if(!_currentLines.length){ showMsg('No lines loaded — click Load Lines first.', '#d29922'); return; }
+
+  const total_preview_cmds = combos.length * _currentLines.length * 2;  // rough estimate
+  if(!confirm(`Run ${_algoType} algo with ${combos.length} param combo(s) on ${_currentLines.length} lines?\n\nThis will INSERT PENDING orders into the DB.\n(The broker will start submitting them immediately.)`)) return;
+
+  const sym  = document.getElementById('sym-sel').value;
+  const date = document.getElementById('date-sel').value;
+  const qty  = parseInt(document.getElementById('qty-inp').value) || 1;
+
+  showMsg('Running…', '#8b949e');
+  document.getElementById('run-btn').disabled = true;
+
+  fetch('/api/cl-algo-run', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({
+      symbol: sym, date, algo_type: _algoType,
+      tp_ticks_list: combos.map(c=>c[0]),
+      sl_ticks_list: combos.map(c=>c[1]),
+      direction_filter: _dirFilter,
+      strength_max: _strengthMax,
+      quantity: qty,
+    })
+  })
+  .then(r=>r.json())
+  .then(d=>{
+    showMsg(`✓ ${d.total} commands inserted across ${d.runs.length} combo(s)`, '#3fb950');
+    loadRunHistory();
+  })
+  .catch(e=>{ showMsg('✗ '+e, '#f85149'); })
+  .finally(()=>{ document.getElementById('run-btn').disabled = false; });
+});
+
+// ── Run history ───────────────────────────────────────────────────────────────
+function loadRunHistory(){
+  fetch('/api/cl-algo-runs?limit=20').then(r=>r.json()).then(rows=>{
+    const el = document.getElementById('run-history-wrap');
+    if(!rows.length){ el.innerHTML = '<div style="color:#6e7681;font-size:11px">—</div>'; return; }
+    el.innerHTML = `<table style="width:100%;font-size:11px;border-collapse:collapse">
+      <thead><tr>
+        <th style="text-align:left;color:#6e7681;padding:2px 6px">#</th>
+        <th style="text-align:left;color:#6e7681;padding:2px 6px">Time</th>
+        <th style="color:#6e7681;padding:2px 6px">Sym</th>
+        <th style="color:#6e7681;padding:2px 6px">Algo</th>
+        <th style="color:#6e7681;padding:2px 6px">TP/SL</th>
+        <th style="color:#6e7681;padding:2px 6px">N</th>
+      </tr></thead>
+      <tbody>` +
+      rows.map(r=>`<tr>
+        <td style="color:#6e7681;padding:2px 6px">${r.id}</td>
+        <td style="color:#6e7681;padding:2px 6px">${(r.created_at||'').slice(11,16)}</td>
+        <td style="text-align:center;padding:2px 6px">${r.symbol}</td>
+        <td style="text-align:center;padding:2px 6px;color:#79c0ff">${r.algo_type}</td>
+        <td style="text-align:center;padding:2px 6px;color:#8b949e">${r.tp_ticks}/${r.sl_ticks}</td>
+        <td style="text-align:center;padding:2px 6px"><span class="run-badge">${r.commands_generated}</span></td>
+      </tr>`).join('')+
+    `</tbody></table>`;
+  }).catch(()=>{});
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+function getSelectedCombos(){
+  return [..._selectedCombos].map(k=>{
+    const [tp,sl] = k.split(',').map(Number);
+    return [tp, sl];
+  });
+}
+
+function showMsg(msg, color){
+  const el = document.getElementById('run-msg');
+  el.textContent = msg;
+  el.style.color = color;
+}
+
+// ── Init ──────────────────────────────────────────────────────────────────────
+document.getElementById('date-sel').value = todayLocal();
+
+// Deduplicate symbols in selector
+const symSel = document.getElementById('sym-sel');
+const seen = new Set();
+[...symSel.options].forEach(o=>{ if(seen.has(o.value)){ o.remove(); } else { seen.add(o.value); } });
+
+buildMatrix();
+loadAlgoTypes();
+loadRunHistory();
+
+// Auto-load today's lines
+const initSym = symSel.value;
+loadLines(initSym, todayLocal());
+
+// Refresh run history every 15s
+setInterval(loadRunHistory, 15000);
+</script>
+{% endblock %}
