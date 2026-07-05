@@ -36,7 +36,7 @@ _ROOT = Path(__file__).parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from lib.db import get_db, init_db
+from lib.db             import get_db, init_db
 from lib.data_availability import get_ready_days, summarise
 
 
@@ -63,10 +63,11 @@ def run_pipeline(db_path: Path, history_dir: Path,
                  dry_run: bool = False,
                  verbose: bool = False) -> dict:
     """
-    Full pipeline: availability → backtest → score → learn.
+    Full pipeline: availability → half-duplex backtest + full-duplex → score → learn.
     Returns summary dict.
     """
     bt  = _load("cl_algo_backtester")
+    fd  = _load("cl_algo_full_duplex")
     sc  = _load("cl_algo_scorer")
     lr  = _load("cl_algo_learner")
 
@@ -74,7 +75,7 @@ def run_pipeline(db_path: Path, history_dir: Path,
     init_db(db_path)
 
     # Stage 1: data availability
-    _print("Stage 1/4 — Checking data availability...")
+    _print("Stage 1/5 — Checking data availability...")
     ready_days = get_ready_days(db_path, history_dir, symbols=syms)
     _print(summarise(ready_days))
 
@@ -92,8 +93,8 @@ def run_pipeline(db_path: Path, history_dir: Path,
 
         _print(f"[{sym}] {len(sym_days)} ready day(s)")
 
-        # Stage 2: backtest
-        _print(f"[{sym}] Stage 2/4 — Running backtester...")
+        # Stage 2a: half-duplex backtest (Cartesian combos)
+        _print(f"[{sym}] Stage 2a/5 — Half-duplex backtester (combo matrix)...")
         bt_result = bt.run(
             db_path=db_path,
             history_dir=history_dir,
@@ -101,13 +102,27 @@ def run_pipeline(db_path: Path, history_dir: Path,
             dry_run=dry_run,
             verbose=verbose,
         )
-        _print(f"[{sym}] Backtest: written={bt_result.get('written',0)}"
+        _print(f"[{sym}] Half-duplex: written={bt_result.get('written',0)}"
                f" skipped={bt_result.get('skipped',0)}"
                f" errors={bt_result.get('errors',0)}"
                f" elapsed={bt_result.get('elapsed_s','?')}s")
 
-        # Stage 3: score
-        _print(f"[{sym}] Stage 3/4 — Scoring combos...")
+        # Stage 2b: full-duplex backtest (structural exits via critical lines)
+        _print(f"[{sym}] Stage 2b/5 — Full-duplex backtester (structural exits)...")
+        fd_result = fd.run(
+            db_path=db_path,
+            history_dir=history_dir,
+            symbols=[sym],
+            dry_run=dry_run,
+            verbose=verbose,
+        )
+        _print(f"[{sym}] Full-duplex: written={fd_result.get('written',0)}"
+               f" skipped={fd_result.get('skipped',0)}"
+               f" errors={fd_result.get('errors',0)}"
+               f" elapsed={fd_result.get('elapsed_s','?')}s")
+
+        # Stage 3: score (half-duplex combos)
+        _print(f"[{sym}] Stage 3/5 — Scoring combos...")
         score_result = sc.score(db_path, sym, verbose=verbose)
         top = score_result.get("top")
         if top:
@@ -119,8 +134,26 @@ def run_pipeline(db_path: Path, history_dir: Path,
         else:
             _print(f"[{sym}] No ranked combos yet (insufficient data)")
 
-        # Stage 4: learn
-        _print(f"[{sym}] Stage 4/4 — Running learner...")
+        # Stage 4: full-duplex summary
+        with get_db(db_path) as con:
+            fd_rows = con.execute("""
+                SELECT COUNT(*) as n_total,
+                       SUM(CASE WHEN exit_reason='TP' THEN 1 ELSE 0 END) as n_tp,
+                       SUM(CASE WHEN exit_reason='SL' THEN 1 ELSE 0 END) as n_sl,
+                       AVG(pnl_ticks) as avg_pnl,
+                       SUM(CASE WHEN tp_source='critical_line' THEN 1 ELSE 0 END) as n_cl_tp,
+                       SUM(CASE WHEN sl_source='critical_line' THEN 1 ELSE 0 END) as n_cl_sl
+                FROM cl_algo_fd_results
+                WHERE symbol=? AND entry_fill_price IS NOT NULL
+            """, (sym,)).fetchone()
+        if fd_rows and fd_rows["n_total"]:
+            _print(f"[{sym}] Full-duplex fills: {fd_rows['n_total']} fills"
+                   f" TP={fd_rows['n_tp']} SL={fd_rows['n_sl']}"
+                   f" avg_pnl={fd_rows['avg_pnl']:.1f}t"
+                   f" CL-exits={fd_rows['n_cl_tp']}/{fd_rows['n_cl_sl']}")
+
+        # Stage 5: learn (uses half-duplex scores for now)
+        _print(f"[{sym}] Stage 5/5 — Running learner...")
         learn_result = lr.recommend(db_path, sym, dry_run=dry_run)
         _print(f"[{sym}] Status={learn_result['convergence_status']}"
                f" iteration={learn_result['iteration']}")
@@ -130,6 +163,7 @@ def run_pipeline(db_path: Path, history_dir: Path,
         all_results[sym] = {
             "ready_days":      len(sym_days),
             "bt":              bt_result,
+            "fd":              fd_result,
             "score":           score_result,
             "learn":           learn_result,
         }

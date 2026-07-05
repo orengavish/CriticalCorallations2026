@@ -292,6 +292,48 @@ CREATE INDEX IF NOT EXISTS idx_algo_runs_sym_date   ON algo_runs(symbol, date);
 CREATE INDEX IF NOT EXISTS idx_cl_sim_sym_date      ON cl_algo_sim_results(symbol, date);
 CREATE INDEX IF NOT EXISTS idx_cl_sim_combo         ON cl_algo_sim_results(algo_type, tp_ticks, sl_ticks);
 CREATE INDEX IF NOT EXISTS idx_cl_scores_sym        ON cl_algo_combo_scores(symbol, scored_at);
+
+CREATE TABLE IF NOT EXISTS cl_algo_day_params (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol              TEXT    NOT NULL,
+    date                TEXT    NOT NULL,           -- YYYY-MM-DD trading date
+    two_hour_avg_move   REAL    NOT NULL,           -- avg(max-min) per 2hr window, prior day
+    source_date         TEXT    NOT NULL,           -- YYYY-MM-DD the prior day used (or 'default')
+    tick_buffer         INTEGER NOT NULL DEFAULT 1, -- ticks added/subtracted at entry/exit/sl
+    computed_at         TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+    UNIQUE(symbol, date)
+);
+
+CREATE TABLE IF NOT EXISTS cl_algo_fd_results (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    date                TEXT    NOT NULL,
+    symbol              TEXT    NOT NULL,
+    entry_line_price    REAL    NOT NULL,
+    entry_line_type     TEXT    NOT NULL,           -- SUPPORT | RESISTANCE
+    entry_line_strength INTEGER NOT NULL,
+    direction           TEXT    NOT NULL,           -- BUY | SELL
+    entry_type          TEXT    NOT NULL,           -- LMT | STP
+    entry_price         REAL    NOT NULL,           -- line_price ± tick_buffer
+    tp_line_price       REAL,                       -- NULL if 2hr_avg fallback used
+    tp_price            REAL    NOT NULL,           -- actual TP order price
+    tp_source           TEXT    NOT NULL,           -- 'critical_line' | '2hr_avg_fallback'
+    sl_line_price       REAL,                       -- NULL if 2hr_avg fallback used
+    sl_price            REAL    NOT NULL,           -- actual SL order price
+    sl_source           TEXT    NOT NULL,           -- 'critical_line' | '2hr_avg_fallback'
+    two_hour_avg_move   REAL    NOT NULL,           -- cap value in effect for this row
+    tick_buffer         INTEGER NOT NULL DEFAULT 1,
+    entry_fill_price    REAL,
+    entry_fill_time     TEXT,
+    exit_reason         TEXT,                       -- TP | SL | EXPIRED | ERROR
+    exit_fill_price     REAL,
+    pnl_ticks           REAL,
+    ticks_to_exit       INTEGER,
+    created_at          TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+    UNIQUE(date, symbol, entry_line_price, direction, entry_type)
+);
+
+CREATE INDEX IF NOT EXISTS idx_cl_fd_sym_date  ON cl_algo_fd_results(symbol, date);
+CREATE INDEX IF NOT EXISTS idx_cl_fd_direction ON cl_algo_fd_results(direction, entry_type);
 """
 
 
@@ -455,6 +497,30 @@ def _migrate(path: Path = None):
         "CREATE INDEX IF NOT EXISTS idx_cl_sim_sym_date ON cl_algo_sim_results(symbol, date)",
         "CREATE INDEX IF NOT EXISTS idx_cl_sim_combo ON cl_algo_sim_results(algo_type, tp_ticks, sl_ticks)",
         "CREATE INDEX IF NOT EXISTS idx_cl_scores_sym ON cl_algo_combo_scores(symbol, scored_at)",
+        """CREATE TABLE IF NOT EXISTS cl_algo_day_params (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol TEXT NOT NULL, date TEXT NOT NULL,
+            two_hour_avg_move REAL NOT NULL, source_date TEXT NOT NULL,
+            tick_buffer INTEGER NOT NULL DEFAULT 1,
+            computed_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+            UNIQUE(symbol, date)
+        )""",
+        """CREATE TABLE IF NOT EXISTS cl_algo_fd_results (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            date TEXT NOT NULL, symbol TEXT NOT NULL,
+            entry_line_price REAL NOT NULL, entry_line_type TEXT NOT NULL,
+            entry_line_strength INTEGER NOT NULL,
+            direction TEXT NOT NULL, entry_type TEXT NOT NULL, entry_price REAL NOT NULL,
+            tp_line_price REAL, tp_price REAL NOT NULL, tp_source TEXT NOT NULL,
+            sl_line_price REAL, sl_price REAL NOT NULL, sl_source TEXT NOT NULL,
+            two_hour_avg_move REAL NOT NULL, tick_buffer INTEGER NOT NULL DEFAULT 1,
+            entry_fill_price REAL, entry_fill_time TEXT,
+            exit_reason TEXT, exit_fill_price REAL, pnl_ticks REAL, ticks_to_exit INTEGER,
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+            UNIQUE(date, symbol, entry_line_price, direction, entry_type)
+        )""",
+        "CREATE INDEX IF NOT EXISTS idx_cl_fd_sym_date  ON cl_algo_fd_results(symbol, date)",
+        "CREATE INDEX IF NOT EXISTS idx_cl_fd_direction ON cl_algo_fd_results(direction, entry_type)",
     ]
     with get_db(path) as con:
         for stmt in alter_stmts:
@@ -667,7 +733,8 @@ def self_test() -> bool:
             expected = {"commands", "positions", "ib_events", "system_state",
                         "critical_lines", "release_notes", "fetch_log", "completed_trades",
                         "cl_algo_sim_results", "cl_algo_combo_scores",
-                        "cl_algo_score_history", "cl_algo_learner_runs"}
+                        "cl_algo_score_history", "cl_algo_learner_runs",
+                        "cl_algo_day_params", "cl_algo_fd_results"}
             assert expected <= tables, f"Missing tables: {expected - tables}"
 
             # 2. WAL mode is active
