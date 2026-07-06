@@ -275,6 +275,34 @@ Falls back to `updated_at` when no active row exists (G14 safety for file transi
 
 ---
 
+## G17 — Watchdog process dies → 12+ hours dark with no auto-restart
+
+**Symptom:** System completely offline for ~12 hours. No fetch progress. Gateway may have bounced.
+Watchdog log shows long silence (hours gap between entries). Scheduler log goes cold.
+
+**Cause:** The `fetch_watchdog.py` process runs in a console window started manually.
+If that window is closed, the PC sleeps/hibernates, or the process crashes from an unhandled
+OS-level signal, the watchdog dies. With no watchdog, a stuck or dead scheduler is never restarted.
+
+**Timeline (2026-07-05 → 07-06):**
+- 19:05 UTC: Gateway DOWN. Watchdog restarted it (first attempt failed/90s timeout, second OK).
+- 19:19 UTC: Gateway DOWN again 10 min later. Watchdog restarted again.
+- 19:23 UTC: Gateway back up — watchdog died immediately after (unknown cause).
+- 19:23 → 07:29 next day: ~12h dark. No scheduler restarts, no fetch progress.
+- 07:29: User manually noticed and restarted scheduler.
+
+**Fix:**
+1. Added single-instance guard to `fetch_watchdog.py`: if another watchdog is already running,
+   the new process exits immediately. Safe to call from Task Scheduler every 5 min.
+2. Added `GalgoFetchWatchdog` Windows Task Scheduler task (every 5 min) via `install_scheduler.ps1`.
+   The task fires every 5 minutes and exits in <1s if watchdog is healthy. If watchdog is dead,
+   it starts a new one — maximum dark time is now 5 minutes instead of unlimited.
+3. Created `scripts/run_fetch_watchdog.bat` for the Task Scheduler action.
+
+**Deployed 2026-07-06.**
+
+---
+
 ## Rate & Time Estimates
 
 | Symbol | TRADES records (typical) | BID_ASK records | BID_ASK time @ 24k/min |

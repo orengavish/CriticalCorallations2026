@@ -317,10 +317,30 @@ def check_and_heal(cfg) -> list[str]:
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
+def _watchdog_already_running() -> bool:
+    """Return True if another fetch_watchdog process is already running."""
+    my_pid = os.getpid()
+    for proc in psutil.process_iter(["pid", "cmdline"]):
+        if proc.info["pid"] == my_pid:
+            continue
+        try:
+            cmd = " ".join(proc.info.get("cmdline") or [])
+            if "fetch_watchdog" in cmd and "python" in cmd.lower():
+                return True
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+    return False
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--once", action="store_true", help="Run one check and exit")
     args = parser.parse_args()
+
+    # Single-instance guard — safe to call from Task Scheduler every 5 min
+    if not args.once and _watchdog_already_running():
+        print("[WATCHDOG] already running — exiting", flush=True)
+        return
 
     cfg = get_config()
     log.info("Watchdog started (interval=%ds, stale_threshold=%ds)", CHECK_INTERVAL, STALE_THRESHOLD)
