@@ -60,12 +60,13 @@ def run(show_all: bool = False):
         print("No verified trades in DB.")
         return
 
-    priority   = [r for r in rows if not (has_trades(r["symbol"], r["d"]) and has_bidask(r["symbol"], r["d"]))]
-    covered    = [r for r in rows if     (has_trades(r["symbol"], r["d"]) and has_bidask(r["symbol"], r["d"]))]
+    tier1   = [r for r in rows if has_trades(r["symbol"], r["d"]) and not has_bidask(r["symbol"], r["d"])]
+    tier2   = [r for r in rows if not has_trades(r["symbol"], r["d"])]
+    covered = [r for r in rows if has_trades(r["symbol"], r["d"]) and has_bidask(r["symbol"], r["d"])]
 
-    def _print_rows(label, data):
+    def _print_rows(data):
         if not data:
-            print(f"  (none)")
+            print("  (none)")
             return
         for r in data:
             t = "T" if has_trades(r["symbol"], r["d"]) else "-"
@@ -76,14 +77,16 @@ def run(show_all: bool = False):
 
     print("\nFETCH PRIORITY — dates with verified trades, missing tick files")
     print("=" * 66)
-    _print_rows("PRIORITY", priority)
+    print(f"\n[TIER 1 — BID_ASK only, TRADES done] ({len(tier1)} dates, fetch order = count DESC)")
+    _print_rows(tier1)
+    print(f"\n[TIER 2 — full fetch needed]          ({len(tier2)} dates, fetch order = count DESC)")
+    _print_rows(tier2)
 
     if show_all and covered:
-        print("\nALREADY COVERED — tick files present")
-        print("-" * 66)
-        _print_rows("COVERED", covered)
+        print(f"\n[COVERED — both TRADES+BID_ASK done]  ({len(covered)} dates)")
+        _print_rows(covered)
 
-    print(f"\nPriority fetches needed: {len(priority)}  |  Already covered: {len(covered)}\n")
+    print(f"\nTier 1: {len(tier1)}  |  Tier 2: {len(tier2)}  |  Covered: {len(covered)}\n")
 
 
 if __name__ == "__main__":

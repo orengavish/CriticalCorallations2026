@@ -153,7 +153,7 @@ def check_file(symbol: str, target_date: date,
         except Exception:
             output_dir = Path("data/history")
 
-    path = output_dir / f"{symbol}_{dtype}_{date_compact}.csv"
+    path = output_dir / f"{symbol}_{dtype.replace('_', '')}_{date_compact}.csv"
 
     issues = []  # (severity, message)   severity: 'error' | 'warn' | 'info'
 
@@ -222,10 +222,11 @@ def check_file(symbol: str, target_date: date,
     if first_ct.hour < 15 or first_ct.hour > 19:
         warn(f"first tick at {first_ct.strftime('%H:%M CT')} — expected ~17:00 CT prev day")
 
-    # Session close: same-day 17:00 CT (±2h tolerance → 15:00–19:00)
+    # Session close: CME last tick is 15:59:59 CT (not 16:00:00), so 15:59 is normal.
+    # Only warn if last tick is before 15:59 (genuinely early) or outside normal range.
     if last_ct.hour < 15 or last_ct.hour > 19:
         warn(f"last tick at {last_ct.strftime('%H:%M CT')} — expected ~17:00 CT")
-    elif last_ct.hour < 16:
+    elif last_ct.hour == 15 and last_ct.minute < 59:
         warn(f"last tick at {last_ct.strftime('%H:%M CT')} — session may be truncated")
 
     # ── 4. Price range ──

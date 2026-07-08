@@ -1248,7 +1248,7 @@ def api_fetch_status():
             for r in rows:
                 sym   = r["symbol"]
                 ds    = r["date"]
-                dtype = r["data_type"].lower()   # TRADES -> trades
+                dtype = r["data_type"].lower().replace("_", "")  # BID_ASK → bidask
                 rec   = r["records_fetched"] or 0
                 done  = bool(r["finished"])
                 age_s = None
@@ -1263,10 +1263,11 @@ def api_fetch_status():
                     pass
 
                 is_csv = (sym, ds, dtype) in csv_present
-                if done or is_csv:
-                    status = "ok"
-                elif rec > 0 and age_s is not None and age_s < 90:
+                # Check active FIRST: DB says currently downloading → show active even if CSV exists
+                if not done and rec > 0 and age_s is not None and age_s < 90:
                     status = "active"
+                elif done or is_csv:
+                    status = "ok"
                 elif rec > 0:
                     status = "stale"
                 else:
@@ -1409,11 +1410,16 @@ def api_fetch_live():
         for sym in symbols:
             for dtype in dtypes:
                 rows = by_slot.get((sym, dtype), [])
-                n_total = len(rows)
-                n_done  = sum(1 for r in rows if r["finished"])
+                # Exclude holiday dates from counts so partial holiday fetches don't distort totals
+                rows_trading = [r for r in rows if r["date"] not in _FETCH_HOLIDAYS]
+                n_total = len(rows_trading)
+                n_done  = sum(1 for r in rows_trading if r["finished"])
 
                 # Find the most recently updated unfinished row (what's being fetched now)
-                active_rows = [r for r in rows if not r["finished"]]
+                # Exclude holiday dates so they don't pollute the "current" slot
+                active_rows = [r for r in rows
+                               if not r["finished"]
+                               and r["date"] not in _FETCH_HOLIDAYS]
                 active_rows.sort(key=lambda r: r["updated_at"] or "", reverse=True)
                 active_row = active_rows[0] if active_rows else None
 
@@ -1457,24 +1463,41 @@ def api_fetch_live():
 
                     is_active = age_s is not None and age_s < 90
                     status    = "active" if is_active else "stale"
+                    # For BID_ASK, denominator = total TRADES done (real backfill target)
+                    if dtype == "BID_ASK":
+                        n_needed_all = sum(1 for r in by_slot.get((sym, "TRADES"), [])
+                                           if r["finished"] and r["date"] not in _FETCH_HOLIDAYS)
+                        dates_label = f"{n_done}/{max(n_needed_all, n_total)}"
+                    else:
+                        dates_label = f"{n_done}/{n_total}"
                     result[sym][dtype] = {
                         "status":   status,
                         "records":  rec,
                         "pct":      pct,
                         "finished": False,
-                        "dates":    f"{n_done}/{n_total}",
+                        "dates":    dates_label,
                         "cur_date": active_row["date"],
                         "rate_ks":  rate_ks,
                         "age_s":    age_s,
                     }
                 elif n_done > 0:
+                    # For BID_ASK, denominator = TRADES done for this sym (real backfill target).
+                    # For TRADES, denominator = n_total (already holidays-excluded above).
+                    if dtype == "BID_ASK":
+                        n_needed = sum(1 for r in by_slot.get((sym, "TRADES"), [])
+                                       if r["finished"] and r["date"] not in _FETCH_HOLIDAYS)
+                        n_needed = max(n_needed, n_total)
+                    else:
+                        n_needed = n_total
+                    all_done = (n_done >= n_needed and n_needed > 0)
+                    pct_done = int(n_done / max(n_needed, 1) * 100)
                     result[sym][dtype] = {
-                        "status":  "done",
-                        "records": sum(r["records_fetched"] for r in rows),
-                        "pct":     100,
-                        "finished": True,
-                        "dates":   f"{n_done}/{n_total}",
-                        "rate_ks": None, "age_s": None,
+                        "status":   "done" if all_done else "partial",
+                        "records":  sum(r["records_fetched"] for r in rows),
+                        "pct":      100 if all_done else pct_done,
+                        "finished": all_done,
+                        "dates":    f"{n_done}/{n_needed}",
+                        "rate_ks":  None, "age_s": None,
                     }
                 else:
                     result[sym][dtype] = {
@@ -1806,6 +1829,241 @@ def api_fetch_queue():
         "total_done":    total_done,
         "total_entries": total_entries,
         "vt_counts":     vt_counts,
+    })
+
+
+@app.route("/api/fetch-eta")
+def api_fetch_eta():
+    """
+    Estimate when the next fully backtestable day will be ready.
+    A "full day" = MES + MNQ + MYM each have both TRADES and BID_ASK finished.
+    Uses current fetch rate (derived from active file + scheduler lock age)
+    and BIDASK/TRADES ratio from already-finished pairs.
+    """
+    import sqlite3 as _sq3
+    import os as _os
+    from datetime import datetime as _dt, timezone as _tz2
+
+    FULL_SYMS    = ["MES", "MNQ", "MYM"]
+    DEFAULT_RATE = 400   # rec/sec conservative fallback
+
+    june_progress = _june_fetch_db()
+    galao_db_path = june_progress.parent / "galao.db"
+    lock_path     = june_progress.parent.parent.parent / "data" / "fetch_scheduler.lock"
+    history_dir   = _june_history_dir()
+
+    # ── Read all progress rows ─────────────────────────────────────────────────
+    try:
+        con = _sq3.connect(str(june_progress), timeout=5)
+        con.row_factory = _sq3.Row
+        rows = con.execute("SELECT * FROM fetch_progress").fetchall()
+        con.close()
+    except Exception as e:
+        return jsonify({"error": str(e)}), 200
+
+    now_ts = _dt.now(_tz2.utc).timestamp()
+
+    # ── Active file ────────────────────────────────────────────────────────────
+    unfinished = [r for r in rows
+                  if not r["finished"] and (r["records_fetched"] or 0) > 0]
+    unfinished.sort(key=lambda r: r["updated_at"] or "", reverse=True)
+    active = unfinished[0] if unfinished else None
+
+    # ── Fetch rate (rec/sec) ───────────────────────────────────────────────────
+    # Prefer the rolling throughput history (maintained by api_fetch_live polls).
+    # Fall back to the per-slot rolling window from _fetch_rate_state.
+    import time as _time2
+    rate = DEFAULT_RATE
+    now_mono = _time2.monotonic()
+    # Source 1: global throughput history (populated by api_fetch_live every 5s)
+    if _fetch_throughput_hist and len(_fetch_throughput_hist) >= 2:
+        cutoff = now_mono - 300  # last 5 min
+        recent = [h for h in _fetch_throughput_hist if h["ts"] >= cutoff]
+        if len(recent) >= 2:
+            dt2 = recent[-1]["ts"] - recent[0]["ts"]
+            dr2 = recent[-1]["total_dl"] - recent[0]["total_dl"]
+            if dt2 > 10 and dr2 > 0:
+                rate = max(dr2 / dt2, 10)
+    # Source 2: per-slot rate from rolling window (falls back to DEFAULT if no history)
+    if rate == DEFAULT_RATE and active:
+        slot_key = f"{active['symbol']}_{active['data_type']}"
+        hist = _fetch_rate_state.get(slot_key, [])
+        if len(hist) >= 2:
+            dt2 = hist[-1]["ts"] - hist[0]["ts"]
+            dr2 = hist[-1]["records"] - hist[0]["records"]
+            if dt2 > 1 and dr2 > 0:
+                rate = max(dr2 / dt2, 10)
+
+    # ── Finished file sizes ────────────────────────────────────────────────────
+    trades_sz = {(r["symbol"], r["date"]): r["records_fetched"]
+                 for r in rows if r["finished"] and r["data_type"] == "TRADES"}
+    bidask_sz = {(r["symbol"], r["date"]): r["records_fetched"]
+                 for r in rows if r["finished"] and r["data_type"] == "BID_ASK"}
+
+    # BID_ASK / TRADES ratio from paired finished files
+    ratios = [bidask_sz[k] / trades_sz[k]
+              for k in bidask_sz if k in trades_sz and trades_sz[k] > 0]
+    ratio = round(sum(ratios) / len(ratios), 1) if ratios else 10.0
+
+    # Per-symbol defaults when no reference data available
+    sym_fallback = {"MES": 4_000_000, "MNQ": 10_000_000, "MYM": 800_000}
+
+    def _est_bidask(sym, date_str):
+        if (sym, date_str) in bidask_sz:
+            return bidask_sz[(sym, date_str)]
+        if (sym, date_str) in trades_sz:
+            return int(trades_sz[(sym, date_str)] * ratio)
+        sym_trades = [v for (s, _), v in trades_sz.items() if s == sym]
+        if sym_trades:
+            return int(sum(sym_trades) / len(sym_trades) * ratio)
+        return sym_fallback.get(sym, 5_000_000)
+
+    def _est_trades(sym):
+        sym_trades = [v for (s, _), v in trades_sz.items() if s == sym]
+        return int(sum(sym_trades) / len(sym_trades)) if sym_trades else 500_000
+
+    # ── Which (sym, date) pairs are done ──────────────────────────────────────
+    trades_done = {(r["symbol"], r["date"])
+                   for r in rows if r["finished"] and r["data_type"] == "TRADES"}
+    bidask_done = {(r["symbol"], r["date"])
+                   for r in rows if r["finished"] and r["data_type"] == "BID_ASK"}
+
+    # ── Supplement trades_done from CSV presence (for files predating DB tracking) ─
+    # Do NOT include BID_ASK CSVs: they can be partial (in-progress writes) and
+    # would incorrectly mark an active fetch as complete.
+    active_bidask_keys = {(r["symbol"], r["date"])
+                          for r in rows if not r["finished"] and r["data_type"] == "BID_ASK"
+                          and (r["records_fetched"] or 0) > 0}
+    if history_dir.exists():
+        for f in history_dir.glob("*.csv"):
+            parts = f.stem.split("_")
+            if len(parts) >= 3 and f.stat().st_size > 100:
+                sym, ftype, dc = parts[0], parts[1], parts[2]
+                date_s = f"{dc[:4]}-{dc[4:6]}-{dc[6:]}"
+                if ftype == "trades":
+                    trades_done.add((sym, date_s))
+                elif ftype == "bidask" and (sym, date_s) not in active_bidask_keys:
+                    # Only count a BID_ASK CSV as done if the scheduler isn't actively writing it
+                    bidask_done.add((sym, date_s))
+
+    # ── Already complete dates ─────────────────────────────────────────────────
+    all_dates = sorted({d for _, d in trades_done} | {d for _, d in bidask_done})
+    complete_dates = [d for d in all_dates
+                      if all((s, d) in trades_done and (s, d) in bidask_done
+                             for s in FULL_SYMS)]
+
+    # ── Verified trade dates (priority) ───────────────────────────────────────
+    vt_dates = []
+    try:
+        gcon = _sq3.connect(str(galao_db_path), timeout=5)
+        vt_dates = [r[0] for r in gcon.execute(
+            "SELECT DISTINCT DATE(fill_time) FROM verified_trades ORDER BY DATE(fill_time)"
+        ).fetchall()]
+        gcon.close()
+    except Exception:
+        pass
+
+    # ── Build fetch queue in priority order (critical dates first) ─────────────
+    # For each (sym, date), determine what's still needed: BIDASK and/or TRADES
+    w_trades = set(trades_done)
+    w_bidask = set(bidask_done)
+    queue    = []
+    seen     = set()
+
+    for date_str in vt_dates:
+        for sym in FULL_SYMS:
+            # BID_ASK needed?
+            if (sym, date_str) not in w_bidask:
+                k = (sym, date_str, "BID_ASK")
+                if k not in seen:
+                    seen.add(k)
+                    queue.append((sym, date_str, "BID_ASK"))
+            # TRADES needed?
+            if (sym, date_str) not in w_trades:
+                k = (sym, date_str, "TRADES")
+                if k not in seen:
+                    seen.add(k)
+                    queue.append((sym, date_str, "TRADES"))
+
+    # ── Walk queue, accumulate seconds, find first full date ──────────────────
+    total_sec      = 0.0
+    files_detail   = []
+    next_full_date = None
+
+    # Already complete before any fetching?
+    for date_str in vt_dates:
+        if all((s, date_str) in w_trades and (s, date_str) in w_bidask
+               for s in FULL_SYMS):
+            next_full_date = date_str
+            break
+
+    if not next_full_date:
+        for sym, date_str, dtype in queue:
+            est_size = _est_bidask(sym, date_str) if dtype == "BID_ASK" else _est_trades(sym)
+
+            is_cur = bool(active and active["symbol"] == sym
+                          and active["date"] == date_str
+                          and active["data_type"] == dtype)
+            fetched   = (active["records_fetched"] or 0) if is_cur else 0
+            remaining = max(est_size - fetched, 0)
+            est_sec   = remaining / max(rate, 1)
+            pct       = int(min(99, fetched / max(est_size, 1) * 100)) if is_cur else 0
+
+            total_sec += est_sec
+            files_detail.append({
+                "sym":        sym,
+                "date":       date_str,
+                "dtype":      dtype,
+                "est_size":   int(est_size),
+                "remaining":  int(remaining),
+                "est_sec":    int(est_sec),
+                "is_current": is_cur,
+                "pct":        pct,
+            })
+
+            # Mark hypothetically complete
+            (w_bidask if dtype == "BID_ASK" else w_trades).add((sym, date_str))
+
+            # Check if this date now fully done for all syms
+            if all((s, date_str) in w_trades and (s, date_str) in w_bidask
+                   for s in FULL_SYMS):
+                next_full_date = date_str
+                break
+
+    # ── ETA formatting ─────────────────────────────────────────────────────────
+    def _fmt(sec):
+        if sec <= 0:   return "now"
+        if sec < 60:   return f"~{int(sec)}s"
+        if sec < 3600: return f"~{int(sec/60)}min"
+        if sec < 86400:return f"~{sec/3600:.1f}h"
+        return f"~{sec/86400:.1f}d"
+
+    cur_info = None
+    if active:
+        est = _est_bidask(active["symbol"], active["date"]) \
+              if active["data_type"] == "BID_ASK" \
+              else _est_trades(active["symbol"])
+        cur_info = {
+            "sym":      active["symbol"],
+            "date":     active["date"],
+            "dtype":    active["data_type"],
+            "records":  active["records_fetched"],
+            "est_size": int(est),
+            "pct":      int(min(99, (active["records_fetched"] or 0) / max(est, 1) * 100)),
+        }
+
+    return jsonify({
+        "next_full_date":    next_full_date,
+        "eta_seconds":       int(total_sec),
+        "eta_human":         _fmt(total_sec),
+        "complete_dates":    complete_dates,
+        "n_complete":        len(complete_dates),
+        "files_before":      files_detail,       # all files until next_full_date
+        "n_files_before":    len(files_detail),
+        "rate_recps":        int(rate),
+        "rate_human":        f"{int(rate*60/1000)}k/min",
+        "ratio_ba_t":        ratio,
+        "current":           cur_info,
     })
 
 

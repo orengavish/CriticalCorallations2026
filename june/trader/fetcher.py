@@ -193,11 +193,16 @@ def _is_actively_running(conn, symbol, date_str, dtype, grace_seconds=120) -> bo
 
 
 def _mark_started(conn, symbol, date_str, dtype):
+    # On RESUME (row already exists with records > 0) keep the existing record count
+    # so progress display doesn't reset to 0. Only reset records on a fresh start.
     conn.execute("""
         INSERT INTO fetch_progress (symbol, date, data_type, records_fetched, finished, updated_at)
         VALUES (?,?,?,0,0,?)
         ON CONFLICT(symbol,date,data_type) DO UPDATE
-        SET finished=0, records_fetched=0, updated_at=excluded.updated_at
+        SET finished=0,
+            records_fetched=CASE WHEN excluded.records_fetched=0 AND records_fetched>0
+                                 THEN records_fetched ELSE 0 END,
+            updated_at=excluded.updated_at
     """, (symbol, date_str, dtype, datetime.now(timezone.utc).isoformat()))
     conn.commit()
 
