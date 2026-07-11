@@ -118,9 +118,28 @@ def _prev_trading_day(from_date: date | None = None) -> date | None:
     return None
 
 
+_RTH_START_MIN, _RTH_END_MIN = 9 * 60 + 30, 16 * 60   # 09:30–16:00 CT
+
 def _find_csv(symbol: str, d: date) -> Path | None:
     p = _HIST_DIR / f"{symbol}_trades_{d.strftime('%Y%m%d')}.csv"
     return p if p.exists() else None
+
+def _csv_has_rth(symbol: str, d: date) -> bool:
+    """Return True only if the CSV contains at least one tick inside RTH (09:30–16:00 CT)."""
+    p = _find_csv(symbol, d)
+    if not p:
+        return False
+    with open(p, newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            try:
+                t_part = row["time_ct"].split("T")[1][:5]
+                hh, mm = int(t_part[:2]), int(t_part[3:5])
+                if _RTH_START_MIN <= hh * 60 + mm < _RTH_END_MIN:
+                    return True
+            except (ValueError, IndexError, KeyError):
+                continue
+    return False
 
 
 def _load_ticks(symbol: str, d: date) -> list | None:
@@ -300,6 +319,8 @@ def api_lines_create():
             search -= timedelta(days=1)
             if search.weekday() >= 5:
                 continue
+            if not _csv_has_rth(sym, search):
+                continue
             t = _load_ticks(sym, search)
             if t:
                 ticks, used_date = t, search
@@ -352,7 +373,11 @@ def api_lines_create():
                      ln["strength"], ln["source"], ln["algo_type"], json.dumps(tip))
                 )
 
-        results[sym] = {"lines": len(kept), "from_date": used_date.isoformat()}
+        results[sym] = {
+            "lines":     len(kept),
+            "from_date": used_date.isoformat(),
+            "mock":      used_date.isoformat() if used_date != hist_start else None,
+        }
 
     return jsonify({"results": results, "mock_date": mock_date, "today": today})
 
@@ -369,7 +394,7 @@ def api_lines():
         "SELECT id, symbol, price, line_type, strength,"
         " COALESCE(source,'manual') AS source,"
         " COALESCE(algo_type,'MANUAL') AS algo_type,"
-        " note"
+        " note, COALESCE(armed,1) AS armed"
         " FROM critical_lines WHERE date=? AND strength>=?"
     )
     with get_db(db_path) as con:
@@ -404,11 +429,33 @@ def api_lines_manual():
     return jsonify({"id": cur.lastrowid, "ok": True})
 
 
+@app.route("/api/lines/<int:line_id>", methods=["PATCH"])
+def api_lines_patch(line_id: int):
+    body  = request.get_json(force=True) or {}
+    armed = int(bool(body.get("armed", True)))
+    with get_db(_resolve_db()) as con:
+        con.execute("UPDATE critical_lines SET armed=? WHERE id=?", (armed, line_id))
+    return jsonify({"ok": True})
+
+
 @app.route("/api/lines/<int:line_id>", methods=["DELETE"])
 def api_lines_delete(line_id: int):
     with get_db(_resolve_db()) as con:
         con.execute("DELETE FROM critical_lines WHERE id=?", (line_id,))
     return jsonify({"ok": True})
+
+
+@app.route("/api/last_data_date")
+def api_last_data_date():
+    """Walk back from yesterday and return the most recent date any symbol has RTH data."""
+    search = date.today()
+    for _ in range(30):
+        search -= timedelta(days=1)
+        if search.weekday() >= 5:
+            continue
+        if any(_csv_has_rth(sym, search) for sym in ALL_SYMBOLS):
+            return jsonify({"date": search.isoformat()})
+    return jsonify({"date": None})
 
 
 @app.route("/api/history/<symbol>")
@@ -418,10 +465,12 @@ def api_history(symbol: str):
     start        = date.fromisoformat(req_date_str) if req_date_str else (date.today() - timedelta(days=1))
 
     ticks, used_date = None, None
-    search = start + timedelta(days=1)          # start from requested date and walk back
+    search = start + timedelta(days=1)
     for _ in range(20):
         search -= timedelta(days=1)
         if search.weekday() >= 5:
+            continue
+        if not _csv_has_rth(symbol, search):
             continue
         t = _load_ticks(symbol, search)
         if t:
@@ -431,9 +480,8 @@ def api_history(symbol: str):
     if not ticks:
         return jsonify({"bars": [], "date": None, "symbol": symbol, "error": "no data"})
 
-    _RTH_START, _RTH_END = 9 * 60 + 30, 16 * 60   # 09:30 – 16:00
     rth_bars = [b for b in _ohlcv_bars(ticks, interval)
-                if _RTH_START <= b["t_min"] < _RTH_END]
+                if _RTH_START_MIN <= b["t_min"] < _RTH_END_MIN]
     bars = []
     for b in rth_bars:
         hh, mm = b["t_min"] // 60, b["t_min"] % 60
@@ -593,7 +641,7 @@ body{font-size:.85rem;}
 .row-overnight {background:rgba(89,161,79,.12)!important;}
 .row-manual    {background:rgba(225,87,89,.12)!important;}
 .price-chip{font-family:monospace;font-size:.8rem;padding:2px 8px;border-radius:4px;}
-#mock-banner,#mock-banner-graph{display:none;}
+#mock-banner-graph{display:none;}
 </style>
 </head>
 <body>
@@ -607,7 +655,7 @@ body{font-size:.85rem;}
     <span class="price-chip bg-secondary" id="chip-M2K">M2K —</span>
   </div>
   <span class="badge bg-info text-dark">:5003</span>
-  <span class="badge bg-secondary">v1.3</span>
+  <span class="badge bg-secondary">v1.7</span>
 </nav>
 
 <div class="container-fluid py-2">
@@ -617,9 +665,15 @@ body{font-size:.85rem;}
   <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-trades">Create Trades</button></li>
   <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-submitted" id="btn-sub-tab">Submitted</button></li>
   <li class="nav-item ms-auto d-flex align-items-center pe-1">
-    <span class="badge bg-secondary">v1.3</span>
+    <span class="badge bg-secondary">v1.7</span>
   </li>
 </ul>
+<div class="d-flex align-items-center gap-2 mb-2">
+  <label class="small text-muted mb-0">Date</label>
+  <input type="date" id="shared-date-input" class="form-control form-control-sm" style="width:148px"
+         onchange="onSharedDateChange()">
+</div>
+
 <div class="tab-content">
 
 <!-- ══════════════════════ LINES ══════════════════════ -->
@@ -639,9 +693,8 @@ body{font-size:.85rem;}
       <label class="small"><input class="form-check-input" type="radio" name="merge-thr" value="8"> 8pt</label>
       <label class="small"><input class="form-check-input" type="radio" name="merge-thr" value="16" checked> 16pt</label>
     </div>
-    <input type="date" id="lines-date-input" class="form-control form-control-sm ms-1" style="width:148px"
-           onchange="document.getElementById('graph-date-input').value=this.value">
-    <button class="btn btn-sm btn-primary ms-1" onclick="createLines()">Create Lines</button>
+    <button class="btn btn-sm btn-outline-info" onclick="loadLastDay()">Last Day</button>
+    <button class="btn btn-sm btn-primary" onclick="createLines()">Create Lines</button>
     <span id="lines-msg" class="small text-muted ms-1"></span>
   </div>
   <!-- Row 2: Algo type checkboxes (all 14 preselected) -->
@@ -680,9 +733,6 @@ body{font-size:.85rem;}
     <button class="btn btn-sm btn-outline-secondary" onclick="refreshLines()">Refresh</button>
   </div>
 
-  <div id="mock-banner" class="alert alert-warning py-1 px-2 mb-2 small">
-    ⚠ MOCK MODE — lines generated from <strong id="mock-date-lbl"></strong>
-  </div>
 
   <table class="table table-sm table-hover table-bordered mb-1">
     <thead class="table-dark">
@@ -737,9 +787,15 @@ body{font-size:.85rem;}
       <button id="btn-range-4h"  class="btn btn-outline-secondary"        onclick="setGraphRange('4h',this)">Last 4h</button>
       <button id="btn-range-1h"  class="btn btn-outline-secondary"        onclick="setGraphRange('1h',this)">Last 1h</button>
     </div>
-    <input type="date" id="graph-date-input" class="form-control form-control-sm" style="width:148px"
-           onchange="document.getElementById('lines-date-input').value=this.value; loadGraph()">
+    <div class="btn-group btn-group-sm" role="group">
+      <button id="btn-int-1"  class="btn btn-outline-secondary"        onclick="setGraphInterval(1,this)">1m</button>
+      <button id="btn-int-5"  class="btn btn-outline-secondary active" onclick="setGraphInterval(5,this)">5m</button>
+      <button id="btn-int-15" class="btn btn-outline-secondary"        onclick="setGraphInterval(15,this)">15m</button>
+      <button id="btn-int-30" class="btn btn-outline-secondary"        onclick="setGraphInterval(30,this)">30m</button>
+    </div>
     <span id="bar-count" class="text-muted small ms-1"></span>
+    <button class="btn btn-sm btn-outline-warning ms-auto" onclick="createGraphTrades()">Create Trades</button>
+    <span id="graph-trades-msg" class="small ms-1"></span>
   </div>
   <div id="mock-banner-graph" class="alert alert-warning py-1 px-2 mb-1 small">
     ⚠ No data for selected date — loaded <strong id="mock-date-graph"></strong>
@@ -855,7 +911,7 @@ async function createLines(){
   const syms      = checkedVals('sym-lines');
   const algoTypes = [...document.querySelectorAll('.algo-chk:checked')].map(e=>e.value);
   const mergeThr  = parseFloat(document.querySelector('input[name="merge-thr"]:checked')?.value||'16');
-  const histDate  = document.getElementById('lines-date-input').value||'';
+  const histDate  = document.getElementById('shared-date-input').value||'';
   document.getElementById('lines-msg').textContent='Creating…';
   try{
     const payload = {symbols:syms,algo_types:algoTypes,merge_threshold:mergeThr};
@@ -863,12 +919,25 @@ async function createLines(){
     const d = await (await fetch('/api/lines/create',{method:'POST',
       headers:{'Content-Type':'application/json'},
       body:JSON.stringify(payload)})).json();
-    const mock = d.mock_date;
-    document.getElementById('mock-banner').style.display = mock?'block':'none';
-    if(mock) document.getElementById('mock-date-lbl').textContent=mock;
-    const msg = Object.entries(d.results).map(([s,v])=>`${s}:${v.lines||0}`).join(' ');
-    document.getElementById('lines-msg').textContent='Created — '+msg;
-    refreshLines();
+    const ok     = Object.entries(d.results).filter(([,v]) => !v.error);
+    const failed = Object.entries(d.results).filter(([,v]) =>  v.error);
+    const okMsg  = ok.map(([s,v]) => `${s}:${v.lines}`).join(' ');
+    const noMsg  = failed.map(([s]) => s).join(' ');
+    const mockSyms = ok.filter(([,v]) => v.mock).map(([s,v]) => `${s}→${v.mock}`).join(' ');
+
+    const linesMsg = document.getElementById('lines-msg');
+    if(ok.length === 0){
+      linesMsg.className = 'small text-danger ms-1';
+      linesMsg.textContent = 'No data found for: ' + noMsg;
+    } else if(failed.length > 0){
+      linesMsg.className = 'small text-warning ms-1';
+      linesMsg.textContent = `Created ${okMsg}${mockSyms?' ('+mockSyms+')':''} | No data: ${noMsg}`;
+    } else {
+      linesMsg.className = 'small text-success ms-1';
+      linesMsg.textContent = `Created ${okMsg}${mockSyms?' ('+mockSyms+')':''}`;
+    }
+
+    if(ok.length > 0) refreshLines();
   }catch(e){ document.getElementById('lines-msg').textContent='Error: '+e; }
 }
 
@@ -939,7 +1008,8 @@ async function addManualLine(){
 }
 
 // ── GRAPH ────────────────────────────────────────────────────────────────────
-let _graphSym='MES', _chartBars=[], _chartLines=[], _graphMode='candle', _graphRange='all';
+let _graphSym='MES', _chartBars=[], _chartLines=[], _graphMode='candle', _graphRange='all', _graphInterval=5;
+let _visibleLines=[];  // mirrors line traces 1:1 (trace index 0 = bar, 1..N = lines)
 
 function setGraphMode(mode, btn){
   _graphMode = mode;
@@ -955,6 +1025,13 @@ function setGraphRange(range, btn){
   drawChart();
 }
 
+function setGraphInterval(min, btn){
+  _graphInterval = min;
+  document.querySelectorAll('#btn-int-1,#btn-int-5,#btn-int-15,#btn-int-30').forEach(b=>b.classList.remove('active'));
+  btn.classList.add('active');
+  loadGraph();
+}
+
 function selectSym(sym,btn){
   _graphSym=sym;
   document.querySelectorAll('#sym-pill-tabs .nav-link').forEach(b=>b.classList.remove('active'));
@@ -964,26 +1041,65 @@ function selectSym(sym,btn){
 
 function filteredBars(){
   if(_graphRange==='all') return _chartBars;
-  const n = _graphRange==='1h' ? 12 : 48;  // 12×5min=1h, 48×5min=4h
+  const bph = Math.round(60 / _graphInterval);
+  const n = _graphRange==='1h' ? bph : bph * 4;
   return _chartBars.slice(-n);
 }
 
 async function loadGraph(){
-  const reqDate = document.getElementById('graph-date-input').value||'';
-  const url = reqDate ? `/api/history/${_graphSym}?date=${reqDate}` : `/api/history/${_graphSym}`;
+  const reqDate = document.getElementById('shared-date-input').value||'';
+  const base = `/api/history/${_graphSym}?interval=${_graphInterval}`;
+  const url = reqDate ? `${base}&date=${reqDate}` : base;
   try{
     const br = await (await fetch(url)).json();
     _chartBars = br.bars||[];
     const mock = br.mock_date;
     document.getElementById('mock-banner-graph').style.display=mock?'block':'none';
     if(mock) document.getElementById('mock-date-graph').textContent=mock;
-    // Update picker to the actually-loaded date (auto-fills on first load)
-    if(br.date) document.getElementById('graph-date-input').value = br.date;
 
     const ms = parseInt(document.getElementById('min-str-lines').value)||1;
     _chartLines = await (await fetch(`/api/lines?symbol=${_graphSym}&min_strength=${ms}`)).json();
     drawChart();
   }catch(e){ console.error(e); }
+}
+
+function enabledSources(){
+  const s=new Set();
+  if(document.getElementById('tog-ohlc').checked)      s.add('ohlc');
+  if(document.getElementById('tog-pivot').checked)     s.add('pivot');
+  if(document.getElementById('tog-overnight').checked) s.add('overnight');
+  if(document.getElementById('tog-manual').checked)    s.add('manual');
+  return s;
+}
+
+function buildLineTraces(bars){
+  if(!bars.length) return [];
+  const x0 = bars[0].t, x1 = bars[bars.length-1].t;
+  const en  = enabledSources();
+  _visibleLines = _chartLines.filter(l => en.has(l.source));
+  return _visibleLines.map(l => {
+    const armed = l._armed !== undefined ? l._armed : !!l.armed;
+    const col   = armed ? (SOURCE_COLORS[l.source]||'#888') : 'rgba(128,128,128,0.35)';
+    return {
+      type:'scatter', mode:'lines',
+      x:[x0, x1], y:[l.price, l.price],
+      line:{color:col, width:armed?3:1, dash:armed?'solid':'dot'},
+      name:l.algo_type,
+      hovertemplate:`<b>${l.algo_type}</b> ${l.price.toFixed(2)}<extra></extra>`,
+      showlegend:false
+    };
+  });
+}
+
+function buildAnnotations(){
+  const en = enabledSources();
+  return _chartLines.filter(l => en.has(l.source)).map(l => {
+    const armed = l._armed !== undefined ? l._armed : !!l.armed;
+    const col   = armed ? (SOURCE_COLORS[l.source]||'#888') : 'rgba(128,128,128,0.45)';
+    return {xref:'paper',yref:'y',x:1,y:l.price,
+      text:`${l.algo_type} ${l.price}`,showarrow:false,
+      xanchor:'right',font:{size:9,color:col}};
+  });
 }
 
 function drawChart(){
@@ -995,53 +1111,89 @@ function drawChart(){
   }
   const bars = filteredBars();
   document.getElementById('bar-count').textContent = bars.length + ' bars';
-  let trace;
+  let barTrace;
   if(_graphMode==='line'){
-    trace = {type:'scatter',mode:'lines',x:bars.map(b=>b.t),y:bars.map(b=>b.close),
-      name:_graphSym,line:{color:'#7db3d8',width:1.5}};
+    barTrace = {type:'scatter',mode:'lines',x:bars.map(b=>b.t),y:bars.map(b=>b.close),
+      name:_graphSym,line:{color:'#7db3d8',width:1.5},showlegend:false};
   } else {
-    trace = {type:'candlestick',x:bars.map(b=>b.t),
+    barTrace = {type:'candlestick',x:bars.map(b=>b.t),
       open:bars.map(b=>b.open),high:bars.map(b=>b.high),
       low:bars.map(b=>b.low),close:bars.map(b=>b.close),
       name:_graphSym,
-      increasing:{line:{color:'#26a69a'}},decreasing:{line:{color:'#ef5350'}}};
+      increasing:{line:{color:'#26a69a'}},decreasing:{line:{color:'#ef5350'}},
+      showlegend:false};
   }
+  const lineTraces = buildLineTraces(bars);
   const layout={
     paper_bgcolor:'#1a1a2e',plot_bgcolor:'#1a1a2e',
     font:{color:'#ccc'},margin:{l:55,r:10,t:10,b:40},
     xaxis:{rangeslider:{visible:false},gridcolor:'#333'},
     yaxis:{gridcolor:'#333'},
-    shapes:buildShapes(),annotations:buildAnnotations(),showlegend:false};
-  Plotly.newPlot('chart',[trace],layout,{responsive:true,displayModeBar:false});
+    annotations:buildAnnotations(),
+    showlegend:false};
+  Plotly.newPlot('chart',[barTrace,...lineTraces],layout,{responsive:true,displayModeBar:false});
+
+  document.getElementById('chart').on('plotly_click', function(evtData){
+    const cn = evtData.points[0].curveNumber;
+    if(cn === 0) return;
+    const line = _visibleLines[cn - 1];
+    if(!line) return;
+    const wasArmed = line._armed !== undefined ? line._armed : !!line.armed;
+    line._armed = !wasArmed;
+    fetch(`/api/lines/${line.id}`, {method:'PATCH',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({armed: line._armed ? 1 : 0})
+    });
+    drawChart();
+  });
 }
 
-function enabledSources(){
-  const s=new Set();
-  if(document.getElementById('tog-ohlc').checked)      s.add('ohlc');
-  if(document.getElementById('tog-pivot').checked)     s.add('pivot');
-  if(document.getElementById('tog-overnight').checked) s.add('overnight');
-  if(document.getElementById('tog-manual').checked)    s.add('manual');
-  return s;
-}
-function buildShapes(){
-  const en=enabledSources();
-  return _chartLines.filter(l=>en.has(l.source)).map(l=>({
-    type:'line',xref:'paper',x0:0,x1:1,yref:'y',y0:l.price,y1:l.price,
-    line:{color:SOURCE_COLORS[l.source]||'#888',width:1,dash:'dot'}}));
-}
-function buildAnnotations(){
-  const en=enabledSources();
-  return _chartLines.filter(l=>en.has(l.source)).map(l=>({
-    xref:'paper',yref:'y',x:1,y:l.price,
-    text:`${l.algo_type} ${l.price}`,showarrow:false,
-    xanchor:'right',font:{size:9,color:SOURCE_COLORS[l.source]||'#888'}}));
-}
 function redrawLines(){
   if(!_chartBars.length) return;
-  Plotly.relayout('chart',{shapes:buildShapes(),annotations:buildAnnotations()});
+  drawChart();
 }
 
-document.getElementById('btn-graph-tab').addEventListener('click',()=>loadGraph());
+async function createGraphTrades(){
+  const msg = document.getElementById('graph-trades-msg');
+  msg.className='small ms-1 text-warning';
+  msg.textContent='Generating…';
+  try{
+    const d = await (await fetch('/api/trades/create',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({symbols:[_graphSym], brackets:[4,8], min_strength:1})
+    })).json();
+    const cands = d.candidates||[];
+    if(!cands.length){
+      msg.className='small ms-1 text-muted';
+      msg.textContent='No armed lines';
+      return;
+    }
+    const s = await (await fetch('/api/trades/submit',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({candidates:cands})
+    })).json();
+    msg.className='small ms-1 text-success';
+    msg.textContent=`${s.submitted} trades submitted`;
+  }catch(e){
+    msg.className='small ms-1 text-danger';
+    msg.textContent='Error: '+e;
+  }
+}
+
+function onSharedDateChange(){
+  const active = document.querySelector('#mainTab .nav-link.active');
+  if(active?.dataset?.bsTarget === '#tab-graph') loadGraph();
+}
+
+document.getElementById('btn-graph-tab').addEventListener('click', function(){
+  document.getElementById('shared-date-input').readOnly = true;
+  loadGraph();
+});
+document.querySelectorAll('#mainTab .nav-link:not(#btn-graph-tab)').forEach(function(btn){
+  btn.addEventListener('click', function(){
+    document.getElementById('shared-date-input').readOnly = false;
+  });
+});
 
 // ── CREATE TRADES ────────────────────────────────────────────────────────────
 let _candidates=[];
@@ -1139,16 +1291,36 @@ function toggleAutoRef(){
 
 document.getElementById('btn-sub-tab').addEventListener('click',loadSubmitted);
 
-// Initial load — set both date pickers to today, max = today
-(function(){
+function _lastWeekday(){
+  const d = new Date();
+  d.setDate(d.getDate() - 1);
+  while(d.getDay() === 0 || d.getDay() === 6) d.setDate(d.getDate() - 1);
+  return d.toISOString().split('T')[0];
+}
+
+async function loadLastDay(){
+  try{
+    const d = await (await fetch('/api/last_data_date')).json();
+    document.getElementById('shared-date-input').value = d.date || _lastWeekday();
+  }catch(e){
+    document.getElementById('shared-date-input').value = _lastWeekday();
+  }
+  createLines();
+}
+
+// Initial load — set shared date picker to last actual data date, max = today
+(async function(){
   const today = new Date().toISOString().split('T')[0];
-  ['graph-date-input','lines-date-input'].forEach(id=>{
-    const el = document.getElementById(id);
-    el.value = today;
-    el.max   = today;
-  });
+  const el = document.getElementById('shared-date-input');
+  el.max = today;
+  try{
+    const d = await (await fetch('/api/last_data_date')).json();
+    el.value = d.date || _lastWeekday();
+  }catch(e){
+    el.value = _lastWeekday();
+  }
+  refreshLines();
 })();
-refreshLines();
 </script>
 </body>
 </html>"""
