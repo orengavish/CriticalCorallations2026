@@ -890,7 +890,7 @@ body.busy-wait button,body.busy-wait input,body.busy-wait select{opacity:.55;}
     <span class="price-chip bg-secondary" id="chip-M2K">M2K —</span>
   </div>
   <span class="badge bg-info text-dark">:5003</span>
-  <span class="badge bg-secondary">v2.2</span>
+  <span class="badge bg-secondary">v2.3</span>
 </nav>
 
 <div class="container-fluid py-2">
@@ -901,13 +901,14 @@ body.busy-wait button,body.busy-wait input,body.busy-wait select{opacity:.55;}
   <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-trades">Create Trades</button></li>
   <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-submitted" id="btn-sub-tab">Submitted</button></li>
   <li class="nav-item ms-auto d-flex align-items-center pe-1">
-    <span class="badge bg-secondary">v2.2</span>
+    <span class="badge bg-secondary">v2.3</span>
   </li>
 </ul>
 <div class="d-flex align-items-center gap-2 mb-2">
   <label class="small text-muted mb-0">Date</label>
   <input type="date" id="shared-date-input" class="form-control form-control-sm" style="width:148px"
          onchange="onSharedDateChange()">
+  <button class="btn btn-sm btn-outline-info" onclick="loadLastDay()">Last Day</button>
 </div>
 
 <div class="tab-content">
@@ -929,7 +930,6 @@ body.busy-wait button,body.busy-wait input,body.busy-wait select{opacity:.55;}
       <label class="small"><input class="form-check-input" type="radio" name="merge-thr" value="8"> 8pt</label>
       <label class="small"><input class="form-check-input" type="radio" name="merge-thr" value="16" checked> 16pt</label>
     </div>
-    <button class="btn btn-sm btn-outline-info" onclick="loadLastDay()">Last Day</button>
     <button class="btn btn-sm btn-primary" onclick="createLines()">Create Lines</button>
     <span id="lines-msg" class="small text-muted ms-1"></span>
   </div>
