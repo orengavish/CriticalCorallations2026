@@ -1043,7 +1043,7 @@ body.busy-wait button,body.busy-wait input,body.busy-wait select{opacity:.55;}
     <span class="price-chip bg-secondary" id="chip-M2K">M2K —</span>
   </div>
   <span class="badge bg-info text-dark">:5003</span>
-  <span class="badge bg-secondary">v3.2</span>
+  <span class="badge bg-secondary">v3.3</span>
 </nav>
 
 <!-- Line detail modal -->
@@ -1090,10 +1090,11 @@ body.busy-wait button,body.busy-wait input,body.busy-wait select{opacity:.55;}
 <ul class="nav nav-tabs mb-2" id="mainTab" role="tablist">
   <li class="nav-item"><button class="nav-link active" data-bs-toggle="tab" data-bs-target="#tab-lines">Lines</button></li>
   <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-graph" id="btn-graph-tab">Graph</button></li>
+  <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-all" id="btn-all-tab">All Symbols</button></li>
   <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-trades">Create Trades</button></li>
   <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-submitted" id="btn-sub-tab">Submitted</button></li>
   <li class="nav-item ms-auto d-flex align-items-center pe-1">
-    <span class="badge bg-secondary">v3.2</span>
+    <span class="badge bg-secondary">v3.3</span>
   </li>
 </ul>
 
@@ -1281,6 +1282,40 @@ body.busy-wait button,body.busy-wait input,body.busy-wait select{opacity:.55;}
     <label><input type="checkbox" id="tog-volume"    checked onchange="redrawLines()"><span class="badge source-volume">Volume</span></label>
     <label><input type="checkbox" id="tog-round"     checked onchange="redrawLines()"><span class="badge source-round">Round</span></label>
     <label><input type="checkbox" id="tog-manual"    checked onchange="redrawLines()"><span class="badge source-manual">Manual</span></label>
+  </div>
+</div>
+
+<!-- ══════════════════════ ALL SYMBOLS ══════════════════════ -->
+<div class="tab-pane fade" id="tab-all">
+  <div class="d-flex align-items-center gap-2 mb-2 flex-wrap">
+    <div class="btn-group btn-group-sm" role="group">
+      <button class="btn btn-outline-secondary" onclick="setAllInterval(1,this)">1m</button>
+      <button id="btn-all-int-5" class="btn btn-outline-secondary active" onclick="setAllInterval(5,this)">5m</button>
+      <button class="btn btn-outline-secondary" onclick="setAllInterval(15,this)">15m</button>
+      <button class="btn btn-outline-secondary" onclick="setAllInterval(30,this)">30m</button>
+    </div>
+    <span class="vr"></span>
+    <button class="btn btn-sm btn-outline-secondary px-2" onclick="navAllDay(-1)">&#9664;D</button>
+    <span id="all-day-info" class="small text-muted px-1" style="min-width:100px;text-align:center">&#8212;</span>
+    <button class="btn btn-sm btn-outline-secondary px-2" onclick="navAllDay(1)">D&#9654;</button>
+  </div>
+  <div class="row g-2">
+    <div class="col-6">
+      <div class="text-center small text-muted mb-1">MES</div>
+      <div id="chart-all-MES" style="height:290px;background:#1a1a2e;border-radius:4px"></div>
+    </div>
+    <div class="col-6">
+      <div class="text-center small text-muted mb-1">MNQ</div>
+      <div id="chart-all-MNQ" style="height:290px;background:#1a1a2e;border-radius:4px"></div>
+    </div>
+    <div class="col-6">
+      <div class="text-center small text-muted mb-1">MYM</div>
+      <div id="chart-all-MYM" style="height:290px;background:#1a1a2e;border-radius:4px"></div>
+    </div>
+    <div class="col-6">
+      <div class="text-center small text-muted mb-1">M2K</div>
+      <div id="chart-all-M2K" style="height:290px;background:#1a1a2e;border-radius:4px"></div>
+    </div>
   </div>
 </div>
 
@@ -1906,6 +1941,70 @@ function redrawLines(){
 
 document.getElementById('btn-graph-tab').addEventListener('click',function(){
   initGraphAndLoad();
+});
+
+// ── ALL SYMBOLS ───────────────────────────────────────────────────────────────
+let _allInterval=5;
+
+function setAllInterval(v,btn){
+  _allInterval=v;
+  document.querySelectorAll('#tab-all .btn-group-sm .btn').forEach(b=>b.classList.remove('active'));
+  if(btn)btn.classList.add('active');
+  loadAllSymbols();
+}
+
+async function navAllDay(delta){
+  if(!_graphDates.length)return;
+  const newIdx=Math.max(0,Math.min(_graphDates.length-1,_graphDateIdx+delta));
+  if(newIdx===_graphDateIdx)return;
+  _graphDateIdx=newIdx;
+  _updateDayInfo();
+  await loadAllSymbols();
+}
+
+async function loadAllSymbols(){
+  if(!_graphDates.length){
+    await initGraphAndLoad();
+    if(!_graphDates.length)return;
+  }
+  const reqDate=_graphDates[_graphDateIdx]||'';
+  if(!reqDate)return;
+  document.getElementById('all-day-info').textContent=
+    `${_graphDateIdx+1}/${_graphDates.length}  ${reqDate}`;
+  await Promise.all(['MES','MNQ','MYM','M2K'].map(sym=>_loadOneSymAll(sym,reqDate)));
+}
+
+async function _loadOneSymAll(sym,reqDate){
+  const el=document.getElementById(`chart-all-${sym}`);
+  try{
+    const d=await(await fetch(`/api/history/${sym}?interval=${_allInterval}&date=${reqDate}`)).json();
+    const bars=d.bars||[];
+    if(!bars.length){
+      Plotly.purge(el);
+      el.innerHTML='<div class="d-flex align-items-center justify-content-center h-100 text-muted small">No data</div>';
+      return;
+    }
+    const yLow=Math.min(...bars.map(b=>b.low));
+    const yHigh=Math.max(...bars.map(b=>b.high));
+    const yPad=(yHigh-yLow)*0.07;
+    const trace={type:'candlestick',x:bars.map(b=>b.t),
+      open:bars.map(b=>b.open),high:bars.map(b=>b.high),
+      low:bars.map(b=>b.low),close:bars.map(b=>b.close),name:sym,
+      increasing:{line:{color:'#26a69a'}},decreasing:{line:{color:'#ef5350'}},
+      showlegend:false};
+    const layout={paper_bgcolor:'#1a1a2e',plot_bgcolor:'#1a1a2e',
+      font:{color:'#ccc',size:9},margin:{l:50,r:5,t:5,b:30},
+      xaxis:{rangeslider:{visible:false},gridcolor:'#333'},
+      yaxis:{range:[yLow-yPad,yHigh+yPad],gridcolor:'#333'},
+      showlegend:false,dragmode:'zoom'};
+    Plotly.newPlot(el,[trace],layout,{responsive:true,displayModeBar:false});
+  }catch(e){
+    el.innerHTML=`<div class="text-danger small p-2">${e}</div>`;
+  }
+}
+
+document.getElementById('btn-all-tab').addEventListener('click',function(){
+  loadAllSymbols();
 });
 
 // ── CREATE TRADES ─────────────────────────────────────────────────────────────
