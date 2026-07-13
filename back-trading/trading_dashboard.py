@@ -1043,7 +1043,7 @@ body.busy-wait button,body.busy-wait input,body.busy-wait select{opacity:.55;}
     <span class="price-chip bg-secondary" id="chip-M2K">M2K —</span>
   </div>
   <span class="badge bg-info text-dark">:5003</span>
-  <span class="badge bg-secondary">v3.0</span>
+  <span class="badge bg-secondary">v3.2</span>
 </nav>
 
 <!-- Line detail modal -->
@@ -1093,7 +1093,7 @@ body.busy-wait button,body.busy-wait input,body.busy-wait select{opacity:.55;}
   <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-trades">Create Trades</button></li>
   <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-submitted" id="btn-sub-tab">Submitted</button></li>
   <li class="nav-item ms-auto d-flex align-items-center pe-1">
-    <span class="badge bg-secondary">v3.0</span>
+    <span class="badge bg-secondary">v3.2</span>
   </li>
 </ul>
 
@@ -1573,6 +1573,7 @@ let _graphMode='candle',_graphRange='all',_graphInterval=5;
 let _visibleLines=[];
 let _graphDates=[],_graphDateIdx=0,_graphCurrentDate=null;
 let _graphZoomState=null;
+let _graphNaturalYRange=null,_graphNaturalXRange=null;
 
 async function initGraphAndLoad(){
   const{from,to}=_getDateRange();
@@ -1607,7 +1608,9 @@ function _updateDayInfo(){
 
 async function navDay(delta){
   if(!_graphDates.length)return;
-  _graphDateIdx=Math.max(0,Math.min(_graphDates.length-1,_graphDateIdx+delta));
+  const newIdx=Math.max(0,Math.min(_graphDates.length-1,_graphDateIdx+delta));
+  if(newIdx===_graphDateIdx)return;
+  _graphDateIdx=newIdx;
   _graphZoomState=null;
   _updateDayInfo();
   await loadGraph();
@@ -1617,8 +1620,8 @@ function navSym(delta){
   const syms=_sharedSyms().length?_sharedSyms():['MES','MNQ','MYM','M2K'];
   const idx=syms.indexOf(_graphSym);
   const next=syms[(idx+delta+syms.length)%syms.length];
-  document.querySelectorAll('#sym-pill-tabs .nav-link').forEach(btn=>{
-    if(btn.textContent.trim()===next)btn.click();
+  document.querySelectorAll('#sym-pill-tabs .nav-link').forEach(b=>{
+    if(b.textContent.trim()===next)selectSym(next,b);
   });
 }
 
@@ -1828,6 +1831,7 @@ function drawChart(){
   const yLow=Math.min(...bars.map(b=>b.low));
   const yHigh=Math.max(...bars.map(b=>b.high));
   const yPad=(yHigh-yLow)*0.07;
+  _graphNaturalYRange=[yLow-yPad,yHigh+yPad];
   document.getElementById('sb-bars').textContent=bars.length;
   document.getElementById('sb-low').textContent=yLow.toFixed(2);
   document.getElementById('sb-high').textContent=yHigh.toFixed(2);
@@ -1862,22 +1866,37 @@ function drawBarsMode(){
   document.getElementById('bar-count').textContent=_barsProfile.length+' price levels';
   const prices=_barsProfile.map(p=>p.price);
   const counts=_barsProfile.map(p=>p.count);
+  const priceMin=Math.min(...prices);
+  const priceMax=Math.max(...prices);
+  const xPad=(priceMax-priceMin)*0.05||1;
+  _graphNaturalXRange=[priceMin-xPad,priceMax+xPad];
   const barTrace={type:'bar',x:prices,y:counts,
     marker:{color:'#4e79a7',opacity:0.75},showlegend:false,
     hovertemplate:'%{x:.2f}: %{y} ticks<extra></extra>'};
   const lineTraces=buildBarsLineTraces();
   const layout={paper_bgcolor:'#1a1a2e',plot_bgcolor:'#1a1a2e',
     font:{color:'#ccc'},margin:{l:55,r:10,t:10,b:40},bargap:0.05,
-    xaxis:{gridcolor:'#333',title:{text:'Price',font:{size:10}}},
+    xaxis:{range:_graphNaturalXRange,gridcolor:'#333',title:{text:'Price',font:{size:10}}},
     yaxis:{gridcolor:'#333',title:{text:'Ticks',font:{size:10}}},
     annotations:buildBarsAnnotations(),showlegend:false,dragmode:'zoom'};
+  _applyZoom(layout);
   Plotly.newPlot('chart',[barTrace,...lineTraces],layout,{responsive:true,displayModeBar:false});
   _attachChartHandlers();
 }
 
 function resetZoom(){
   _graphZoomState=null;
-  try{Plotly.relayout('chart',{'xaxis.autorange':true,'yaxis.autorange':true});}catch(_){}
+  const update={};
+  if(_graphMode==='bars'){
+    if(_graphNaturalXRange)update['xaxis.range']=_graphNaturalXRange;
+    else update['xaxis.autorange']=true;
+    update['yaxis.autorange']=true;
+  }else{
+    update['xaxis.autorange']=true;
+    if(_graphNaturalYRange)update['yaxis.range']=_graphNaturalYRange;
+    else update['yaxis.autorange']=true;
+  }
+  try{Plotly.relayout('chart',update);}catch(_){}
 }
 
 function redrawLines(){
