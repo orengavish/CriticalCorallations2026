@@ -253,8 +253,8 @@ def score(db_path: Path, symbol: str, top_n: int = 20,
                 (scored_at, symbol, n_combos_scored,
                  top_algo_type, top_tp_ticks, top_sl_ticks,
                  top_direction_filter, top_strength_max, top_composite_score,
-                 convergence_status)
-            VALUES (?,?,?,?,?,?,?,?,?,?)
+                 top_n_fills, convergence_status)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?)
         """, (
             scored_at, symbol, len(combo_data),
             top["algo_type"]        if top else None,
@@ -263,6 +263,7 @@ def score(db_path: Path, symbol: str, top_n: int = 20,
             top["direction_filter"] if top else None,
             top["strength_max"]     if top else None,
             top["composite_score"]  if top else None,
+            top["n_fills"]          if top else None,
             convergence,
         ))
 

@@ -47,6 +47,10 @@ _EXPLORE_PCT = 0.20   # 20% random exploration budget
 _FINE_RADIUS = 3      # ticks on each side of the hot-zone centroid for fine grid
 _CONVERGENCE_RUNS = 3 # stable top-5 for this many runs → CONVERGED
 _TOP_K = 5            # fingerprint uses top-K combos
+_MIN_N_FILLS_FOR_CONVERGENCE = 30  # Monte Carlo guard — a fingerprint-stable top combo
+                                    # can't be declared CONVERGED until it has this many
+                                    # resolved fills; below that, small-sample noise can
+                                    # produce a "stable" top by chance.
 
 
 def _load_scores(db_path: Path, symbol: str) -> list[dict]:
@@ -82,18 +86,31 @@ def _combo_fingerprint(c: dict) -> str:
     return f"{c['algo_type']}|{c['tp_ticks']}|{c['sl_ticks']}|{c['direction_filter']}|{c['strength_max']}"
 
 
-def _check_convergence(history: list[dict]) -> str:
-    """Return 'converged', 'narrowing', or 'exploring'."""
+def _check_convergence(history: list[dict]) -> tuple[str, str | None]:
+    """Return (status, note). status is 'converged', 'narrowing', or 'exploring'.
+    note explains why convergence was held back, if applicable."""
     if len(history) < _CONVERGENCE_RUNS:
-        return "exploring"
+        return "exploring", None
     # Check last N top combos are identical
-    fingerprints = [h.get("top_algo_type") or "" for h in history[:_CONVERGENCE_RUNS]]
-    tp_vals  = [h.get("top_tp_ticks") for h in history[:_CONVERGENCE_RUNS]]
-    sl_vals  = [h.get("top_sl_ticks") for h in history[:_CONVERGENCE_RUNS]]
-    if len(set(fingerprints)) == 1 and len(set(tp_vals)) == 1 and len(set(sl_vals)) == 1:
-        return "converged"
+    recent = history[:_CONVERGENCE_RUNS]
+    fingerprints = [h.get("top_algo_type") or "" for h in recent]
+    tp_vals  = [h.get("top_tp_ticks") for h in recent]
+    sl_vals  = [h.get("top_sl_ticks") for h in recent]
+    fingerprint_stable = (len(set(fingerprints)) == 1 and
+                           len(set(tp_vals)) == 1 and len(set(sl_vals)) == 1)
+    if fingerprint_stable:
+        # Monte Carlo guard: the stable top combo also needs enough fills to trust it —
+        # a fingerprint that's "stable" on a handful of fills can just be noise.
+        min_n_fills = min((h.get("top_n_fills") or 0) for h in recent)
+        if min_n_fills >= _MIN_N_FILLS_FOR_CONVERGENCE:
+            return "converged", None
+        return "narrowing", (
+            f"Top combo fingerprint stable across {_CONVERGENCE_RUNS} runs but only "
+            f"N={min_n_fills} fills (need ≥{_MIN_N_FILLS_FOR_CONVERGENCE}) — "
+            f"holding at 'narrowing' pending more data (Monte Carlo guard)."
+        )
     # More than 1 scoring run but not yet converged
-    return "narrowing" if len(history) >= 2 else "exploring"
+    return ("narrowing" if len(history) >= 2 else "exploring"), None
 
 
 def _hot_zone(top_combos: list[dict]) -> tuple[float, float]:
@@ -167,11 +184,11 @@ def recommend(db_path: Path, symbol: str,
             for s in sls:
                 already_explored.add((t, s))
 
-    convergence = _check_convergence(history)
+    convergence, convergence_note = _check_convergence(history)
 
     # Build recommendation
     ok_scores = [s for s in scores if s.get("data_status") == "ok"]
-    reasoning_parts = []
+    reasoning_parts = [convergence_note] if convergence_note else []
 
     if convergence == "converged":
         top = ok_scores[0] if ok_scores else None
@@ -300,17 +317,17 @@ def _self_test() -> bool:
             init_db(db_path)
 
             # Snapshot 1: BOUNCE tp=4 sl=4 is top
-            def _insert_history(scored_at, top_algo, top_tp, top_sl, n=5):
+            def _insert_history(scored_at, top_algo, top_tp, top_sl, n=5, n_fills=30):
                 with get_db(db_path) as con:
                     con.execute("""
                         INSERT INTO cl_algo_score_history
                             (scored_at, symbol, n_combos_scored,
                              top_algo_type, top_tp_ticks, top_sl_ticks,
                              top_direction_filter, top_strength_max,
-                             top_composite_score, convergence_status)
-                        VALUES (?,?,?,?,?,?,?,?,?,?)
+                             top_composite_score, top_n_fills, convergence_status)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?)
                     """, (scored_at, "MES", n, top_algo, top_tp, top_sl,
-                          "ALL", 3, 0.75, "exploring"))
+                          "ALL", 3, 0.75, n_fills, "exploring"))
                     for tp in [2, 4, 6, 8, 12]:
                         for sl in [2, 4, 6, 8, 12]:
                             con.execute("""
@@ -322,7 +339,8 @@ def _self_test() -> bool:
                                      rank, data_status)
                                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                             """, (scored_at, "MES", top_algo, tp, sl, "ALL", 3,
-                                  25, 10, 6, 4, 15,
+                                  25, n_fills if (tp == top_tp and sl == top_sl) else 10,
+                                  6, 4, 15,
                                   0.60 if (tp == top_tp and sl == top_sl) else 0.50,
                                   1.50 if (tp == top_tp and sl == top_sl) else 1.10,
                                   2.0  if (tp == top_tp and sl == top_sl) else 0.5,
@@ -330,7 +348,7 @@ def _self_test() -> bool:
                                   1    if (tp == top_tp and sl == top_sl) else tp + sl,
                                   "ok"))
 
-            _insert_history("2026-07-04T10:00:00Z", "BOUNCE", 4, 4)
+            _insert_history("2026-07-04T10:00:00Z", "BOUNCE", 4, 4, n_fills=12)
 
             rec1 = recommend(db_path, "MES")
             assert rec1["convergence_status"] in ("exploring", "narrowing")
@@ -339,13 +357,27 @@ def _self_test() -> bool:
             # Hot zone should center near tp=4, sl=4
             assert 4 in rec1["recommended_tp_ticks"] or 3 in rec1["recommended_tp_ticks"]
 
-            # Snapshot 2+3: same top (convergence should trigger)
-            _insert_history("2026-07-04T11:00:00Z", "BOUNCE", 4, 4)
-            _insert_history("2026-07-04T12:00:00Z", "BOUNCE", 4, 4)
+            # Snapshot 2+3: same top, but N<30 on all 3 recent runs — Monte Carlo guard
+            # should hold at 'narrowing' despite the fingerprint being stable.
+            _insert_history("2026-07-04T11:00:00Z", "BOUNCE", 4, 4, n_fills=12)
+            _insert_history("2026-07-04T12:00:00Z", "BOUNCE", 4, 4, n_fills=12)
+
+            rec_guarded = recommend(db_path, "MES")
+            assert rec_guarded["convergence_status"] == "narrowing", \
+                (f"Expected 'narrowing' (N<30 guard) despite stable fingerprint, "
+                 f"got {rec_guarded['convergence_status']}")
+            assert "Monte Carlo guard" in rec_guarded["reasoning"], \
+                "Reasoning should explain the N<30 hold-back"
+
+            # Snapshots 4-6: same top, N>=30 on all 3 most recent runs — now convergence
+            # should trigger (the guard looks at the last _CONVERGENCE_RUNS runs only).
+            _insert_history("2026-07-04T13:00:00Z", "BOUNCE", 4, 4, n_fills=30)
+            _insert_history("2026-07-04T14:00:00Z", "BOUNCE", 4, 4, n_fills=30)
+            _insert_history("2026-07-04T15:00:00Z", "BOUNCE", 4, 4, n_fills=30)
 
             rec2 = recommend(db_path, "MES")
             assert rec2["convergence_status"] == "converged", \
-                f"Expected converged after 3 identical tops, got {rec2['convergence_status']}"
+                f"Expected converged after 3 identical tops with N>=30, got {rec2['convergence_status']}"
 
             # Dry-run doesn't write to DB
             with get_db(db_path) as con:

@@ -1,6 +1,6 @@
 # Claude State — CriticalCorallations2026
 > **Living doc. Update every time scope changes, a task completes, or context shifts.**
-> Last updated: 2026-07-15
+> Last updated: 2026-07-16
 
 ---
 
@@ -27,7 +27,7 @@ Tabs: **Lines \| Graph \| Create Trades \| Submitted**
 DB: `trader/data/galao.db`
 History data (tick CSVs): read from `C:\Projects\Fetcher2026\data\history\` (owned by brother)
 
-Current version: **v4.00** — Sandbox tab with price-level microstructure profile
+Current version: **v4.10** — Monte Carlo guard (N≥30) on CL Algo learner convergence
 
 **Do NOT start `trader/visualizer/app.py` (port 5001) or `back-trading/algo_dashboard.py` (port 5002).** Those are legacy/wrong.
 
@@ -53,12 +53,12 @@ These three were split out from the old `C:\Projects\Galgo2026\june\` monolith o
 
 ### Active / Short Term
 - [ ] **CL Algo pipeline** — `back-trading/run_cl_algo_pipeline.py` — runs after 17:00 when tick data is available. Command: `python back-trading/run_cl_algo_pipeline.py --symbol MES --verbose`
-  - Pending: june/ path compatibility fix
-  - Pending: next-run grid in UI
-  - Pending: Monte Carlo guard at N≥30
+  - [x] Monte Carlo guard at N≥30 — learner won't declare CONVERGED until the top combo has ≥30 fills on all 3 most recent scoring runs, even if the fingerprint looks stable (`cl_algo_learner.py`, v4.10)
+  - Deferred: june/ path compatibility fix — `trading_dashboard.py` / `lib/price_profile.py` still read from `C:\Projects\Galgo2026\june\trader\data\history`. Checked 2026-07-16: that's still where live data actually lands — `Fetcher2026\data\history` is empty despite its fetch_progress.db/lock existing. Do NOT switch until Fetcher2026 is confirmed writing there, or the dashboard goes dark.
+  - Pending: next-run grid in UI — no spec yet, needs design input before building
 
 ### Infra (needs admin action by Oren — run both once)
-- [ ] Install CC2026 Task Scheduler (auto-start port 5003 on boot):
+- [ ] Install CC2026 Task Scheduler (auto-start port 5003 on boot). Note: `install_scheduler.ps1` was fixed 2026-07-16 — it used to print "OK" even when task/firewall registration silently failed (non-elevated shells swallowed the errors). Now it checks real success and reports FAILED honestly. Still must be run elevated:
   `Start-Process powershell -Verb RunAs -ArgumentList '-File C:\Projects\CriticalCorallations2026\scripts\install_scheduler.ps1'`
 - [ ] Install Fetcher2026 Task Scheduler (brother's job):
   `Start-Process powershell -Verb RunAs -ArgumentList '-File C:\Projects\Fetcher2026\scripts\install_scheduler.ps1'`
@@ -92,6 +92,8 @@ python dashboard.py                          # port 5050
 
 ## Recent Git History (for context)
 ```
+v4.10: Monte Carlo N>=30 guard on learner convergence; install_scheduler.ps1 honest error reporting
+v4.09: price profile module, DB scheduler updates, Task Scheduler install script
 v3.12: Draw mode popup on dblclick — Support/Resistance color buttons, green/red lines
 v3.11: Fix Draw mode — remove !important, timed dblclick, robust _pixelToPrice fallback
 v3.10: Transpose bars mode — price on Y axis, ticks on X

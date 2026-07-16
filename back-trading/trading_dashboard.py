@@ -1173,7 +1173,7 @@ body.busy-wait button,body.busy-wait input,body.busy-wait select{opacity:.55;}
     <span class="price-chip bg-secondary" id="chip-M2K">M2K —</span>
     <span class="text-muted ms-1" style="font-size:.75rem">Trading Dashboard</span>
     <span class="badge bg-info text-dark">:5003</span>
-    <span class="badge bg-secondary">v4.09</span>
+    <span class="badge bg-secondary">v4.10</span>
   </div>
 </div>
 
@@ -3245,6 +3245,15 @@ _RELEASE_NOTES = [
     ("v3.10", "Transpose bars mode — price on Y axis, ticks on X, lines align with other graphs", None),
     ("v3.11", "Fix Draw mode — remove !important, timed dblclick, robust _pixelToPrice fallback", None),
     ("v3.12", "Draw mode popup on dblclick — Support/Resistance color buttons, green/red lines", None),
+    ("v4.10", "CL Algo: Monte Carlo N≥30 guard on learner convergence; scheduler script honest errors",
+              "cl_algo_learner.py no longer declares CONVERGED off a fingerprint-stable top combo "
+              "alone — the top combo must also have ≥30 fills on all 3 most recent scoring runs "
+              "(cl_algo_score_history gained a top_n_fills column). Below that it holds at 'narrowing' "
+              "with a reasoning note explaining why. Also fixed scripts/install_scheduler.ps1, which "
+              "previously printed \"OK\" for Task Scheduler / firewall registration even when it silently "
+              "failed in a non-elevated shell; it now verifies the task actually registered and reports "
+              "FAILED honestly."),
+    ("v4.09", "Price profile module, DB scheduler updates, Task Scheduler install script", None),
     ("v4.07", "Test tab: MES 5-day 15m candlestick, support lines, daily lows, dbl-click hide/add",
               "New Test tab — MES only, 5 working days back from 2026-07-10, 15m candles. "
               "8 support lines (normal/!/?) with distinct colors. Day separators. Daily low per day. "

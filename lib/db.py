@@ -263,6 +263,7 @@ CREATE TABLE IF NOT EXISTS cl_algo_score_history (
     top_direction_filter    TEXT,
     top_strength_max        INTEGER,
     top_composite_score     REAL,
+    top_n_fills             INTEGER,
     convergence_status      TEXT    NOT NULL DEFAULT 'exploring'
 );
 
@@ -471,6 +472,7 @@ def _migrate(path: Path = None):
         "ALTER TABLE commands ADD COLUMN source TEXT",
         "ALTER TABLE commands ADD COLUMN parent_command_id INTEGER",
         "ALTER TABLE commands ADD COLUMN critical_line_id INTEGER REFERENCES critical_lines(id)",
+        "ALTER TABLE cl_algo_score_history ADD COLUMN top_n_fills INTEGER",
         # Idempotent CREATE IF NOT EXISTS for tables added after initial schema
         """CREATE TABLE IF NOT EXISTS price_cache (
             symbol       TEXT PRIMARY KEY,
@@ -525,6 +527,7 @@ def _migrate(path: Path = None):
             n_combos_scored INTEGER NOT NULL DEFAULT 0,
             top_algo_type TEXT, top_tp_ticks INTEGER, top_sl_ticks INTEGER,
             top_direction_filter TEXT, top_strength_max INTEGER, top_composite_score REAL,
+            top_n_fills INTEGER,
             convergence_status TEXT NOT NULL DEFAULT 'exploring'
         )""",
         """CREATE TABLE IF NOT EXISTS cl_algo_learner_runs (
