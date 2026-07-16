@@ -32,6 +32,11 @@ session:
   open_offset_minutes: 30
   shutdown_offset_minutes: 60
   timezone: America/Chicago
+  monitor_poll_seconds: 5          # session.py: how often to check broker/decider liveness
+  max_restarts: 5                  # session.py: give up restarting a component after this many crashes
+  restart_backoff_base_seconds: 5  # session.py: delay before first restart attempt
+  restart_backoff_cap_seconds: 60  # session.py: backoff doubles per crash, capped here
+  stop_grace_seconds: 20           # session.py: how long to wait for clean SESSION=SHUTDOWN exit before kill()
 
 orders:
   active_brackets: [2, 4]

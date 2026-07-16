@@ -27,7 +27,28 @@ Tabs: **Lines \| Graph \| Create Trades \| Submitted**
 DB: `trader/data/galao.db`
 History data (tick CSVs): read from `C:\Projects\Fetcher2026\data\history\` (owned by brother)
 
-Current version: **v4.10** — Monte Carlo guard (N≥30) on CL Algo learner convergence
+Current version: **v4.11** — Session manager (Start/Stop broker+decider from dashboard)
+
+**trader/broker.py and trader/decider.py are no longer homeless.** `trader/session.py` supervises
+them as managed subprocesses (spawn, stdout capture to `trader/logs/{broker,decider}_stdout.log`,
+crash-restart with backoff, clean shutdown via SESSION=SHUTDOWN). The dashboard's top bar has a
+Start/Stop Session button + live Broker/Decider status badges, backed by
+`GET/POST /api/session/{status,start,stop}`.
+
+**I have NOT yet actually clicked Start Session against real IB** — that launches real order-
+generation processes (paper account, but still). `trader/session.py --self-test` proves the
+supervision mechanics in isolation (fake stand-in scripts, no real IB/DB). Starting a real session
+is Oren's call.
+
+**Config gotcha for anyone touching trader/session.py or importing it into another process:**
+there are TWO config.yaml files — `trader/config.yaml` (live trading engine) and
+`back-trading/config.yaml` (separate backtest engine, different DB/ports). `lib.config_loader`
+picks whichever is nearest the *launching* script and caches it globally on first call, ignoring
+path args after that. session.py works around this by loading `trader/config.yaml` by its own
+file location and by NOT calling `get_logger()` with ambient config resolution (passes `log_dir`
+explicitly) — otherwise importing session.py into the dashboard (which lives in back-trading/)
+silently loads the wrong config. If you add a new trader/*.py module that gets imported
+cross-directory, watch for this.
 
 **Do NOT start `trader/visualizer/app.py` (port 5001) or `back-trading/algo_dashboard.py` (port 5002).** Those are legacy/wrong.
 
@@ -52,6 +73,7 @@ These three were split out from the old `C:\Projects\Galgo2026\june\` monolith o
 ## Planned Next Steps
 
 ### Active / Short Term
+- [x] **Session manager** — `trader/session.py` + dashboard Start/Stop Session button (v4.11, 2026-07-16). Note: `trader/runner.py` already existed and does something broader (launches decider/broker/position_manager/**visualizer**/fetch_scheduler/random_gen with its own crash-restart) but isn't wired to anything and includes the forbidden legacy visualizer — session.py is deliberately narrower (broker+decider only) and dashboard-integrated. Left runner.py untouched; worth deciding later whether to retire it.
 - [ ] **CL Algo pipeline** — `back-trading/run_cl_algo_pipeline.py` — runs after 17:00 when tick data is available. Command: `python back-trading/run_cl_algo_pipeline.py --symbol MES --verbose`
   - [x] Monte Carlo guard at N≥30 — learner won't declare CONVERGED until the top combo has ≥30 fills on all 3 most recent scoring runs, even if the fingerprint looks stable (`cl_algo_learner.py`, v4.10)
   - Deferred: june/ path compatibility fix — `trading_dashboard.py` / `lib/price_profile.py` still read from `C:\Projects\Galgo2026\june\trader\data\history`. Checked 2026-07-16: that's still where live data actually lands — `Fetcher2026\data\history` is empty despite its fetch_progress.db/lock existing. Do NOT switch until Fetcher2026 is confirmed writing there, or the dashboard goes dark.
@@ -92,6 +114,7 @@ python dashboard.py                          # port 5050
 
 ## Recent Git History (for context)
 ```
+v4.11: Session manager (trader/session.py) + dashboard Start/Stop Session + broker/decider status
 v4.10: Monte Carlo N>=30 guard on learner convergence; install_scheduler.ps1 honest error reporting
 v4.09: price profile module, DB scheduler updates, Task Scheduler install script
 v3.12: Draw mode popup on dblclick — Support/Resistance color buttons, green/red lines

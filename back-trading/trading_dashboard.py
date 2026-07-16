@@ -29,6 +29,7 @@ from flask import Flask, jsonify, request, render_template_string
 
 from lib.db import get_db
 from lib.price_profile import ensure_profile as _ensure_price_profile, get_price_profile
+from trader.session import get_session_manager
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
@@ -425,6 +426,24 @@ def api_prices():
         except Exception:
             out[sym] = None
     return jsonify(out)
+
+
+@app.route("/api/session/status")
+def api_session_status():
+    return jsonify(get_session_manager().status())
+
+
+@app.route("/api/session/start", methods=["POST"])
+def api_session_start():
+    try:
+        return jsonify(get_session_manager().start())
+    except RuntimeError as e:
+        return jsonify({"error": str(e)}), 409
+
+
+@app.route("/api/session/stop", methods=["POST"])
+def api_session_stop():
+    return jsonify(get_session_manager().stop())
 
 
 @app.route("/api/lines/create", methods=["POST"])
@@ -1133,7 +1152,9 @@ body.busy-wait{cursor:wait!important;}
 body.busy-wait *{pointer-events:none!important;}
 body.busy-wait button,body.busy-wait input,body.busy-wait select{opacity:.55;}
 #top-bar{background:#161b22;height:40px;border-bottom:1px solid #30363d;display:flex;align-items:center;padding:0 8px;gap:0;overflow:hidden}
-.top-tab{border:none!important;border-radius:0!important;background:transparent!important;color:#8b949e;font-size:.8rem;height:40px;border-bottom:2px solid transparent!important;display:flex;align-items:center;padding:0 12px;white-space:nowrap}
+.top-tab{border:none!important;border-radius:0!important;background:transparent!important;color:#8b949e;font-size:.8rem;height:40px;border-bottom:2px solid transparent!important;display:flex;align-items:center;padding:0 9px;white-space:nowrap}
+.top-tab.icon-tab{padding:0 8px;font-size:.9rem}
+#menu-links{min-width:11rem}
 .top-tab:hover{color:#ccc;background:rgba(255,255,255,.05)!important}
 .top-tab.active{color:#fff!important;border-bottom-color:#0d6efd!important}
 /* Sandbox tab */
@@ -1155,6 +1176,14 @@ body.busy-wait button,body.busy-wait input,body.busy-wait select{opacity:.55;}
     <li class="nav-item"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-test" id="btn-test-tab">Test</button></li>
     <li class="nav-item"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-trades">Trades</button></li>
     <li class="nav-item"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-submitted" id="btn-sub-tab">Sub</button></li>
+    <li class="nav-item dropdown">
+      <button class="nav-link top-tab icon-tab" data-bs-toggle="dropdown" title="Other dashboards">🔗</button>
+      <ul class="dropdown-menu dropdown-menu-dark" id="menu-links">
+        <li><a class="dropdown-item" id="menu-link-cc2026"  target="_blank">CC2026 Dashboard (this)</a></li>
+        <li><a class="dropdown-item" id="menu-link-fetcher" target="_blank">Fetcher2026</a></li>
+        <li><a class="dropdown-item" id="menu-link-geva"    target="_blank">GevaExtract</a></li>
+      </ul>
+    </li>
   </ul>
   <div class="vr mx-2 flex-shrink-0" style="height:20px;background:#30363d"></div>
   <div class="d-flex align-items-center gap-2 small flex-shrink-0">
@@ -1167,13 +1196,18 @@ body.busy-wait button,body.busy-wait input,body.busy-wait select{opacity:.55;}
     <input type="date" id="range-to"   class="form-control form-control-sm py-0" style="width:120px;display:none;font-size:.75rem;height:24px" onchange="onDateRangeChange()">
   </div>
   <div class="d-flex align-items-center gap-2 ms-auto flex-shrink-0">
+    <span class="badge" id="session-broker-badge"  style="background:#6c757d">Broker: —</span>
+    <span class="badge" id="session-decider-badge" style="background:#6c757d">Decider: —</span>
+    <span class="text-muted" id="session-uptime" style="font-size:.7rem;min-width:3.5em"></span>
+    <button class="btn btn-sm btn-success" id="session-toggle-btn" onclick="toggleSession()">Start Session</button>
+    <div class="vr mx-1" style="height:20px;background:#30363d"></div>
     <span class="price-chip bg-secondary" id="chip-MES">MES —</span>
     <span class="price-chip bg-secondary" id="chip-MNQ">MNQ —</span>
     <span class="price-chip bg-secondary" id="chip-MYM">MYM —</span>
     <span class="price-chip bg-secondary" id="chip-M2K">M2K —</span>
     <span class="text-muted ms-1" style="font-size:.75rem">Trading Dashboard</span>
     <span class="badge bg-info text-dark">:5003</span>
-    <span class="badge bg-secondary">v4.10</span>
+    <span class="badge bg-secondary">v4.11</span>
   </div>
 </div>
 
@@ -1667,6 +1701,55 @@ async function pollPrices(){
   }catch(e){}
 }
 pollPrices();setInterval(pollPrices,5000);
+
+// ── Cross-dashboard menu links (localhost/LAN/VPN all work — same host, diff port) ─
+(function(){
+  const base=location.protocol+'//'+location.hostname;
+  document.getElementById('menu-link-cc2026').href  = base+':5003';
+  document.getElementById('menu-link-fetcher').href = base+':5050';
+  document.getElementById('menu-link-geva').href    = base+':5005';
+})();
+
+// ── Session manager (broker + decider) ──────────────────────────────────────
+let _sessionBusy=false;
+function _sessionBadgeColor(state){
+  return state==='running'?'#198754':state==='restarting'?'#fd7e14':'#6c757d';
+}
+async function pollSessionStatus(){
+  try{
+    const d=await (await fetch('/api/session/status')).json();
+    const bB=document.getElementById('session-broker-badge');
+    const bD=document.getElementById('session-decider-badge');
+    bB.textContent='Broker: '+d.broker;   bB.style.background=_sessionBadgeColor(d.broker);
+    bD.textContent='Decider: '+d.decider; bD.style.background=_sessionBadgeColor(d.decider);
+    const up=d.uptime_seconds||0;
+    document.getElementById('session-uptime').textContent=
+      up>0?`${Math.floor(up/60)}m ${up%60}s`:'';
+    if(!_sessionBusy){
+      const anyAlive=d.broker!=='dead'||d.decider!=='dead';
+      const btn=document.getElementById('session-toggle-btn');
+      btn.textContent=anyAlive?'Stop Session':'Start Session';
+      btn.className='btn btn-sm '+(anyAlive?'btn-danger':'btn-success');
+    }
+  }catch(e){}
+}
+async function toggleSession(){
+  const btn=document.getElementById('session-toggle-btn');
+  const starting=btn.textContent.trim()==='Start Session';
+  _sessionBusy=true; btn.disabled=true;
+  btn.textContent=starting?'Starting…':'Stopping…';
+  try{
+    const r=await fetch('/api/session/'+(starting?'start':'stop'),{method:'POST'});
+    const d=await r.json();
+    if(d.error) alert('Session '+(starting?'start':'stop')+' failed: '+d.error);
+  }catch(e){
+    alert('Session '+(starting?'start':'stop')+' failed: '+e);
+  }finally{
+    _sessionBusy=false; btn.disabled=false;
+    pollSessionStatus();
+  }
+}
+pollSessionStatus();setInterval(pollSessionStatus,5000);
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 function checkedVals(id){
@@ -3245,6 +3328,24 @@ _RELEASE_NOTES = [
     ("v3.10", "Transpose bars mode — price on Y axis, ticks on X, lines align with other graphs", None),
     ("v3.11", "Fix Draw mode — remove !important, timed dblclick, robust _pixelToPrice fallback", None),
     ("v3.12", "Draw mode popup on dblclick — Support/Resistance color buttons, green/red lines", None),
+    ("v4.11", "Session manager — Start/Stop broker+decider from the dashboard; cross-dashboard menu",
+              "New trader/session.py: supervises broker.py + decider.py as managed subprocesses, "
+              "streams their stdout to trader/logs/{broker,decider}_stdout.log, restarts on crash "
+              "with backoff (max 5 attempts), and shuts both down cleanly via the SESSION=SHUTDOWN "
+              "flag they already poll for. A PID-lock file stops a second supervisor (e.g. a "
+              "standalone CLI run) from double-launching them against the same DB. "
+              "Dashboard: Start/Stop Session button + live Broker/Decider status badges in the top "
+              "bar, backed by GET/POST /api/session/{status,start,stop}. "
+              "Fixed a real bug found while wiring this up: SessionManager was resolving the wrong "
+              "config.yaml (back-trading/config.yaml instead of trader/config.yaml) when imported "
+              "into the dashboard process, because lib.config_loader picks a config near the "
+              "*launching* script and caches it globally on first use — session.py's own module-level "
+              "logger setup was triggering that ambient lookup before SessionManager could ask for "
+              "the right file explicitly. Now loads trader/config.yaml by its own file location, "
+              "unaffected by whichever script imports it. "
+              "Also added a small 🔗 menu (icon-only, not a new tab — trimmed tab padding too) "
+              "linking to Fetcher2026 (:5050) and GevaExtract (:5005) alongside this dashboard, "
+              "using the current page's hostname so it works from localhost, LAN, or VPN."),
     ("v4.10", "CL Algo: Monte Carlo N≥30 guard on learner convergence; scheduler script honest errors",
               "cl_algo_learner.py no longer declares CONVERGED off a fingerprint-stable top combo "
               "alone — the top combo must also have ≥30 fills on all 3 most recent scoring runs "
