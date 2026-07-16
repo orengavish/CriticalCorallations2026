@@ -1224,7 +1224,7 @@ body.busy-wait #busy-overlay{display:flex;}
     <span class="price-chip bg-secondary" id="chip-M2K">M2K —</span>
     <span class="text-muted ms-1" style="font-size:.75rem">Trading Dashboard</span>
     <span class="badge bg-info text-dark">:5003</span>
-    <span class="badge bg-secondary">v4.14</span>
+    <span class="badge bg-secondary">v4.15</span>
   </div>
 </div>
 
@@ -1582,21 +1582,27 @@ body.busy-wait #busy-overlay{display:flex;}
     <button class="btn btn-sm btn-outline-warning active" id="all-auto-btn" onclick="toggleAllAutoZoom()"
             title="Auto-refine bar resolution when you zoom the overlay chart">&#9889; Auto</button>
   </div>
-  <div id="chart-all-overlay" style="display:none;height:590px;background:#1a1a2e;border-radius:4px"></div>
+  <div id="chart-all-overlay-wrap" style="display:none">
+    <div id="chart-all-overlay" style="height:285px;background:#1a1a2e;border-radius:4px"></div>
+    <div class="d-flex align-items-center gap-3 my-1 small text-muted">
+      <span>Pairs:</span>
+      <label class="mb-0"><input type="checkbox" id="all-pair-MES_MYM" checked onchange="_plotAllDiff()"> MES&minus;MYM</label>
+      <label class="mb-0"><input type="checkbox" id="all-pair-MES_M2K" checked onchange="_plotAllDiff()"> MES&minus;M2K</label>
+      <label class="mb-0"><input type="checkbox" id="all-pair-MYM_M2K" checked onchange="_plotAllDiff()"> MYM&minus;M2K</label>
+      <span class="ms-auto" style="font-size:.7rem">Dotted = &plusmn;2&sigma; for the day (session-wide)</span>
+    </div>
+    <div id="chart-all-diff" style="height:285px;background:#1a1a2e;border-radius:4px"></div>
+  </div>
   <div id="all-grid" class="row g-2">
-    <div class="col-6">
+    <div class="col-4">
       <div class="text-center small text-muted mb-1">MES</div>
       <div id="chart-all-MES" style="height:290px;background:#1a1a2e;border-radius:4px"></div>
     </div>
-    <div class="col-6">
-      <div class="text-center small text-muted mb-1">MNQ</div>
-      <div id="chart-all-MNQ" style="height:290px;background:#1a1a2e;border-radius:4px"></div>
-    </div>
-    <div class="col-6">
+    <div class="col-4">
       <div class="text-center small text-muted mb-1">MYM</div>
       <div id="chart-all-MYM" style="height:290px;background:#1a1a2e;border-radius:4px"></div>
     </div>
-    <div class="col-6">
+    <div class="col-4">
       <div class="text-center small text-muted mb-1">M2K</div>
       <div id="chart-all-M2K" style="height:290px;background:#1a1a2e;border-radius:4px"></div>
     </div>
@@ -2346,6 +2352,9 @@ document.getElementById('btn-graph-tab').addEventListener('click',function(){
 
 // ── ALL SYMBOLS ───────────────────────────────────────────────────────────────
 let _allInterval=5, _allOverlay=false, _allAutoZoom=true, _allZoomTimer=null;
+let _allDiffCache=null, _allSyncingZoom=false;
+const ALL_PAIRS=[['MES','MYM'],['MES','M2K'],['MYM','M2K']];
+const ALL_PAIR_COLORS={MES_MYM:'#E8A838',MES_M2K:'#9B59B6',MYM_M2K:'#17A2B8'};
 
 // Auto-zoom bar resolution ladder: wider visible window -> coarser bars, so
 // zooming in always reveals more bars instead of the same handful stretched out.
@@ -2381,7 +2390,7 @@ function toggleAllAutoZoom(){
 function toggleAllOverlay(){
   _allOverlay=!_allOverlay;
   document.getElementById('all-overlay-btn').classList.toggle('active',_allOverlay);
-  document.getElementById('chart-all-overlay').style.display=_allOverlay?'block':'none';
+  document.getElementById('chart-all-overlay-wrap').style.display=_allOverlay?'block':'none';
   document.getElementById('all-grid').style.display=_allOverlay?'none':'flex';
   // Wait one frame so browser reflows the newly-visible div before Plotly queries its dimensions
   requestAnimationFrame(()=>loadAllSymbols());
@@ -2408,30 +2417,35 @@ async function loadAllSymbols(){
   _enterBusy();
   try{
     if(_allOverlay) await _loadOverlayAll(reqDate);
-    else await Promise.all(['MES','MNQ','MYM','M2K'].map(sym=>_loadOneSymAll(sym,reqDate)));
+    else await Promise.all(['MES','MYM','M2K'].map(sym=>_loadOneSymAll(sym,reqDate)));
   }finally{_exitBusy();}
 }
 
+function _pairKey(a,b){return a+'_'+b;}
+
 async function _loadOverlayAll(reqDate,forcedRange){
   const el=document.getElementById('chart-all-overlay');
-  const SYM_COLORS={MES:'#5B8DD9',MNQ:'#E8A838',MYM:'#32BA64',M2K:'#D25050'};
-  const SYMS=['MES','MNQ','MYM','M2K'];
+  const SYM_COLORS={MES:'#5B8DD9',MYM:'#32BA64',M2K:'#D25050'};
+  const SYMS=['MES','MYM','M2K'];
   let data;
   try{
     data=await Promise.all(SYMS.map(s=>
       fetch(`/api/history/${s}?interval=${_allInterval}&date=${reqDate}`).then(r=>r.json())
     ));
   }catch(e){el.innerHTML=`<div class="text-danger small p-2">${e}</div>`;return;}
+
   const traces=[];
+  const tsToY={};  // per-symbol map: timestamp -> ticks-from-open (for the diff panel below)
   for(let i=0;i<SYMS.length;i++){
     const sym=SYMS[i],bars=data[i].bars||[];
     if(!bars.length)continue;
     const base=bars[0].close??bars[0].open;
     const tick=SB_TICKS[sym]||0.25;
+    const ys=bars.map(b=>Math.round((b.close-base)/tick));
+    tsToY[sym]=new Map(bars.map((b,j)=>[b.t,ys[j]]));
     traces.push({
       name:sym,type:'scatter',mode:'lines',
-      x:bars.map(b=>b.t),
-      y:bars.map(b=>Math.round((b.close-base)/tick)),
+      x:bars.map(b=>b.t), y:ys,
       line:{color:SYM_COLORS[sym],width:1.5},
       hovertemplate:`<b>${sym}</b><br>%{x}<br>%{y} ticks<extra></extra>`,
     });
@@ -2441,33 +2455,103 @@ async function _loadOverlayAll(reqDate,forcedRange){
   if(forcedRange) xaxis.range=forcedRange;
   await Plotly.newPlot(el,traces,{
     paper_bgcolor:'#1a1a2e',plot_bgcolor:'#1a1a2e',
-    font:{color:'#ccc',size:10},margin:{t:8,b:30,l:50,r:8},
+    font:{color:'#ccc',size:10},margin:{t:8,b:20,l:50,r:8},
     xaxis,
     yaxis:{gridcolor:'#252535',zeroline:true,zerolinecolor:'#555',title:'Ticks from open'},
     showlegend:true,legend:{x:0,y:1,bgcolor:'rgba(0,0,0,0)',font:{size:11}},
     dragmode:'zoom',
   },{responsive:true,displayModeBar:false,scrollZoom:true});
 
-  // Auto-refine: on zoom (and only zoom, not pan/autorange), fetch a finer
-  // interval sized to the new visible window so zooming in always reveals
-  // more bars instead of stretching the same handful. Debounced so a drag
-  // doesn't fire a fetch per pixel. Toggle off via the Auto button for pure
-  // manual interval control instead.
-  el.removeAllListeners?.('plotly_relayout');
-  el.on('plotly_relayout',(ev)=>{
-    if(!_allAutoZoom)return;
-    const x0=ev['xaxis.range[0]'], x1=ev['xaxis.range[1]'];
-    if(x0===undefined||x1===undefined)return;  // pan/autorange/other relayout, not a zoom range
-    clearTimeout(_allZoomTimer);
-    _allZoomTimer=setTimeout(()=>{
-      const windowSec=(new Date(x1)-new Date(x0))/1000;
-      const next=_allIntervalForWindow(windowSec);
-      if(next===_allInterval)return;
-      _allInterval=next;
-      _syncAllIntervalBtn();
-      _loadOverlayAll(reqDate,[x0,x1]);
-    },400);
-  });
+  // Pairwise diffs for the opportunity panel below — only over timestamps
+  // present in BOTH symbols of a pair (a data gap in one shouldn't silently
+  // misalign the other). Session-wide mean/std gives a flat +-2sigma band:
+  // "what's normal scatter for this pair today."
+  _allDiffCache={};
+  for(const [a,b] of ALL_PAIRS){
+    const key=_pairKey(a,b);
+    if(!tsToY[a]||!tsToY[b]){_allDiffCache[key]=null;continue;}
+    const xs=[],ys=[];
+    for(const [t,ya] of tsToY[a]){
+      if(!tsToY[b].has(t))continue;
+      xs.push(t); ys.push(ya-tsToY[b].get(t));
+    }
+    if(ys.length<2){_allDiffCache[key]=null;continue;}
+    const mean=ys.reduce((s,v)=>s+v,0)/ys.length;
+    const std=Math.sqrt(ys.reduce((s,v)=>s+(v-mean)**2,0)/ys.length);
+    _allDiffCache[key]={x:xs,y:ys,mean,std};
+  }
+  await _plotAllDiff(forcedRange);
+
+  // Zoom handling, wired on both panels:
+  //  1. Auto-refine (Auto button on): re-fetch at a finer interval sized to
+  //     the new visible window, debounced, so zooming in reveals more bars.
+  //  2. Keep both panels' x-range in sync either way, since they're two
+  //     independent Plotly figures (not subplots) sharing one time axis.
+  // _allSyncingZoom guards against the mirrored relayout re-triggering itself.
+  const diffEl=document.getElementById('chart-all-diff');
+  const wireZoom=(srcEl,mirrorEl)=>{
+    srcEl.removeAllListeners?.('plotly_relayout');
+    srcEl.on('plotly_relayout',(ev)=>{
+      if(_allSyncingZoom){_allSyncingZoom=false;return;}
+      const x0=ev['xaxis.range[0]'], x1=ev['xaxis.range[1]'];
+      if(x0===undefined||x1===undefined)return;  // pan/autorange/other relayout, not a zoom range
+      _allSyncingZoom=true;
+      Plotly.relayout(mirrorEl,{'xaxis.range':[x0,x1]});
+      if(!_allAutoZoom)return;
+      clearTimeout(_allZoomTimer);
+      _allZoomTimer=setTimeout(()=>{
+        const windowSec=(new Date(x1)-new Date(x0))/1000;
+        const next=_allIntervalForWindow(windowSec);
+        if(next===_allInterval)return;
+        _allInterval=next;
+        _syncAllIntervalBtn();
+        _loadOverlayAll(reqDate,[x0,x1]);
+      },400);
+    });
+  };
+  wireZoom(el,diffEl);
+  wireZoom(diffEl,el);
+}
+
+async function _plotAllDiff(forcedRange){
+  const el=document.getElementById('chart-all-diff');
+  if(!_allDiffCache){el.innerHTML='<div class="d-flex align-items-center justify-content-center h-100 text-muted small">No data</div>';return;}
+  // Preserve the current zoom on checkbox-toggle redraws (no explicit range passed) —
+  // otherwise ticking a pair on/off would silently reset the view to full-day.
+  if(!forcedRange){
+    const cur=el._fullLayout?.xaxis?.range;
+    if(cur) forcedRange=[...cur];
+  }
+  const traces=[];
+  for(const [a,b] of ALL_PAIRS){
+    const key=_pairKey(a,b);
+    const chk=document.getElementById('all-pair-'+key);
+    if(chk&&!chk.checked)continue;
+    const d=_allDiffCache[key];
+    if(!d)continue;
+    const col=ALL_PAIR_COLORS[key];
+    const label=`${a}−${b}`;
+    traces.push({name:label,type:'scatter',mode:'lines',x:d.x,y:d.y,
+      line:{color:col,width:1.5},
+      hovertemplate:`<b>${label}</b><br>%{x}<br>%{y} ticks<extra></extra>`});
+    traces.push({name:label+' +2σ',type:'scatter',mode:'lines',x:[d.x[0],d.x[d.x.length-1]],
+      y:[d.mean+2*d.std,d.mean+2*d.std],line:{color:col,width:1,dash:'dot'},
+      opacity:.6,hoverinfo:'skip',showlegend:false});
+    traces.push({name:label+' -2σ',type:'scatter',mode:'lines',x:[d.x[0],d.x[d.x.length-1]],
+      y:[d.mean-2*d.std,d.mean-2*d.std],line:{color:col,width:1,dash:'dot'},
+      opacity:.6,hoverinfo:'skip',showlegend:false});
+  }
+  if(!traces.length){el.innerHTML='<div class="d-flex align-items-center justify-content-center h-100 text-muted small">No pairs selected</div>';return;}
+  const xaxis={gridcolor:'#252535',zeroline:false,rangeslider:{visible:false}};
+  if(forcedRange) xaxis.range=forcedRange;
+  await Plotly.newPlot(el,traces,{
+    paper_bgcolor:'#1a1a2e',plot_bgcolor:'#1a1a2e',
+    font:{color:'#ccc',size:10},margin:{t:8,b:30,l:50,r:8},
+    xaxis,
+    yaxis:{gridcolor:'#252535',zeroline:true,zerolinecolor:'#777',title:'Diff (ticks)'},
+    showlegend:true,legend:{x:0,y:1,bgcolor:'rgba(0,0,0,0)',font:{size:11}},
+    dragmode:'zoom',
+  },{responsive:true,displayModeBar:false,scrollZoom:true});
 }
 
 async function _loadOneSymAll(sym,reqDate){
@@ -3398,6 +3482,18 @@ _RELEASE_NOTES = [
     ("v3.10", "Transpose bars mode — price on Y axis, ticks on X, lines align with other graphs", None),
     ("v3.11", "Fix Draw mode — remove !important, timed dblclick, robust _pixelToPrice fallback", None),
     ("v3.12", "Draw mode popup on dblclick — Support/Resistance color buttons, green/red lines", None),
+    ("v4.15", "All tab: MNQ removed, new pairwise-diff opportunity panel below the overlay",
+              "MNQ dropped from the All tab entirely (both overlay and per-symbol grid) — its "
+              "tick-delta dwarfed MES/MYM/M2K on the shared y-axis, squashing the other 3 into a "
+              "flat band. Removing it also freed the y-axis to auto-rescale to the remaining 3 "
+              "(no fixed range was ever set, so this needed no extra code). "
+              "New lower panel (50/50 split under the price overlay): pairwise diff lines for all "
+              "3 pairs (MES−MYM, MES−M2K, MYM−M2K, in tick units), each with a checkbox to toggle "
+              "(all on by default) plus a dotted ±2σ band computed once over the whole day's diff "
+              "values per pair (a flat 'what's normal today' reference, not a rolling band). "
+              "The two panels are separate Plotly figures (not subplots) with their zoom ranges "
+              "kept in sync — dragging to zoom either one mirrors the same x-range to the other, "
+              "and (with Auto on) triggers the existing bar-resolution auto-refine on both."),
     ("v4.14", "All/Overlay: 30s interval, hourglass while loading, auto bar-resolution on zoom",
               "All tab's overlay mode had no busy indicator at all — loading could take a while "
               "with no feedback, which is why it looked 'empty' rather than 'still loading'. "
