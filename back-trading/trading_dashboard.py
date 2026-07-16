@@ -28,6 +28,7 @@ import requests
 from flask import Flask, jsonify, request, render_template_string
 
 from lib.db import get_db
+from lib.price_profile import ensure_profile as _ensure_price_profile, get_price_profile
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
@@ -135,7 +136,7 @@ def _resolve_db() -> Path:
 
 
 def _ensure_columns(db_path: Path) -> None:
-    """Add source / algo_type / note to critical_lines if absent (idempotent)."""
+    """Add source / algo_type / note / confidence to critical_lines if absent (idempotent)."""
     with get_db(db_path) as con:
         existing = {r[1] for r in con.execute("PRAGMA table_info(critical_lines)").fetchall()}
         if "source" not in existing:
@@ -144,6 +145,8 @@ def _ensure_columns(db_path: Path) -> None:
             con.execute("ALTER TABLE critical_lines ADD COLUMN algo_type TEXT DEFAULT 'MANUAL'")
         if "note" not in existing:
             con.execute("ALTER TABLE critical_lines ADD COLUMN note TEXT")
+        if "confidence" not in existing:
+            con.execute("ALTER TABLE critical_lines ADD COLUMN confidence TEXT DEFAULT ''")
 
 
 # ── History helpers ────────────────────────────────────────────────────────────
@@ -458,6 +461,14 @@ def api_lines_create():
             results[sym] = {"lines": 0, "from_date": None, "error": "no history CSV found"}
             continue
 
+        # Build price profile in background — fast if cached, ~5s on first build
+        threading.Thread(
+            target=_ensure_price_profile,
+            args=(sym, used_date.isoformat()),
+            daemon=True,
+            name=f"profile-{sym}-{used_date}",
+        ).start()
+
         if used_date != hist_start:
             mock_date = used_date.isoformat()
 
@@ -606,6 +617,62 @@ def api_lines_patch(line_id: int):
 def api_lines_delete(line_id: int):
     with get_db(_resolve_db()) as con:
         con.execute("DELETE FROM critical_lines WHERE id=?", (line_id,))
+    return jsonify({"ok": True})
+
+
+# ── Sandbox manual lines (source='D') ──────────────────────────────────────────
+
+@app.route("/api/sandbox/lines/<symbol>/<date_str>")
+def api_sandbox_lines_get(symbol: str, date_str: str):
+    db_path = _resolve_db()
+    _ensure_columns(db_path)
+    with get_db(db_path) as con:
+        rows = con.execute(
+            "SELECT id, price, line_type, COALESCE(confidence,'') AS confidence"
+            " FROM critical_lines"
+            " WHERE symbol=? AND date=? AND source='D'"
+            " ORDER BY price",
+            (symbol.upper(), date_str)
+        ).fetchall()
+    return jsonify({"lines": [dict(r) for r in rows]})
+
+
+@app.route("/api/sandbox/line", methods=["POST"])
+def api_sandbox_line_create():
+    body     = request.get_json(force=True) or {}
+    symbol   = body.get("symbol", "MES").upper()
+    date_str = body.get("date", date.today().isoformat())
+    price    = float(body.get("price", 0))
+    ltype    = body.get("line_type", "SUPPORT").upper()
+    conf     = body.get("confidence", "")
+    strength = {"!": 1, "": 2, "?": 3}.get(conf, 2)
+    db_path  = _resolve_db()
+    _ensure_columns(db_path)
+    with get_db(db_path) as con:
+        cur = con.execute(
+            "INSERT INTO critical_lines"
+            " (symbol, date, line_type, price, strength, armed, source, algo_type, confidence)"
+            " VALUES (?,?,?,?,?,1,'D','MANUAL',?)",
+            (symbol, date_str, ltype, price, strength, conf)
+        )
+    return jsonify({"id": cur.lastrowid, "ok": True})
+
+
+@app.route("/api/sandbox/line/<int:line_id>", methods=["PATCH"])
+def api_sandbox_line_patch(line_id: int):
+    body   = request.get_json(force=True) or {}
+    ltype  = body.get("line_type", "").upper() or None
+    conf   = body.get("confidence")  # may be '' which is falsy but valid
+    db_path = _resolve_db()
+    _ensure_columns(db_path)
+    with get_db(db_path) as con:
+        if ltype:
+            con.execute("UPDATE critical_lines SET line_type=? WHERE id=? AND source='D'",
+                        (ltype, line_id))
+        if conf is not None:
+            strength = {"!": 1, "": 2, "?": 3}.get(conf, 2)
+            con.execute("UPDATE critical_lines SET confidence=?, strength=? WHERE id=? AND source='D'",
+                        (conf, strength, line_id))
     return jsonify({"ok": True})
 
 
@@ -1014,6 +1081,23 @@ def api_available_dates():
     return jsonify({"dates": sorted(available)})
 
 
+@app.route("/api/sandbox/profile/<symbol>/<date_str>")
+def api_sandbox_profile(symbol: str, date_str: str):
+    """Return price-level profile for (symbol, date). Builds if not yet cached."""
+    if symbol not in ALL_SYMBOLS:
+        return jsonify({"error": "unknown symbol"}), 400
+    try:
+        date.fromisoformat(date_str)
+    except ValueError:
+        return jsonify({"error": "invalid date"}), 400
+    db_path = _resolve_db()
+    _ensure_price_profile(symbol, date_str, db_path)
+    rows = get_price_profile(symbol, date_str, db_path)
+    if not rows:
+        return jsonify({"error": "no data", "symbol": symbol, "date": date_str, "rows": []}), 404
+    return jsonify({"symbol": symbol, "date": date_str, "rows": rows})
+
+
 # ── HTML ───────────────────────────────────────────────────────────────────────
 
 HTML = r"""<!doctype html>
@@ -1052,6 +1136,12 @@ body.busy-wait button,body.busy-wait input,body.busy-wait select{opacity:.55;}
 .top-tab{border:none!important;border-radius:0!important;background:transparent!important;color:#8b949e;font-size:.8rem;height:40px;border-bottom:2px solid transparent!important;display:flex;align-items:center;padding:0 12px;white-space:nowrap}
 .top-tab:hover{color:#ccc;background:rgba(255,255,255,.05)!important}
 .top-tab.active{color:#fff!important;border-bottom-color:#0d6efd!important}
+/* Sandbox tab */
+#sb-col-checks label{cursor:pointer;gap:4px;}
+#sb-transpose-btn.active{background:rgba(13,110,253,.25);border-color:#0d6efd;color:#6ea8fe;}
+#sb-popup{display:none;position:fixed;z-index:1050;min-width:215px;background:#1e2530;border:1px solid #30363d;border-radius:6px;padding:8px 10px;box-shadow:0 4px 20px rgba(0,0,0,.7);}
+#sb-popup table td{padding:2px 6px;}
+#sb-chart{cursor:crosshair;}
 </style>
 </head>
 <body>
@@ -1060,7 +1150,9 @@ body.busy-wait button,body.busy-wait input,body.busy-wait select{opacity:.55;}
   <ul class="nav mb-0 flex-shrink-0" id="mainTab" role="tablist" style="height:40px;gap:0;list-style:none;padding:0;margin:0;display:flex">
     <li class="nav-item"><button class="nav-link top-tab active" data-bs-toggle="tab" data-bs-target="#tab-lines">Lines</button></li>
     <li class="nav-item"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-graph" id="btn-graph-tab">Graph</button></li>
+    <li class="nav-item"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-sandbox" id="btn-sandbox-tab">Sandbox</button></li>
     <li class="nav-item"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-all" id="btn-all-tab">All</button></li>
+    <li class="nav-item"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-test" id="btn-test-tab">Test</button></li>
     <li class="nav-item"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-trades">Trades</button></li>
     <li class="nav-item"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-submitted" id="btn-sub-tab">Sub</button></li>
   </ul>
@@ -1081,7 +1173,7 @@ body.busy-wait button,body.busy-wait input,body.busy-wait select{opacity:.55;}
     <span class="price-chip bg-secondary" id="chip-M2K">M2K —</span>
     <span class="text-muted ms-1" style="font-size:.75rem">Trading Dashboard</span>
     <span class="badge bg-info text-dark">:5003</span>
-    <span class="badge bg-secondary">v3.12</span>
+    <span class="badge bg-secondary">v4.09</span>
   </div>
 </div>
 
@@ -1344,6 +1436,82 @@ body.busy-wait button,body.busy-wait input,body.busy-wait select{opacity:.55;}
   </div>
 </div>
 
+<!-- ══════════════════════ SANDBOX ══════════════════════ -->
+<div class="tab-pane fade" id="tab-sandbox">
+  <div class="d-flex align-items-center gap-2 mb-1 flex-wrap">
+    <ul class="nav nav-pills mb-0" id="sb-sym-pills">
+      <li class="nav-item"><button class="nav-link active" onclick="sbSelectSym('MES',this)">MES</button></li>
+      <li class="nav-item"><button class="nav-link" onclick="sbSelectSym('MNQ',this)">MNQ</button></li>
+      <li class="nav-item"><button class="nav-link" onclick="sbSelectSym('MYM',this)">MYM</button></li>
+      <li class="nav-item"><button class="nav-link" onclick="sbSelectSym('M2K',this)">M2K</button></li>
+    </ul>
+    <input type="date" id="sb-date" class="form-control form-control-sm py-0" style="width:130px;font-size:.8rem;height:28px">
+    <button class="btn btn-sm btn-primary" onclick="sbLoad()">Load</button>
+    <button class="btn btn-sm btn-outline-secondary" id="sb-transpose-btn" onclick="sbTranspose()">⟲ Transpose</button>
+    <button class="btn btn-sm btn-outline-secondary" onclick="sbResetZoom()">⊙ Reset</button>
+    <span class="vr"></span>
+    <input type="number" id="sb-add-price" class="form-control form-control-sm" placeholder="Price" step="0.25" style="width:82px;height:26px;font-size:.78rem">
+    <label class="d-flex align-items-center gap-1 text-success mb-0 user-select-none" style="font-size:.75rem;cursor:pointer">
+      <input type="radio" name="sb-add-type" value="SUPPORT" checked> S
+    </label>
+    <label class="d-flex align-items-center gap-1 text-danger mb-0 user-select-none" style="font-size:.75rem;cursor:pointer">
+      <input type="radio" name="sb-add-type" value="RESISTANCE"> R
+    </label>
+    <span class="text-muted" style="font-size:.7rem">|</span>
+    <label class="d-flex align-items-center gap-1 text-muted mb-0 user-select-none" style="font-size:.75rem;cursor:pointer">
+      <input type="radio" name="sb-add-conf" value="" checked> ●
+    </label>
+    <label class="d-flex align-items-center gap-1 text-warning mb-0 user-select-none" style="font-size:.75rem;cursor:pointer">
+      <input type="radio" name="sb-add-conf" value="!"> !
+    </label>
+    <label class="d-flex align-items-center gap-1 text-muted mb-0 user-select-none" style="font-size:.75rem;cursor:pointer">
+      <input type="radio" name="sb-add-conf" value="?"> ?
+    </label>
+    <button class="btn btn-sm btn-outline-secondary" onclick="sbAddManualLine()" style="height:26px;padding:0 8px;font-size:.75rem">+ Line</button>
+    <span id="sb-status" class="text-muted small"></span>
+    <span id="sb-spinner" class="spinner-border spinner-border-sm text-info" style="display:none"></span>
+    <div class="ms-auto d-flex align-items-center gap-3 small text-muted">
+      <span id="sb-has-bidask"></span>
+      <span>Levels: <b id="sb-level-count">—</b></span>
+    </div>
+  </div>
+  <div id="sb-chart" style="width:100%;height:460px;background:#1a1a2e;border-radius:4px;"></div>
+  <div class="d-flex gap-3 mt-1 flex-wrap small" id="sb-col-checks"></div>
+</div>
+
+<!-- Sandbox line popup (shared, outside tab-pane so it survives DOM reflow) -->
+<div id="sb-popup">
+  <div class="d-flex align-items-center justify-content-between mb-1">
+    <b id="sb-popup-price" class="font-monospace text-info" style="font-size:.9rem"></b>
+    <button onclick="sbClosePopup()" style="background:none;border:none;color:#8b949e;cursor:pointer;line-height:1;padding:0 2px;font-size:.95rem">✕</button>
+  </div>
+  <div class="d-flex gap-3 mb-1" style="font-size:.75rem">
+    <label class="d-flex align-items-center gap-1 text-success user-select-none" style="cursor:pointer">
+      <input type="radio" name="sb-popup-type" value="SUPPORT" onchange="sbSetPopupType('SUPPORT')"> Support
+    </label>
+    <label class="d-flex align-items-center gap-1 text-danger user-select-none" style="cursor:pointer">
+      <input type="radio" name="sb-popup-type" value="RESISTANCE" onchange="sbSetPopupType('RESISTANCE')"> Resistance
+    </label>
+  </div>
+  <div class="d-flex gap-3 mb-2" style="font-size:.75rem">
+    <label class="d-flex align-items-center gap-1 text-muted user-select-none" style="cursor:pointer">
+      <input type="radio" name="sb-popup-conf" value="" onchange="sbSetPopupConf('')"> Normal
+    </label>
+    <label class="d-flex align-items-center gap-1 text-warning user-select-none" style="cursor:pointer">
+      <input type="radio" name="sb-popup-conf" value="!" onchange="sbSetPopupConf('!')"> !
+    </label>
+    <label class="d-flex align-items-center gap-1 text-muted user-select-none" style="cursor:pointer">
+      <input type="radio" name="sb-popup-conf" value="?" onchange="sbSetPopupConf('?')"> ?
+    </label>
+  </div>
+  <div id="sb-popup-body"></div>
+  <div class="d-flex gap-1 mt-2">
+    <button class="btn btn-sm btn-outline-secondary px-2" onclick="sbMovePopupLine(1)" title="Up 1 tick">▲</button>
+    <button class="btn btn-sm btn-outline-secondary px-2" onclick="sbMovePopupLine(-1)" title="Down 1 tick">▼</button>
+    <button class="btn btn-sm btn-outline-danger ms-auto" onclick="sbDeletePopupLine()">Delete</button>
+  </div>
+</div>
+
 <!-- ══════════════════════ ALL SYMBOLS ══════════════════════ -->
 <div class="tab-pane fade" id="tab-all">
   <div class="d-flex align-items-center gap-2 mb-2 flex-wrap">
@@ -1357,8 +1525,11 @@ body.busy-wait button,body.busy-wait input,body.busy-wait select{opacity:.55;}
     <button class="btn btn-sm btn-outline-secondary px-2" onclick="navAllDay(-1)">&#9664;D</button>
     <span id="all-day-info" class="small text-muted px-1" style="min-width:100px;text-align:center">&#8212;</span>
     <button class="btn btn-sm btn-outline-secondary px-2" onclick="navAllDay(1)">D&#9654;</button>
+    <span class="vr"></span>
+    <button class="btn btn-sm btn-outline-info" id="all-overlay-btn" onclick="toggleAllOverlay()">&#8853; Overlay</button>
   </div>
-  <div class="row g-2">
+  <div id="chart-all-overlay" style="display:none;height:590px;background:#1a1a2e;border-radius:4px"></div>
+  <div id="all-grid" class="row g-2">
     <div class="col-6">
       <div class="text-center small text-muted mb-1">MES</div>
       <div id="chart-all-MES" style="height:290px;background:#1a1a2e;border-radius:4px"></div>
@@ -1417,6 +1588,25 @@ body.busy-wait button,body.busy-wait input,body.busy-wait select{opacity:.55;}
     </thead>
     <tbody id="trades-tbody"></tbody>
   </table>
+</div>
+
+<!-- ══════════════════════ TEST ══════════════════════ -->
+<div class="tab-pane fade" id="tab-test">
+  <div class="d-flex align-items-center flex-wrap gap-2 mb-2">
+    <span class="fw-bold text-info">MES · 5-Day · 15m</span>
+    <span class="text-muted small">dbl-click line to hide · dbl-click chart to add</span>
+    <button class="btn btn-sm btn-outline-success ms-auto" onclick="testShowAll()">Show All</button>
+    <button class="btn btn-sm btn-outline-secondary" onclick="testResetZoom()">&#8857; Reset</button>
+  </div>
+  <div id="test-chart" style="width:100%;height:520px;background:#1a1a2e;border-radius:4px;"></div>
+  <div class="d-flex gap-3 mt-2 flex-wrap" style="font-size:.75rem">
+    <span style="color:#32ba64">&#9135; Support</span>
+    <span style="color:#00ff99">&#9135; Strong (!)</span>
+    <span style="color:rgba(50,186,100,0.65)">&#9135;&#9135; Uncertain (?)</span>
+    <span style="color:rgba(255,165,0,0.8)">&#9135;&#9135; Day low</span>
+    <span style="color:#aaa">&#9135;&#9135; Day sep.</span>
+    <span style="color:#fff">&#9135; Manual</span>
+  </div>
 </div>
 
 <!-- ══════════════════════ SUBMITTED ══════════════════════ -->
@@ -2052,13 +2242,22 @@ document.getElementById('btn-graph-tab').addEventListener('click',function(){
 });
 
 // ── ALL SYMBOLS ───────────────────────────────────────────────────────────────
-let _allInterval=5;
+let _allInterval=5, _allOverlay=false;
 
 function setAllInterval(v,btn){
   _allInterval=v;
   document.querySelectorAll('#tab-all .btn-group-sm .btn').forEach(b=>b.classList.remove('active'));
   if(btn)btn.classList.add('active');
   loadAllSymbols();
+}
+
+function toggleAllOverlay(){
+  _allOverlay=!_allOverlay;
+  document.getElementById('all-overlay-btn').classList.toggle('active',_allOverlay);
+  document.getElementById('chart-all-overlay').style.display=_allOverlay?'block':'none';
+  document.getElementById('all-grid').style.display=_allOverlay?'none':'flex';
+  // Wait one frame so browser reflows the newly-visible div before Plotly queries its dimensions
+  requestAnimationFrame(()=>loadAllSymbols());
 }
 
 async function navAllDay(delta){
@@ -2079,7 +2278,43 @@ async function loadAllSymbols(){
   if(!reqDate)return;
   document.getElementById('all-day-info').textContent=
     `${_graphDateIdx+1}/${_graphDates.length}  ${reqDate}`;
-  await Promise.all(['MES','MNQ','MYM','M2K'].map(sym=>_loadOneSymAll(sym,reqDate)));
+  if(_allOverlay) await _loadOverlayAll(reqDate);
+  else await Promise.all(['MES','MNQ','MYM','M2K'].map(sym=>_loadOneSymAll(sym,reqDate)));
+}
+
+async function _loadOverlayAll(reqDate){
+  const el=document.getElementById('chart-all-overlay');
+  const SYM_COLORS={MES:'#5B8DD9',MNQ:'#E8A838',MYM:'#32BA64',M2K:'#D25050'};
+  const SYMS=['MES','MNQ','MYM','M2K'];
+  let data;
+  try{
+    data=await Promise.all(SYMS.map(s=>
+      fetch(`/api/history/${s}?interval=${_allInterval}&date=${reqDate}`).then(r=>r.json())
+    ));
+  }catch(e){el.innerHTML=`<div class="text-danger small p-2">${e}</div>`;return;}
+  const traces=[];
+  for(let i=0;i<SYMS.length;i++){
+    const sym=SYMS[i],bars=data[i].bars||[];
+    if(!bars.length)continue;
+    const base=bars[0].close??bars[0].open;
+    const tick=SB_TICKS[sym]||0.25;
+    traces.push({
+      name:sym,type:'scatter',mode:'lines',
+      x:bars.map(b=>b.t),
+      y:bars.map(b=>Math.round((b.close-base)/tick)),
+      line:{color:SYM_COLORS[sym],width:1.5},
+      hovertemplate:`<b>${sym}</b><br>%{x}<br>%{y} ticks<extra></extra>`,
+    });
+  }
+  if(!traces.length){el.innerHTML='<div class="d-flex align-items-center justify-content-center h-100 text-muted small">No data</div>';return;}
+  Plotly.newPlot(el,traces,{
+    paper_bgcolor:'#1a1a2e',plot_bgcolor:'#1a1a2e',
+    font:{color:'#ccc',size:10},margin:{t:8,b:30,l:50,r:8},
+    xaxis:{gridcolor:'#252535',zeroline:false,rangeslider:{visible:false}},
+    yaxis:{gridcolor:'#252535',zeroline:true,zerolinecolor:'#555',title:'Ticks from open'},
+    showlegend:true,legend:{x:0,y:1,bgcolor:'rgba(0,0,0,0)',font:{size:11}},
+    dragmode:'zoom',
+  },{responsive:true,displayModeBar:false,scrollZoom:true});
 }
 
 async function _loadOneSymAll(sym,reqDate){
@@ -2176,12 +2411,13 @@ function _attachDblClick(){
   if(el._dblHandler)el.removeEventListener('click',el._dblHandler,true);
   let _dblT=0,_dblY=0;
   el._dblHandler=function(e){
-    if(_drawMode!=='draw')return;
     const now=Date.now();
     if(now-_dblT<400&&Math.abs(e.offsetY-_dblY)<12){
       // second click = double-click: add/remove line
       e.stopPropagation();e.preventDefault();
       _dblT=0;
+      // auto-enter draw mode if needed
+      if(_drawMode!=='draw')_applyDrawMode('draw',document.getElementById('btn-drawmode-draw'));
       const price=_pixelToPrice(e.offsetY);
       if(price===null)return;
       const tol=_pxTolerance();
@@ -2426,6 +2662,558 @@ function toggleAutoRef(){
 
 document.getElementById('btn-sub-tab').addEventListener('click',loadSubmitted);
 
+// ── Sandbox ───────────────────────────────────────────────────────────────────
+// Line shape helpers — Support=green, Resistance=red; !=solid bright, blank=solid, ?=dashed dim
+function _sbLineColor(type, conf){
+  if(type==='SUPPORT'){
+    return conf==='?' ? 'rgba(50,186,100,.45)' : '#32ba64';
+  }
+  return conf==='?' ? 'rgba(210,80,80,.45)' : '#d25050';
+}
+function _sbLineDash(conf){ return conf==='?' ? 'dash' : 'solid'; }
+function _sbLineWidth(conf){ return conf==='!' ? 3 : 2; }
+
+const SB_COLS=[
+  {key:'total_volume', label:'Volume',   color:'rgba(91,141,217,.65)',  on:true,  group:'blue'},
+  {key:'visits',       label:'Visits',   color:'rgba(160,191,224,.55)', on:false, group:'blue'},
+  {key:'price_change', label:'Change #', color:'rgba(130,130,130,.55)', on:false, group:'blue'},
+  {key:'change_vol',   label:'Chg Vol',  color:'rgba(170,170,170,.50)', on:false, group:'blue'},
+  {key:'delta',        label:'Delta',    color:'rgba(60,205,200,.70)',  on:true,  group:'blue'},
+  {key:'total_ask',    label:'Ask Liq',  color:'rgba(210,140,60,.65)',  on:false, group:'blue'},
+  {key:'total_bid',    label:'Bid Liq',  color:'rgba(150,100,210,.65)', on:false, group:'blue'},
+  {key:'price_up',     label:'Up #',     color:'rgba(50,186,100,.70)',  on:true,  group:'green'},
+  {key:'up_vol',       label:'Up Vol',   color:'rgba(100,220,140,.65)', on:true,  group:'green'},
+  {key:'price_down',   label:'Down #',   color:'rgba(210,80,80,.70)',   on:true,  group:'red'},
+  {key:'down_vol',     label:'Dn Vol',   color:'rgba(220,110,110,.65)', on:true,  group:'red'},
+];
+
+const SB_TICKS={MES:0.25,MNQ:0.25,MYM:1.0,M2K:0.10};
+
+let _sbSym='MES', _sbRows=[], _sbTransposed=false, _sbChecksBuilt=false;
+let _sbPriceRange=null; // [min, max] of current data prices
+let _sbLines=[];  // [{id, price, type:'SUPPORT'|'RESISTANCE', confidence:'|'?'|'!'}]
+let _sbPopupPrice=null;
+let _sbLastClick={t:0,price:null};
+
+function sbSelectSym(sym,btn){
+  _sbSym=sym;
+  document.querySelectorAll('#sb-sym-pills .nav-link').forEach(b=>b.classList.remove('active'));
+  btn.classList.add('active');
+}
+
+function _sbNorm(values,isDelta){
+  const absMax=isDelta
+    ?Math.max(...values.map(v=>Math.abs(v??0)))
+    :Math.max(...values.map(v=>v??0));
+  if(absMax===0)return values.map(()=>0);
+  return values.map(v=>(v??0)/absMax);
+}
+
+async function sbLoad(){
+  const dt=document.getElementById('sb-date').value;
+  if(!dt){document.getElementById('sb-status').textContent='Pick a date';return;}
+  document.getElementById('sb-spinner').style.display='inline-block';
+  document.getElementById('sb-status').textContent='Building profile…';
+  try{
+    const [pr, lr]=await Promise.all([
+      fetch(`/api/sandbox/profile/${_sbSym}/${dt}`),
+      fetch(`/api/sandbox/lines/${_sbSym}/${dt}`),
+    ]);
+    const [pj, lj]=await Promise.all([pr.json(), lr.json()]);
+    if(!pr.ok){document.getElementById('sb-status').textContent=pj.error||'no data';return;}
+    _sbRows=pj.rows;
+    _sbLines=(lj.lines||[]).map(l=>({id:l.id, price:l.price, type:l.line_type, confidence:l.confidence||''}));
+    sbPlot();
+    const hasBa=_sbRows.some(r=>r.total_ask!==null||r.total_bid!==null);
+    document.getElementById('sb-has-bidask').innerHTML=hasBa
+      ?'<span class="badge bg-success">Bid/Ask ✓</span>'
+      :'<span class="badge bg-secondary">No Bid/Ask</span>';
+    document.getElementById('sb-level-count').textContent=_sbRows.length;
+    document.getElementById('sb-status').textContent='';
+  }catch(e){document.getElementById('sb-status').textContent='Error: '+e;}
+  finally{document.getElementById('sb-spinner').style.display='none';}
+}
+
+function sbTranspose(){
+  _sbTransposed=!_sbTransposed;
+  document.getElementById('sb-transpose-btn').classList.toggle('active',_sbTransposed);
+  if(_sbRows.length)sbPlot();
+}
+
+function sbResetZoom(){
+  if(!_sbPriceRange)return;
+  try{
+    if(_sbTransposed){
+      Plotly.relayout('sb-chart',{'yaxis.range':_sbPriceRange,'xaxis.range':[0,1.05]});
+    }else{
+      Plotly.relayout('sb-chart',{'xaxis.range':_sbPriceRange,'yaxis.range':[0,1.05]});
+    }
+  }catch(_){}
+}
+
+function _sbShapes(){
+  return _sbLines.map(l=>{
+    const col=_sbLineColor(l.type,l.confidence);
+    const ln={color:col,width:_sbLineWidth(l.confidence),dash:_sbLineDash(l.confidence)};
+    return _sbTransposed
+      ?{type:'line',y0:l.price,y1:l.price,x0:0,x1:1,xref:'paper',yref:'y',line:ln}
+      :{type:'line',x0:l.price,x1:l.price,y0:0,y1:1,xref:'x',yref:'paper',line:ln};
+  });
+}
+
+function sbPlot(){
+  if(!_sbRows.length)return;
+  const prices=_sbRows.map(r=>r.price);
+  const tick=SB_TICKS[_sbSym]||0.25;
+  const pmin=Math.min(...prices)-tick, pmax=Math.max(...prices)+tick;
+  _sbPriceRange=[pmin,pmax];
+  const bg='#1a1a2e',grid='#252535';
+  const axC={gridcolor:grid,zeroline:false,tickfont:{size:9}};
+  const traces=[];
+  for(const col of SB_COLS){
+    const chk=document.getElementById('sbchk-'+col.key);
+    if(chk&&!chk.checked)continue;
+    const norm=_sbNorm(_sbRows.map(r=>r[col.key]),col.key==='delta');
+    const ht=`<b>${col.label}</b><br>Price: %{${_sbTransposed?'y':'x'}}<br>Norm: %{${_sbTransposed?'x':'y'}:.3f}<extra></extra>`;
+    const tr={name:col.label,type:'bar',marker:{color:col.color},opacity:1,hovertemplate:ht};
+    if(_sbTransposed){tr.y=prices;tr.x=norm;tr.orientation='h';}
+    else             {tr.x=prices;tr.y=norm;tr.orientation='v';}
+    traces.push(tr);
+  }
+  const layout={
+    paper_bgcolor:bg,plot_bgcolor:bg,font:{color:'#ccc',size:10},
+    margin:_sbTransposed?{t:8,b:40,l:60,r:6}:{t:8,b:30,l:44,r:6},
+    barmode:'overlay',showlegend:false,bargap:0,
+    xaxis:{...axC,
+      title:_sbTransposed?'Normalized (0-1)':'Price',
+      ..._sbTransposed?{range:[0,1.05],fixedrange:true}:{range:_sbPriceRange}},
+    yaxis:{...axC,
+      title:_sbTransposed?'Price':'Normalized (0-1)',
+      ..._sbTransposed?{range:_sbPriceRange}:{range:[0,1.05],fixedrange:true}},
+    shapes:_sbShapes(),
+  };
+  Plotly.newPlot('sb-chart',traces,layout,{responsive:true,displayModeBar:false,doubleClick:false,scrollZoom:true})
+    .then(()=>{
+      const el=document.getElementById('sb-chart');
+      if(el._sbClickH){el.removeEventListener('click',el._sbClickH);}
+      el._sbClickH=_sbNativeClick;
+      el.addEventListener('click',el._sbClickH);
+    });
+}
+
+// Convert mouse clientX/Y to price coordinate using Plotly internals
+function _sbPxToPrice(e){
+  const gd=document.getElementById('sb-chart');
+  if(!gd._fullLayout)return null;
+  const rect=gd.getBoundingClientRect();
+  if(_sbTransposed){
+    const ya=gd._fullLayout.yaxis;
+    if(!ya||!ya.range||!ya._length)return null;
+    const py=(e.clientY-rect.top)-ya._offset;
+    const frac=py/ya._length;
+    return ya.range[1]-frac*(ya.range[1]-ya.range[0]);
+  }else{
+    const xa=gd._fullLayout.xaxis;
+    if(!xa||!xa.range||!xa._length)return null;
+    const px=(e.clientX-rect.left)-xa._offset;
+    const frac=px/xa._length;
+    return xa.range[0]+frac*(xa.range[1]-xa.range[0]);
+  }
+}
+
+function _sbNativeClick(e){
+  if(e.target.closest('#sb-popup'))return;
+  const raw=_sbPxToPrice(e);
+  if(raw===null)return;
+  const tick=SB_TICKS[_sbSym]||0.25;
+  const hitLine=_sbLines.find(l=>Math.abs(l.price-raw)<=tick*2);
+  const now=Date.now();
+  if(now-_sbLastClick.t<350&&Math.abs((_sbLastClick.raw??raw)-raw)<=tick*3){
+    _sbLastClick={t:0,raw:null};
+    _sbToggleLine(_sbSnapPrice(raw));
+  }else{
+    _sbLastClick={t:now,raw};
+    if(hitLine)sbShowPopup(hitLine.price,e.clientX,e.clientY);
+  }
+}
+
+function _sbSnapPrice(raw){
+  if(!_sbRows.length)return raw;
+  return _sbRows.reduce((b,r)=>Math.abs(r.price-raw)<Math.abs(b-raw)?r.price:b,_sbRows[0].price);
+}
+
+async function _sbToggleLine(price){
+  const idx=_sbLines.findIndex(l=>Math.abs(l.price-price)<0.001);
+  if(idx>=0){
+    const lineId=_sbLines[idx].id;
+    if(lineId)await fetch(`/api/lines/${lineId}`,{method:'DELETE'});
+    _sbLines.splice(idx,1);
+    sbClosePopup();
+  }else{
+    const ltype=document.querySelector('input[name="sb-add-type"]:checked')?.value||'SUPPORT';
+    const conf=document.querySelector('input[name="sb-add-conf"]:checked')?.value||'';
+    const dt=document.getElementById('sb-date').value;
+    const res=await fetch('/api/sandbox/line',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({symbol:_sbSym,date:dt,price,line_type:ltype,confidence:conf})});
+    const j=await res.json();
+    _sbLines.push({id:j.id,price,type:ltype,confidence:conf});
+  }
+  Plotly.relayout('sb-chart',{shapes:_sbShapes()});
+}
+
+async function sbAddManualLine(){
+  const priceEl=document.getElementById('sb-add-price');
+  const price=parseFloat(priceEl.value);
+  if(isNaN(price)||price<=0)return;
+  if(_sbLines.find(l=>Math.abs(l.price-price)<0.001))return;
+  const ltype=document.querySelector('input[name="sb-add-type"]:checked')?.value||'SUPPORT';
+  const conf=document.querySelector('input[name="sb-add-conf"]:checked')?.value||'';
+  const dt=document.getElementById('sb-date').value;
+  if(!dt)return;
+  const res=await fetch('/api/sandbox/line',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({symbol:_sbSym,date:dt,price,line_type:ltype,confidence:conf})});
+  const j=await res.json();
+  _sbLines.push({id:j.id,price,type:ltype,confidence:conf});
+  Plotly.relayout('sb-chart',{shapes:_sbShapes()});
+  priceEl.value='';
+}
+
+function sbShowPopup(price,cx,cy){
+  _sbPopupPrice=price;
+  const line=_sbLines.find(l=>Math.abs(l.price-price)<0.001);
+  const row=_sbRows.find(r=>Math.abs(r.price-price)<0.001);
+  const fmt=(v,d=0)=>v===null||v===undefined?'—':Number(v).toFixed(d);
+  document.getElementById('sb-popup-price').textContent=price.toFixed(2);
+  // Set type radio
+  if(line){
+    const tr=document.querySelector(`input[name="sb-popup-type"][value="${line.type}"]`);
+    if(tr)tr.checked=true;
+    const cr=document.querySelector(`input[name="sb-popup-conf"][value="${line.confidence}"]`);
+    if(cr)cr.checked=true;
+  }
+  document.getElementById('sb-popup-body').innerHTML=row?`
+    <table class="table table-dark table-sm table-borderless mb-0" style="font-size:.75rem">
+      <tr><td class="text-muted pe-3">Volume</td><td>${fmt(row.total_volume,0)}</td></tr>
+      <tr><td class="text-muted">Visits</td><td>${fmt(row.visits,0)}</td></tr>
+      <tr><td class="text-muted">Up #</td><td class="text-success">${fmt(row.price_up,0)}</td></tr>
+      <tr><td class="text-muted">Dn #</td><td class="text-danger">${fmt(row.price_down,0)}</td></tr>
+      <tr><td class="text-muted">Up Vol</td><td class="text-success">${fmt(row.up_vol,0)}</td></tr>
+      <tr><td class="text-muted">Dn Vol</td><td class="text-danger">${fmt(row.down_vol,0)}</td></tr>
+      <tr><td class="text-muted">Change #</td><td>${fmt(row.price_change,0)}</td></tr>
+      <tr><td class="text-muted">Delta</td><td>${fmt(row.delta,0)}</td></tr>
+      <tr><td class="text-muted">Ask Liq</td><td>${fmt(row.total_ask,0)}</td></tr>
+      <tr><td class="text-muted">Bid Liq</td><td>${fmt(row.total_bid,0)}</td></tr>
+    </table>`
+    :'<span class="text-muted small">No profile data at this price</span>';
+  const pop=document.getElementById('sb-popup');
+  pop.style.display='block';
+  const pw=pop.offsetWidth||240,ph=pop.offsetHeight||320;
+  let left=cx+14,top=cy-20;
+  if(left+pw>window.innerWidth-10)left=cx-pw-14;
+  if(top+ph>window.innerHeight-10)top=window.innerHeight-ph-10;
+  if(top<10)top=10;
+  pop.style.left=left+'px';pop.style.top=top+'px';
+}
+
+async function sbSetPopupType(ltype){
+  if(_sbPopupPrice===null)return;
+  const idx=_sbLines.findIndex(l=>Math.abs(l.price-_sbPopupPrice)<0.001);
+  if(idx<0)return;
+  _sbLines[idx].type=ltype;
+  const lineId=_sbLines[idx].id;
+  if(lineId)await fetch(`/api/sandbox/line/${lineId}`,{method:'PATCH',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({line_type:ltype})});
+  Plotly.relayout('sb-chart',{shapes:_sbShapes()});
+}
+
+async function sbSetPopupConf(conf){
+  if(_sbPopupPrice===null)return;
+  const idx=_sbLines.findIndex(l=>Math.abs(l.price-_sbPopupPrice)<0.001);
+  if(idx<0)return;
+  _sbLines[idx].confidence=conf;
+  const lineId=_sbLines[idx].id;
+  if(lineId)await fetch(`/api/sandbox/line/${lineId}`,{method:'PATCH',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({confidence:conf})});
+  Plotly.relayout('sb-chart',{shapes:_sbShapes()});
+}
+
+async function sbMovePopupLine(dir){
+  if(_sbPopupPrice===null)return;
+  const tick=SB_TICKS[_sbSym]||0.25;
+  const np=Math.round((_sbPopupPrice+dir*tick)*10000)/10000;
+  const idx=_sbLines.findIndex(l=>Math.abs(l.price-_sbPopupPrice)<0.001);
+  if(idx<0)return;
+  const lineId=_sbLines[idx].id;
+  _sbLines[idx].price=np;
+  _sbPopupPrice=np;
+  // Re-insert at new price (delete + create, since price is part of the key)
+  if(lineId){
+    const line=_sbLines[idx];
+    await fetch(`/api/lines/${lineId}`,{method:'DELETE'});
+    const res=await fetch('/api/sandbox/line',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({symbol:_sbSym,date:document.getElementById('sb-date').value,
+        price:np,line_type:line.type,confidence:line.confidence})});
+    const j=await res.json();
+    _sbLines[idx].id=j.id;
+  }
+  Plotly.relayout('sb-chart',{shapes:_sbShapes()});
+  const pop=document.getElementById('sb-popup');
+  document.getElementById('sb-popup-price').textContent=np.toFixed(2);
+  sbShowPopup(np,parseFloat(pop.style.left),parseFloat(pop.style.top));
+}
+
+async function sbDeletePopupLine(){
+  if(_sbPopupPrice===null)return;
+  const idx=_sbLines.findIndex(l=>Math.abs(l.price-_sbPopupPrice)<0.001);
+  if(idx>=0){
+    const lineId=_sbLines[idx].id;
+    if(lineId)await fetch(`/api/lines/${lineId}`,{method:'DELETE'});
+    _sbLines.splice(idx,1);
+  }
+  Plotly.relayout('sb-chart',{shapes:_sbShapes()});
+  sbClosePopup();
+}
+
+function sbClosePopup(){
+  _sbPopupPrice=null;
+  document.getElementById('sb-popup').style.display='none';
+}
+
+document.addEventListener('click',function(e){
+  const pop=document.getElementById('sb-popup');
+  if(pop.style.display!=='none'&&!pop.contains(e.target)&&!e.target.closest('#sb-chart'))
+    sbClosePopup();
+});
+
+function sbToggleGroup(grp){
+  const cols=SB_COLS.filter(c=>c.group===grp);
+  const allOn=cols.every(c=>{const el=document.getElementById('sbchk-'+c.key);return el&&el.checked;});
+  cols.forEach(c=>{const el=document.getElementById('sbchk-'+c.key);if(el)el.checked=!allOn;});
+  if(_sbRows.length)sbPlot();
+}
+
+function sbBuildCheckboxes(){
+  if(_sbChecksBuilt)return;
+  _sbChecksBuilt=true;
+  const wrap=document.getElementById('sb-col-checks');
+
+  // Group toggle buttons
+  const grpWrap=document.createElement('div');
+  grpWrap.className='d-flex gap-1 me-2';
+  [['Greens','green','#32ba64'],['Reds','red','#d25050'],['Blues','blue','#5b8dd9']].forEach(([lbl,grp,col])=>{
+    const b=document.createElement('button');
+    b.className='btn btn-sm btn-outline-secondary';
+    b.style.cssText=`font-size:.7rem;padding:1px 8px;height:22px;border-color:${col};color:${col};`;
+    b.textContent=lbl;
+    b.onclick=()=>sbToggleGroup(grp);
+    grpWrap.appendChild(b);
+  });
+  wrap.appendChild(grpWrap);
+
+  // Individual checkboxes
+  for(const col of SB_COLS){
+    const lbl=document.createElement('label');
+    lbl.className='d-flex align-items-center gap-1 user-select-none';
+    lbl.style.cursor='pointer';
+    const chk=document.createElement('input');
+    chk.type='checkbox';chk.id='sbchk-'+col.key;chk.checked=col.on;
+    chk.onchange=()=>{if(_sbRows.length)sbPlot();};
+    const dot=document.createElement('span');
+    dot.style.cssText=`display:inline-block;width:10px;height:10px;border-radius:2px;background:${col.color};flex-shrink:0`;
+    const txt=document.createElement('span');
+    txt.textContent=col.label;
+    lbl.append(chk,dot,txt);
+    wrap.appendChild(lbl);
+  }
+
+  // Clear All
+  const btn=document.createElement('button');
+  btn.className='btn btn-sm btn-outline-secondary ms-1';
+  btn.style.cssText='font-size:.7rem;padding:1px 7px;height:22px;';
+  btn.textContent='Clear All';
+  btn.onclick=()=>{
+    SB_COLS.forEach(c=>{const el=document.getElementById('sbchk-'+c.key);if(el)el.checked=false;});
+    if(_sbRows.length)sbPlot();
+  };
+  wrap.appendChild(btn);
+}
+
+document.getElementById('btn-sandbox-tab').addEventListener('click',function(){
+  if(!document.getElementById('sb-date').value)
+    document.getElementById('sb-date').value=_lastWeekday();
+  sbBuildCheckboxes();
+});
+
+// ── TEST TAB ──────────────────────────────────────────────────────────────────
+const TEST_SYM='MES', TEST_TICK=0.25;
+const TEST_SUPPORT=[
+  {price:7568.25,conf:'?'},{price:7529.50,conf:'?'},{price:7507.75,conf:'?'},
+  {price:7469.00,conf:''},{price:7398.50,conf:''},{price:7360.25,conf:'!'},
+  {price:7304.75,conf:''},{price:7266.50,conf:''},
+];
+let _testAllBars=[],_testDates=[],_testDayLows={};
+let _testHidden=new Set(),_testManual=[];
+
+function _testSLineColor(conf){
+  if(conf==='!')return '#00ff99';
+  if(conf==='?')return 'rgba(50,186,100,0.42)';
+  return '#32ba64';
+}
+function _testSLineWidth(conf){return conf==='!'?2.5:conf==='?'?1:1.5;}
+function _testSLineDash(conf){return conf==='?'?'dash':'solid';}
+
+async function loadTest(){
+  const el=document.getElementById('test-chart');
+  el.innerHTML='<div class="d-flex align-items-center justify-content-center h-100 text-muted">Loading 5 days…</div>';
+  // Walk back up to 14 calendar days; collect 5 real trading days (skip holidays/mock)
+  const candidates=[];
+  let d=new Date('2026-07-10T12:00:00Z');
+  for(let i=0;i<14;i++){
+    const dow=d.getUTCDay();
+    if(dow>0&&dow<6)candidates.unshift(d.toISOString().slice(0,10));
+    d=new Date(d.getTime()-86400000);
+  }
+  _testAllBars=[];_testDates=[];_testDayLows={};
+  for(const dt of candidates){
+    if(_testDates.length>=5)break;
+    try{
+      const j=await (await fetch(`/api/history/${TEST_SYM}?interval=15&date=${dt}`)).json();
+      if(j.mock_date)continue;          // holiday — API served a different day's data
+      const bars=j.bars||[];
+      if(!bars.length)continue;
+      _testDates.push(dt);
+      let dayLow=Infinity;
+      for(const b of bars){_testAllBars.push({...b,date:dt});if(b.low<dayLow)dayLow=b.low;}
+      _testDayLows[dt]=dayLow;
+    }catch(_){}
+  }
+  testPlot();
+}
+
+function testPlot(){
+  if(!_testAllBars.length)return;
+  const n=_testAllBars.length;
+  // Y range: fit to actual candle prices, not support lines
+  const yLow=Math.min(..._testAllBars.map(b=>b.low));
+  const yHigh=Math.max(..._testAllBars.map(b=>b.high));
+  const yPad=(yHigh-yLow)*0.06;
+  // Use formatted strings as category labels — eliminates overnight gaps
+  const labels=_testAllBars.map(b=>{
+    const md=b.t.slice(5,10).replace('-','/');  // "MM/DD"
+    const hm=b.t.slice(11,16);                   // "HH:MM"
+    return `${md} ${hm}`;
+  });
+  const shapes=[],annotations=[];
+  // Day separators (float index puts line between bars)
+  for(let i=1;i<n;i++){
+    if(_testAllBars[i].date!==_testAllBars[i-1].date){
+      shapes.push({type:'line',x0:i-0.5,x1:i-0.5,y0:0,y1:1,xref:'x',yref:'paper',
+        line:{color:'rgba(180,180,255,0.35)',width:1.5,dash:'dot'}});
+    }
+  }
+  // Date labels at first bar of each day
+  for(const dt of _testDates){
+    const fi=_testAllBars.findIndex(b=>b.date===dt);
+    if(fi>=0)annotations.push({x:fi,y:0.99,xref:'x',yref:'paper',text:dt.slice(5),
+      showarrow:false,xanchor:'left',yanchor:'top',font:{size:9,color:'rgba(180,180,255,0.7)'}});
+  }
+  // Support lines (paper x = full width)
+  for(const sl of TEST_SUPPORT){
+    if(_testHidden.has(sl.price))continue;
+    shapes.push({type:'line',x0:0,x1:1,y0:sl.price,y1:sl.price,xref:'paper',yref:'y',
+      line:{color:_testSLineColor(sl.conf),width:_testSLineWidth(sl.conf),dash:_testSLineDash(sl.conf)}});
+    annotations.push({x:1,y:sl.price,xref:'paper',yref:'y',
+      text:(sl.conf||' ')+sl.price.toFixed(2),showarrow:false,
+      xanchor:'right',font:{size:8,color:_testSLineColor(sl.conf)}});
+  }
+  // Daily lows (span only that day's bar indices)
+  for(const dt of _testDates){
+    const low=_testDayLows[dt];
+    if(low==null)continue;
+    const idxs=_testAllBars.map((b,i)=>b.date===dt?i:-1).filter(i=>i>=0);
+    if(!idxs.length)continue;
+    shapes.push({type:'line',x0:idxs[0],x1:idxs[idxs.length-1],y0:low,y1:low,
+      xref:'x',yref:'y',line:{color:'rgba(255,165,0,0.6)',width:1,dash:'dot'}});
+    annotations.push({x:idxs[0],y:low,xref:'x',yref:'y',
+      text:low.toFixed(2),showarrow:false,xanchor:'left',font:{size:7,color:'rgba(255,165,0,0.8)'}});
+  }
+  // Manual lines (paper x = full width)
+  for(const ml of _testManual){
+    shapes.push({type:'line',x0:0,x1:1,y0:ml.price,y1:ml.price,xref:'paper',yref:'y',
+      line:{color:'rgba(255,255,255,0.8)',width:1.5,dash:'solid'}});
+    annotations.push({x:0,y:ml.price,xref:'paper',yref:'y',
+      text:ml.price.toFixed(2),showarrow:false,xanchor:'left',font:{size:8,color:'rgba(255,255,255,0.75)'}});
+  }
+  const bg='#1a1a2e',grid='#252535';
+  const layout={
+    paper_bgcolor:bg,plot_bgcolor:bg,font:{color:'#ccc'},
+    margin:{l:55,r:55,t:8,b:65},dragmode:'zoom',showlegend:false,
+    xaxis:{type:'category',gridcolor:grid,rangeslider:{visible:false},
+      tickangle:-45,tickfont:{size:8},nticks:20},
+    yaxis:{gridcolor:grid,range:[yLow-yPad,yHigh+yPad]},
+    shapes,annotations
+  };
+  const trace={type:'candlestick',
+    x:labels,
+    open:_testAllBars.map(b=>b.open),high:_testAllBars.map(b=>b.high),
+    low:_testAllBars.map(b=>b.low),close:_testAllBars.map(b=>b.close),
+    name:TEST_SYM,showlegend:false,
+    increasing:{line:{color:'#26a69a'}},decreasing:{line:{color:'#ef5350'}}
+  };
+  Plotly.newPlot('test-chart',[trace],layout,
+    {responsive:true,displayModeBar:false,scrollZoom:true,doubleClick:false})
+    .then(()=>_attachTestDblClick());
+}
+
+function testResetZoom(){
+  try{Plotly.relayout('test-chart',{'xaxis.autorange':true,'yaxis.autorange':true});}catch(_){}
+}
+
+function testShowAll(){
+  _testHidden.clear();
+  testPlot();
+}
+
+function _testPxToPrice(e){
+  const gd=document.getElementById('test-chart');
+  if(!gd._fullLayout)return null;
+  const ya=gd._fullLayout.yaxis;
+  if(!ya||!ya.range||!ya._length)return null;
+  const rect=gd.getBoundingClientRect();
+  const py=(e.clientY-rect.top)-ya._offset;
+  return ya.range[1]-py/ya._length*(ya.range[1]-ya.range[0]);
+}
+
+function _attachTestDblClick(){
+  const el=document.getElementById('test-chart');
+  if(el._testDblH)el.removeEventListener('click',el._testDblH,true);
+  let _dt=0,_dy=0;
+  el._testDblH=function(e){
+    const now=Date.now();
+    if(now-_dt<400&&Math.abs(e.clientY-_dy)<14){
+      _dt=0;e.stopPropagation();e.preventDefault();
+      const price=_testPxToPrice(e);
+      if(price===null)return;
+      const tol=TEST_TICK*4;
+      // Near a support line → toggle hide
+      const sl=TEST_SUPPORT.find(s=>!_testHidden.has(s.price)&&Math.abs(s.price-price)<=tol);
+      if(sl){_testHidden.add(sl.price);testPlot();return;}
+      // Near a manual line → remove
+      const mi=_testManual.findIndex(m=>Math.abs(m.price-price)<=tol);
+      if(mi>=0){_testManual.splice(mi,1);testPlot();return;}
+      // Add new manual line (snapped to tick)
+      const snapped=Math.round(price/TEST_TICK)*TEST_TICK;
+      _testManual.push({price:snapped});
+      testPlot();
+    }else{_dt=now;_dy=e.clientY;}
+  };
+  el.addEventListener('click',el._testDblH,true);
+}
+
+document.getElementById('btn-test-tab').addEventListener('click',function(){
+  if(!_testAllBars.length)loadTest();
+});
+
 // ── Init ──────────────────────────────────────────────────────────────────────
 (function(){
   const lw=_lastWeekday();
@@ -2442,6 +3230,82 @@ document.getElementById('btn-sub-tab').addEventListener('click',loadSubmitted);
 </html>"""
 
 
+# ── Release notes ─────────────────────────────────────────────────────────────
+
+_RELEASE_NOTES = [
+    ("v3.0",  "Full dashboard redesign — Lines/Graph/Trades/Submitted tabs", None),
+    ("v3.2",  "Fix day/sym nav, bars x-axis range, reset zoom squeeze", None),
+    ("v3.3",  "All Symbols tab + nav/zoom/bars fixes", None),
+    ("v3.4",  "Add lines to All Symbols tab charts", None),
+    ("v3.5",  "Fix Graph day nav (always use 14-day window)", None),
+    ("v3.6",  "Enable threaded Flask server", None),
+    ("v3.7",  "Gray out weekends/holidays and zero-data days in Lines table", None),
+    ("v3.8",  "Collapse header to single 40px bar", None),
+    ("v3.9",  "Draw mode wired — dblclick add/remove, click to name, Auto gray toggle, Save/Send", None),
+    ("v3.10", "Transpose bars mode — price on Y axis, ticks on X, lines align with other graphs", None),
+    ("v3.11", "Fix Draw mode — remove !important, timed dblclick, robust _pixelToPrice fallback", None),
+    ("v3.12", "Draw mode popup on dblclick — Support/Resistance color buttons, green/red lines", None),
+    ("v4.07", "Test tab: MES 5-day 15m candlestick, support lines, daily lows, dbl-click hide/add",
+              "New Test tab — MES only, 5 working days back from 2026-07-10, 15m candles. "
+              "8 support lines (normal/!/?) with distinct colors. Day separators. Daily low per day. "
+              "Dbl-click support line to hide it; Show All to restore. "
+              "Dbl-click chart to add/remove white manual lines. Zoom + Reset."),
+    ("v4.06", "Graph: double-click adds manual line from Auto mode (auto-enters Draw mode)",
+              "Double-clicking the chart no longer requires switching to Draw mode first. "
+              "A dblclick in Auto mode auto-switches to Draw mode and adds the line."),
+    ("v4.05", "Sandbox: zoom locked to price axis only; Reset Zoom snaps to data price range",
+              "scrollZoom now only zooms the price axis (normalized 0-1 axis is fixedrange). "
+              "Price range computed from data min/max ± 1 tick. "
+              "Reset Zoom restores exactly that range on the price axis."),
+    ("v4.04", "Sandbox: manual lines saved to DB with source='D'; type/confidence stored; GEVA lines inserted",
+              "Sandbox lines (click to add/remove) are persisted in critical_lines with source='D'. "
+              "Each line stores line_type (SUPPORT/RESISTANCE) and confidence ('', '!', '?'). "
+              "Toolbar radios select type+confidence before adding a line. "
+              "Popup shows type+confidence radios to change them (PATCH to DB). "
+              "Move Up/Down re-inserts the line at the new price (delete+create). "
+              "Delete removes from DB. Line color/dash/width varies by type+confidence. "
+              "16 GEVA support/resistance lines inserted for MES 2026-07-10."),
+    ("v4.03", "Sandbox: single chart, bargap=0, native click anywhere, group buttons; All: overlay mode",
+              "Sandbox: reverted to single chart (3-panel removed). bargap:0 = no space between bars. "
+              "Click detection uses native mouse listener + Plotly._fullLayout coordinate conversion so "
+              "double-click/single-click works anywhere in the chart area (not just on bar data). "
+              "Added Greens/Reds/Blues group toggle buttons. Reset Zoom button. "
+              "All tab: Overlay toggle button shows all 4 symbols on one chart as ticks-from-open lines."),
+    ("v4.02", "Sandbox: 3-panel layout (General/Up/Down) + 2px bars + white-line placement + click popup",
+              "Split Sandbox into 3 Plotly subplots (General top 32%, Up mid 30%, Down bot 32%). "
+              "Bar width set to 2px (bargap:0.90). Double-click places/removes 3px white line. "
+              "Single click on line opens floating popup showing all price-level stats. "
+              "Popup has Move Up/Down (by 1 tick) and Delete buttons. Panel column routing via SB_COLS.panel."),
+    ("v4.01", "Sandbox: 1px bar width + Clear All checkbox button", None),
+    ("v4.00", "Sandbox tab — price-level microstructure bar chart",
+              "New Sandbox tab: per-price market profile built from tick + bid/ask CSVs. "
+              "Columns: total_volume, visits, price_up/down/change (count), up_vol/down_vol/change_vol "
+              "(volume-weighted), total_ask, total_bid, delta. "
+              "Normalized overlay bar chart (price on X), Transpose button (price on Y). "
+              "11 toggleable columns with color swatches. DB-controlled rebuild when bidask arrives. "
+              "New lib/price_profile.py module + price_profile DB table."),
+]
+
+
+def _write_release_notes():
+    """Upsert all release notes on startup. Idempotent."""
+    db_path = _resolve_db()
+    from lib.db import init_db
+    init_db(db_path)
+    with get_db(db_path) as con:
+        for version, summary, details in _RELEASE_NOTES:
+            exists = con.execute(
+                "SELECT id FROM release_notes WHERE program='trading_dashboard' AND version=?",
+                (version,)
+            ).fetchone()
+            if not exists:
+                con.execute(
+                    "INSERT INTO release_notes (program, version, summary, details)"
+                    " VALUES (?, ?, ?, ?)",
+                    ("trading_dashboard", version, summary, details)
+                )
+
+
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 def main():
@@ -2453,6 +3317,7 @@ def main():
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as _s:
         if _s.connect_ex(("127.0.0.1", args.port)) == 0:
             print(f"[trading_dashboard] port {args.port} already in use -- exiting"); sys.exit(0)
+    _write_release_notes()
     print(f"Trading Dashboard -> http://{args.host}:{args.port}")
     print(f"LAN access        -> http://192.168.1.132:{args.port}")
     app.run(host=args.host, port=args.port, debug=args.debug, threaded=True)

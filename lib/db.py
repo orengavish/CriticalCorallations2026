@@ -358,6 +358,27 @@ CREATE TABLE IF NOT EXISTS algo_candidates (
     created_at          TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
 );
 CREATE INDEX IF NOT EXISTS idx_algo_cand_sess ON algo_candidates(session_id, queued_status, rank);
+
+CREATE TABLE IF NOT EXISTS price_profile (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol        TEXT    NOT NULL,
+    date          TEXT    NOT NULL,   -- YYYY-MM-DD
+    price         REAL    NOT NULL,
+    total_volume  REAL    NOT NULL DEFAULT 0,
+    visits        INTEGER NOT NULL DEFAULT 0,
+    total_ask     REAL,               -- NULL if bidask file not available
+    total_bid     REAL,               -- NULL if bidask file not available
+    price_up      INTEGER NOT NULL DEFAULT 0,
+    price_down    INTEGER NOT NULL DEFAULT 0,
+    price_change  INTEGER NOT NULL DEFAULT 0,  -- price_up + price_down
+    up_vol        REAL    NOT NULL DEFAULT 0,  -- volume at visits that led to an up move
+    down_vol      REAL    NOT NULL DEFAULT 0,  -- volume at visits that led to a down move
+    change_vol    REAL    NOT NULL DEFAULT 0,  -- up_vol + down_vol
+    delta         REAL,               -- total_ask - total_bid, NULL if no bidask
+    created_at    TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+    UNIQUE(symbol, date, price)
+);
+CREATE INDEX IF NOT EXISTS idx_price_profile_sd ON price_profile(symbol, date);
 """
 
 
@@ -545,6 +566,20 @@ def _migrate(path: Path = None):
         )""",
         "CREATE INDEX IF NOT EXISTS idx_cl_fd_sym_date  ON cl_algo_fd_results(symbol, date)",
         "CREATE INDEX IF NOT EXISTS idx_cl_fd_direction ON cl_algo_fd_results(direction, entry_type)",
+        """CREATE TABLE IF NOT EXISTS price_profile (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol TEXT NOT NULL, date TEXT NOT NULL, price REAL NOT NULL,
+            total_volume REAL NOT NULL DEFAULT 0, visits INTEGER NOT NULL DEFAULT 0,
+            total_ask REAL, total_bid REAL,
+            price_up INTEGER NOT NULL DEFAULT 0, price_down INTEGER NOT NULL DEFAULT 0,
+            price_change INTEGER NOT NULL DEFAULT 0,
+            up_vol REAL NOT NULL DEFAULT 0, down_vol REAL NOT NULL DEFAULT 0,
+            change_vol REAL NOT NULL DEFAULT 0,
+            delta REAL,
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+            UNIQUE(symbol, date, price)
+        )""",
+        "CREATE INDEX IF NOT EXISTS idx_price_profile_sd ON price_profile(symbol, date)",
     ]
     with get_db(path) as con:
         for stmt in alter_stmts:
@@ -758,7 +793,8 @@ def self_test() -> bool:
                         "critical_lines", "release_notes", "fetch_log", "completed_trades",
                         "cl_algo_sim_results", "cl_algo_combo_scores",
                         "cl_algo_score_history", "cl_algo_learner_runs",
-                        "cl_algo_day_params", "cl_algo_fd_results"}
+                        "cl_algo_day_params", "cl_algo_fd_results",
+                        "price_profile"}
             assert expected <= tables, f"Missing tables: {expected - tables}"
 
             # 2. WAL mode is active
