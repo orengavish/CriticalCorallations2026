@@ -1151,6 +1151,18 @@ body{font-size:.85rem;}
 body.busy-wait{cursor:wait!important;}
 body.busy-wait *{pointer-events:none!important;}
 body.busy-wait button,body.busy-wait input,body.busy-wait select{opacity:.55;}
+#busy-overlay{display:none;position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,.45);
+  align-items:center;justify-content:center;flex-direction:column;gap:10px;pointer-events:none;}
+body.busy-wait #busy-overlay{display:flex;}
+#busy-overlay .hourglass{font-size:4rem;line-height:1;animation:busy-flip 1s ease-in-out infinite;
+  filter:drop-shadow(0 0 10px rgba(255,193,7,.7));}
+#busy-overlay .busy-label{color:#fff;font-size:.85rem;letter-spacing:.05em;text-shadow:0 1px 3px #000;}
+@keyframes busy-flip{
+  0%   {transform:rotate(0deg)   scale(1);}
+  45%  {transform:rotate(180deg) scale(1.15);}
+  55%  {transform:rotate(180deg) scale(1.15);}
+  100% {transform:rotate(360deg) scale(1);}
+}
 #top-bar{background:#161b22;height:40px;border-bottom:1px solid #30363d;display:flex;align-items:center;padding:0 8px;gap:0;overflow:hidden}
 .top-tab{border:none!important;border-radius:0!important;background:transparent!important;color:#8b949e;font-size:.8rem;height:40px;border-bottom:2px solid transparent!important;display:flex;align-items:center;padding:0 9px;white-space:nowrap}
 .top-tab.icon-tab{padding:0 8px;font-size:.9rem}
@@ -1166,6 +1178,11 @@ body.busy-wait button,body.busy-wait input,body.busy-wait select{opacity:.55;}
 </style>
 </head>
 <body>
+
+<div id="busy-overlay">
+  <span class="hourglass">&#8987;</span>
+  <span class="busy-label">Working…</span>
+</div>
 
 <div id="top-bar">
   <ul class="nav mb-0 flex-shrink-0" id="mainTab" role="tablist" style="height:40px;gap:0;list-style:none;padding:0;margin:0;display:flex">
@@ -1207,7 +1224,7 @@ body.busy-wait button,body.busy-wait input,body.busy-wait select{opacity:.55;}
     <span class="price-chip bg-secondary" id="chip-M2K">M2K —</span>
     <span class="text-muted ms-1" style="font-size:.75rem">Trading Dashboard</span>
     <span class="badge bg-info text-dark">:5003</span>
-    <span class="badge bg-secondary">v4.11</span>
+    <span class="badge bg-secondary">v4.12</span>
   </div>
 </div>
 
@@ -3328,6 +3345,11 @@ _RELEASE_NOTES = [
     ("v3.10", "Transpose bars mode — price on Y axis, ticks on X, lines align with other graphs", None),
     ("v3.11", "Fix Draw mode — remove !important, timed dblclick, robust _pixelToPrice fallback", None),
     ("v3.12", "Draw mode popup on dblclick — Support/Resistance color buttons, green/red lines", None),
+    ("v4.12", "Noticeable hourglass overlay during busy operations",
+              "Busy state (build DB, analyze all, etc.) previously only changed the cursor to "
+              "'wait' and dimmed buttons — easy to miss. Added a full-screen dark overlay with a "
+              "large flipping hourglass (⏳) and a 'Working…' label, shown/hidden via the existing "
+              "body.busy-wait class so no call-site changes were needed."),
     ("v4.11", "Session manager — Start/Stop broker+decider from the dashboard; cross-dashboard menu",
               "New trader/session.py: supervises broker.py + decider.py as managed subprocesses, "
               "streams their stdout to trader/logs/{broker,decider}_stdout.log, restarts on crash "
