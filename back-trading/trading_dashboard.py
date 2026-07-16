@@ -884,25 +884,33 @@ def api_last_data_date():
 def api_history(symbol: str):
     req_date_str = request.args.get("date")
     interval     = float(request.args.get("interval", 5))
+    days         = max(1, min(10, int(request.args.get("days", 1))))
     start        = date.fromisoformat(req_date_str) if req_date_str else (date.today() - timedelta(days=1))
 
-    ticks, used_date = None, None
-    search = start + timedelta(days=1)
-    for _ in range(20):
-        search -= timedelta(days=1)
+    # Walk backward from `start` collecting up to `days` trading days that have
+    # RTH data, same single-day fallback logic as before when days=1. Ticks from
+    # all collected days go into one _ohlcv_bars() call — it buckets by its own
+    # (date, time) key per tick, so multi-day concatenation order doesn't matter.
+    all_ticks: list = []
+    used_dates: list = []
+    search  = start + timedelta(days=1)
+    scanned = 0
+    while len(used_dates) < days and scanned < 40:
+        search  -= timedelta(days=1)
+        scanned += 1
         if search.weekday() >= 5:
             continue
         if not _csv_has_rth(symbol, search):
             continue
         t = _load_ticks(symbol, search)
         if t:
-            ticks, used_date = t, search
-            break
+            all_ticks.extend(t)
+            used_dates.append(search)
 
-    if not ticks:
+    if not all_ticks:
         return jsonify({"bars": [], "date": None, "symbol": symbol, "error": "no data"})
 
-    rth_bars = [b for b in _ohlcv_bars(ticks, interval)
+    rth_bars = [b for b in _ohlcv_bars(all_ticks, interval)
                 if _RTH_START_MIN * 60 <= b["t_sec"] < _RTH_END_MIN * 60]
     bars = []
     for b in rth_bars:
@@ -912,9 +920,12 @@ def api_history(symbol: str):
                      "open": b["open"], "high": b["high"],
                      "low":  b["low"],  "close": b["close"], "vol": b["vol"]})
 
+    used_dates.sort()
+    newest = used_dates[-1]
     total_ticks = sum(b["vol"] for b in rth_bars)
-    mock = used_date.isoformat() if used_date != start else None
-    return jsonify({"bars": bars, "date": used_date.isoformat(),
+    mock = newest.isoformat() if newest != start else None
+    return jsonify({"bars": bars, "date": newest.isoformat(),
+                    "date_range": [used_dates[0].isoformat(), newest.isoformat()],
                     "symbol": symbol, "mock_date": mock,
                     "total_ticks": total_ticks})
 
@@ -1224,7 +1235,7 @@ body.busy-wait #busy-overlay{display:flex;}
     <span class="price-chip bg-secondary" id="chip-M2K">M2K —</span>
     <span class="text-muted ms-1" style="font-size:.75rem">Trading Dashboard</span>
     <span class="badge bg-info text-dark">:5003</span>
-    <span class="badge bg-secondary">v4.15</span>
+    <span class="badge bg-secondary">v4.16</span>
   </div>
 </div>
 
@@ -1581,6 +1592,13 @@ body.busy-wait #busy-overlay{display:flex;}
     <button class="btn btn-sm btn-outline-info" id="all-overlay-btn" onclick="toggleAllOverlay()">&#8853; Overlay</button>
     <button class="btn btn-sm btn-outline-warning active" id="all-auto-btn" onclick="toggleAllAutoZoom()"
             title="Auto-refine bar resolution when you zoom the overlay chart">&#9889; Auto</button>
+    <span id="all-days-wrap" class="d-flex align-items-center gap-1" style="display:none!important">
+      <span class="vr"></span>
+      <label class="small text-muted mb-0" for="all-days-input">Days:</label>
+      <input type="number" id="all-days-input" class="form-control form-control-sm py-0"
+             style="width:56px;height:26px;font-size:.78rem" min="1" max="10" value="1"
+             onchange="setAllDays(this.value)" title="Span up to 10 trading days (~2 weeks) ending at the current day; use D&#9664;/D&#9654; to slide the whole window">
+    </span>
   </div>
   <div id="chart-all-overlay-wrap" style="display:none">
     <div id="chart-all-overlay" style="height:285px;background:#1a1a2e;border-radius:4px"></div>
@@ -2351,7 +2369,18 @@ document.getElementById('btn-graph-tab').addEventListener('click',function(){
 });
 
 // ── ALL SYMBOLS ───────────────────────────────────────────────────────────────
-let _allInterval=5, _allOverlay=false, _allAutoZoom=true, _allZoomTimer=null;
+let _allInterval=5, _allOverlay=false, _allAutoZoom=true, _allZoomTimer=null, _allDaysSpan=1;
+
+function setAllDays(v){
+  _allDaysSpan=Math.max(1,Math.min(10,parseInt(v)||1));
+  document.getElementById('all-days-input').value=_allDaysSpan;
+  loadAllSymbols();
+}
+// Hides weekends + outside-RTH hours so a multi-day span isn't mostly blank gaps.
+const ALL_RANGEBREAKS=[
+  {pattern:'day of week', bounds:[6,1]},
+  {pattern:'hour', bounds:[16,9.5]},
+];
 let _allDiffCache=null, _allSyncingZoom=false;
 const ALL_PAIRS=[['MES','MYM'],['MES','M2K'],['MYM','M2K']];
 const ALL_PAIR_COLORS={MES_MYM:'#E8A838',MES_M2K:'#9B59B6',MYM_M2K:'#17A2B8'};
@@ -2392,6 +2421,8 @@ function toggleAllOverlay(){
   document.getElementById('all-overlay-btn').classList.toggle('active',_allOverlay);
   document.getElementById('chart-all-overlay-wrap').style.display=_allOverlay?'block':'none';
   document.getElementById('all-grid').style.display=_allOverlay?'none':'flex';
+  // Multi-day span only applies to overlay mode
+  document.getElementById('all-days-wrap').style.setProperty('display',_allOverlay?'flex':'none','important');
   // Wait one frame so browser reflows the newly-visible div before Plotly queries its dimensions
   requestAnimationFrame(()=>loadAllSymbols());
 }
@@ -2430,9 +2461,14 @@ async function _loadOverlayAll(reqDate,forcedRange){
   let data;
   try{
     data=await Promise.all(SYMS.map(s=>
-      fetch(`/api/history/${s}?interval=${_allInterval}&date=${reqDate}`).then(r=>r.json())
+      fetch(`/api/history/${s}?interval=${_allInterval}&date=${reqDate}&days=${_allDaysSpan}`).then(r=>r.json())
     ));
   }catch(e){el.innerHTML=`<div class="text-danger small p-2">${e}</div>`;return;}
+  const spanRange=(data.find(d=>d.date_range)||{}).date_range;
+  if(spanRange){
+    document.getElementById('all-day-info').textContent=
+      _allDaysSpan>1 ? `${spanRange[0]} → ${spanRange[1]}  (${_allDaysSpan}d)` : spanRange[1];
+  }
 
   const traces=[];
   const tsToY={};  // per-symbol map: timestamp -> ticks-from-open (for the diff panel below)
@@ -2452,6 +2488,7 @@ async function _loadOverlayAll(reqDate,forcedRange){
   }
   if(!traces.length){el.innerHTML='<div class="d-flex align-items-center justify-content-center h-100 text-muted small">No data</div>';return;}
   const xaxis={gridcolor:'#252535',zeroline:false,rangeslider:{visible:false}};
+  if(_allDaysSpan>1) xaxis.rangebreaks=ALL_RANGEBREAKS;
   if(forcedRange) xaxis.range=forcedRange;
   await Plotly.newPlot(el,traces,{
     paper_bgcolor:'#1a1a2e',plot_bgcolor:'#1a1a2e',
@@ -2543,6 +2580,7 @@ async function _plotAllDiff(forcedRange){
   }
   if(!traces.length){el.innerHTML='<div class="d-flex align-items-center justify-content-center h-100 text-muted small">No pairs selected</div>';return;}
   const xaxis={gridcolor:'#252535',zeroline:false,rangeslider:{visible:false}};
+  if(_allDaysSpan>1) xaxis.rangebreaks=ALL_RANGEBREAKS;
   if(forcedRange) xaxis.range=forcedRange;
   await Plotly.newPlot(el,traces,{
     paper_bgcolor:'#1a1a2e',plot_bgcolor:'#1a1a2e',
@@ -3482,6 +3520,19 @@ _RELEASE_NOTES = [
     ("v3.10", "Transpose bars mode — price on Y axis, ticks on X, lines align with other graphs", None),
     ("v3.11", "Fix Draw mode — remove !important, timed dblclick, robust _pixelToPrice fallback", None),
     ("v3.12", "Draw mode popup on dblclick — Support/Resistance color buttons, green/red lines", None),
+    ("v4.16", "Overlay mode: multi-day span (up to 10 trading days) with a Days control",
+              "/api/history/<symbol> gained a days= param (1-10): walks backward from the anchor "
+              "date collecting up to that many trading days with real RTH data (same missing-day "
+              "fallback as before when days=1, so single-day callers are unaffected), concatenates "
+              "their ticks, and returns a date_range [oldest, newest] alongside the existing date "
+              "field. Overlay mode gets a new 'Days' number input (1-10, only visible in overlay "
+              "mode) driving this. Both overlay charts (price + diff panel) add Plotly rangebreaks "
+              "to hide weekends and non-RTH hours once days>1, so a multi-day view isn't mostly "
+              "blank gaps between sessions. Left/right day navigation (D◀/D▶) already slides the "
+              "anchor date by one trading day, so it doubles as sliding the whole multi-day window "
+              "— no separate control needed. The day-info label shows the actual resolved range "
+              "(e.g. missing days get silently skipped, so 5 requested days can span more than 5 "
+              "calendar days) rather than an assumed one."),
     ("v4.15", "All tab: MNQ removed, new pairwise-diff opportunity panel below the overlay",
               "MNQ dropped from the All tab entirely (both overlay and per-symbol grid) — its "
               "tick-delta dwarfed MES/MYM/M2K on the shared y-axis, squashing the other 3 into a "
