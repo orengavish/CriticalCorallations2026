@@ -1224,7 +1224,7 @@ body.busy-wait #busy-overlay{display:flex;}
     <span class="price-chip bg-secondary" id="chip-M2K">M2K —</span>
     <span class="text-muted ms-1" style="font-size:.75rem">Trading Dashboard</span>
     <span class="badge bg-info text-dark">:5003</span>
-    <span class="badge bg-secondary">v4.12</span>
+    <span class="badge bg-secondary">v4.14</span>
   </div>
 </div>
 
@@ -1567,6 +1567,7 @@ body.busy-wait #busy-overlay{display:flex;}
 <div class="tab-pane fade" id="tab-all">
   <div class="d-flex align-items-center gap-2 mb-2 flex-wrap">
     <div class="btn-group btn-group-sm" role="group">
+      <button class="btn btn-outline-secondary" onclick="setAllInterval(0.5,this)">30s</button>
       <button class="btn btn-outline-secondary" onclick="setAllInterval(1,this)">1m</button>
       <button id="btn-all-int-5" class="btn btn-outline-secondary active" onclick="setAllInterval(5,this)">5m</button>
       <button class="btn btn-outline-secondary" onclick="setAllInterval(15,this)">15m</button>
@@ -1578,6 +1579,8 @@ body.busy-wait #busy-overlay{display:flex;}
     <button class="btn btn-sm btn-outline-secondary px-2" onclick="navAllDay(1)">D&#9654;</button>
     <span class="vr"></span>
     <button class="btn btn-sm btn-outline-info" id="all-overlay-btn" onclick="toggleAllOverlay()">&#8853; Overlay</button>
+    <button class="btn btn-sm btn-outline-warning active" id="all-auto-btn" onclick="toggleAllAutoZoom()"
+            title="Auto-refine bar resolution when you zoom the overlay chart">&#9889; Auto</button>
   </div>
   <div id="chart-all-overlay" style="display:none;height:590px;background:#1a1a2e;border-radius:4px"></div>
   <div id="all-grid" class="row g-2">
@@ -2342,13 +2345,37 @@ document.getElementById('btn-graph-tab').addEventListener('click',function(){
 });
 
 // ── ALL SYMBOLS ───────────────────────────────────────────────────────────────
-let _allInterval=5, _allOverlay=false;
+let _allInterval=5, _allOverlay=false, _allAutoZoom=true, _allZoomTimer=null;
+
+// Auto-zoom bar resolution ladder: wider visible window -> coarser bars, so
+// zooming in always reveals more bars instead of the same handful stretched out.
+const _ALL_ZOOM_LADDER=[
+  {maxSec:4*3600, interval:30},
+  {maxSec:2*3600, interval:15},
+  {maxSec:40*60,  interval:5},
+  {maxSec:8*60,   interval:1},
+  {maxSec:0,      interval:0.5},
+];
+function _allIntervalForWindow(sec){
+  for(const {maxSec,interval} of _ALL_ZOOM_LADDER) if(sec>maxSec) return interval;
+  return 0.5;
+}
 
 function setAllInterval(v,btn){
   _allInterval=v;
   document.querySelectorAll('#tab-all .btn-group-sm .btn').forEach(b=>b.classList.remove('active'));
   if(btn)btn.classList.add('active');
   loadAllSymbols();
+}
+function _syncAllIntervalBtn(){
+  document.querySelectorAll('#tab-all .btn-group-sm .btn').forEach(b=>{
+    b.classList.toggle('active', parseFloat(b.getAttribute('onclick').match(/setAllInterval\(([\d.]+)/)[1])===_allInterval);
+  });
+}
+
+function toggleAllAutoZoom(){
+  _allAutoZoom=!_allAutoZoom;
+  document.getElementById('all-auto-btn').classList.toggle('active',_allAutoZoom);
 }
 
 function toggleAllOverlay(){
@@ -2378,11 +2405,14 @@ async function loadAllSymbols(){
   if(!reqDate)return;
   document.getElementById('all-day-info').textContent=
     `${_graphDateIdx+1}/${_graphDates.length}  ${reqDate}`;
-  if(_allOverlay) await _loadOverlayAll(reqDate);
-  else await Promise.all(['MES','MNQ','MYM','M2K'].map(sym=>_loadOneSymAll(sym,reqDate)));
+  _enterBusy();
+  try{
+    if(_allOverlay) await _loadOverlayAll(reqDate);
+    else await Promise.all(['MES','MNQ','MYM','M2K'].map(sym=>_loadOneSymAll(sym,reqDate)));
+  }finally{_exitBusy();}
 }
 
-async function _loadOverlayAll(reqDate){
+async function _loadOverlayAll(reqDate,forcedRange){
   const el=document.getElementById('chart-all-overlay');
   const SYM_COLORS={MES:'#5B8DD9',MNQ:'#E8A838',MYM:'#32BA64',M2K:'#D25050'};
   const SYMS=['MES','MNQ','MYM','M2K'];
@@ -2407,14 +2437,37 @@ async function _loadOverlayAll(reqDate){
     });
   }
   if(!traces.length){el.innerHTML='<div class="d-flex align-items-center justify-content-center h-100 text-muted small">No data</div>';return;}
-  Plotly.newPlot(el,traces,{
+  const xaxis={gridcolor:'#252535',zeroline:false,rangeslider:{visible:false}};
+  if(forcedRange) xaxis.range=forcedRange;
+  await Plotly.newPlot(el,traces,{
     paper_bgcolor:'#1a1a2e',plot_bgcolor:'#1a1a2e',
     font:{color:'#ccc',size:10},margin:{t:8,b:30,l:50,r:8},
-    xaxis:{gridcolor:'#252535',zeroline:false,rangeslider:{visible:false}},
+    xaxis,
     yaxis:{gridcolor:'#252535',zeroline:true,zerolinecolor:'#555',title:'Ticks from open'},
     showlegend:true,legend:{x:0,y:1,bgcolor:'rgba(0,0,0,0)',font:{size:11}},
     dragmode:'zoom',
   },{responsive:true,displayModeBar:false,scrollZoom:true});
+
+  // Auto-refine: on zoom (and only zoom, not pan/autorange), fetch a finer
+  // interval sized to the new visible window so zooming in always reveals
+  // more bars instead of stretching the same handful. Debounced so a drag
+  // doesn't fire a fetch per pixel. Toggle off via the Auto button for pure
+  // manual interval control instead.
+  el.removeAllListeners?.('plotly_relayout');
+  el.on('plotly_relayout',(ev)=>{
+    if(!_allAutoZoom)return;
+    const x0=ev['xaxis.range[0]'], x1=ev['xaxis.range[1]'];
+    if(x0===undefined||x1===undefined)return;  // pan/autorange/other relayout, not a zoom range
+    clearTimeout(_allZoomTimer);
+    _allZoomTimer=setTimeout(()=>{
+      const windowSec=(new Date(x1)-new Date(x0))/1000;
+      const next=_allIntervalForWindow(windowSec);
+      if(next===_allInterval)return;
+      _allInterval=next;
+      _syncAllIntervalBtn();
+      _loadOverlayAll(reqDate,[x0,x1]);
+    },400);
+  });
 }
 
 async function _loadOneSymAll(sym,reqDate){
@@ -2883,7 +2936,7 @@ function sbPlot(){
   const layout={
     paper_bgcolor:bg,plot_bgcolor:bg,font:{color:'#ccc',size:10},
     margin:_sbTransposed?{t:8,b:40,l:60,r:6}:{t:8,b:30,l:44,r:6},
-    barmode:'overlay',showlegend:false,bargap:0,
+    barmode:'overlay',showlegend:false,bargap:0.06,
     xaxis:{...axC,
       title:_sbTransposed?'Normalized (0-1)':'Price',
       ..._sbTransposed?{range:[0,1.05],fixedrange:true}:{range:_sbPriceRange}},
@@ -3345,6 +3398,23 @@ _RELEASE_NOTES = [
     ("v3.10", "Transpose bars mode — price on Y axis, ticks on X, lines align with other graphs", None),
     ("v3.11", "Fix Draw mode — remove !important, timed dblclick, robust _pixelToPrice fallback", None),
     ("v3.12", "Draw mode popup on dblclick — Support/Resistance color buttons, green/red lines", None),
+    ("v4.14", "All/Overlay: 30s interval, hourglass while loading, auto bar-resolution on zoom",
+              "All tab's overlay mode had no busy indicator at all — loading could take a while "
+              "with no feedback, which is why it looked 'empty' rather than 'still loading'. "
+              "Now loadAllSymbols()/_loadOverlayAll() wrap the existing _enterBusy()/_exitBusy() "
+              "hourglass + input-disable around every load, in both overlay and per-symbol grid "
+              "modes. Added a 30s interval button (the backend already supported sub-minute "
+              "intervals via a float param — just no UI for it). New Auto mode (on by default, "
+              "toggle via the ⚡ Auto button): zooming the overlay chart now auto-refines to a "
+              "finer bar interval sized to the visible window (debounced 400ms) so zooming in "
+              "reveals more bars instead of stretching the same few — ladder is 30m/15m/5m/1m/30s "
+              "keyed to window width in seconds. Turn Auto off to pick the interval manually via "
+              "the existing buttons instead."),
+    ("v4.13", "Sandbox: thinner bars (small bargap instead of touching)",
+              "bargap 0 -> 0.06 on the Sandbox price-level chart, shaving a small gap between "
+              "bars that were previously touching edge-to-edge. Note: Plotly bar width is gap-"
+              "fraction based, not literal pixels, so the exact px change varies with zoom/price "
+              "range — this is an approximation, adjust further if it's not enough/too much."),
     ("v4.12", "Noticeable hourglass overlay during busy operations",
               "Busy state (build DB, analyze all, etc.) previously only changed the cursor to "
               "'wait' and dimmed buttons — easy to miss. Added a full-screen dark overlay with a "
