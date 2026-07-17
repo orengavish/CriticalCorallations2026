@@ -1235,7 +1235,7 @@ body.busy-wait #busy-overlay{display:flex;}
     <span class="price-chip bg-secondary" id="chip-M2K">M2K —</span>
     <span class="text-muted ms-1" style="font-size:.75rem">Trading Dashboard</span>
     <span class="badge bg-info text-dark">:5003</span>
-    <span class="badge bg-secondary">v4.16</span>
+    <span class="badge bg-secondary">v4.17</span>
   </div>
 </div>
 
@@ -3520,6 +3520,23 @@ _RELEASE_NOTES = [
     ("v3.10", "Transpose bars mode — price on Y axis, ticks on X, lines align with other graphs", None),
     ("v3.11", "Fix Draw mode — remove !important, timed dblclick, robust _pixelToPrice fallback", None),
     ("v3.12", "Draw mode popup on dblclick — Support/Resistance color buttons, green/red lines", None),
+    ("v4.17", "Fixed: 425 stale MES orders from repeated session restarts; decider.py dedup guard",
+              "Diagnostic test-trade run (5 MES MKT orders) exposed a real incident: decider.py's "
+              "generate_commands() had zero deduplication — every run_session_start() call "
+              "unconditionally inserted a fresh batch of commands for every armed line, with no "
+              "check for whether an unresolved command already existed for that (line, direction, "
+              "bracket) combo. Repeated session restarts while deploying today's earlier versions "
+              "piled up 425 MES commands stuck at status=SUBMITTED, though IB itself showed 0 open "
+              "orders (the DB was just never reconciled) — reconciled all 425 to CANCELLED. "
+              "generate_commands() now skips any (critical_line_id, direction, bracket_size) combo "
+              "that already has a PENDING/SUBMITTING/SUBMITTED command in flight; self-test extended "
+              "to call it twice and assert the second call adds nothing. "
+              "Also found and fixed a genuine race condition in lib/db.py: broker.py and decider.py "
+              "both call init_db() on startup, and session.py launches them nearly simultaneously — "
+              "their concurrent verified_trades view check-drop-create could collide "
+              "('already exists' / 'no such view'), crashing broker on startup (caught live, "
+              "auto-restarted by session.py's own crash recovery, then hardened and stress-tested "
+              "with 120 concurrent init_db() calls after the real fix)."),
     ("v4.16", "Overlay mode: multi-day span (up to 10 trading days) with a Days control",
               "/api/history/<symbol> gained a days= param (1-10): walks backward from the anchor "
               "date collecting up to that many trading days with real RTH data (same missing-day "

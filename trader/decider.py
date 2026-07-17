@@ -83,7 +83,25 @@ def generate_commands(symbol: str, date_str: str, current_price: float,
         log.warning(f"No armed lines for {symbol} {date_str} — nothing to generate")
         return 0
 
+    # Dedup guard: skip (line, direction, bracket) combos that already have an
+    # unresolved command in flight. Without this, every run_session_start() call
+    # (e.g. each time a session is restarted) re-generates a full fresh batch on
+    # top of whatever's still unfilled from the last one, with no cap — this is
+    # exactly how MES accumulated 425 stale resting orders across repeated
+    # restarts in one day (2026-07-17 incident). CLOSED/CANCELLED/ERROR/FILLED
+    # commands don't block regeneration — only ones still actively working do.
+    with get_db(db_path) as con:
+        in_flight = {
+            (r["critical_line_id"], r["direction"], r["bracket_size"])
+            for r in con.execute(
+                "SELECT critical_line_id, direction, bracket_size FROM commands"
+                " WHERE symbol=? AND status IN ('PENDING','SUBMITTING','SUBMITTED')",
+                (symbol,)
+            ).fetchall()
+        }
+
     count = 0
+    skipped = 0
     for line in lines:
         line_price  = line["price"]
         line_type   = line["line_type"]
@@ -91,6 +109,9 @@ def generate_commands(symbol: str, date_str: str, current_price: float,
 
         for bracket_size in brackets:
             for direction in ("BUY", "SELL"):
+                if (line["id"], direction, bracket_size) in in_flight:
+                    skipped += 1
+                    continue
                 entry_type = determine_entry_type(direction, current_price, line_price)
                 prices = calc_bracket_prices(
                     direction, entry_type, line_price, bracket_size, tick
@@ -116,7 +137,8 @@ def generate_commands(symbol: str, date_str: str, current_price: float,
                 )
 
     log.info(f"Generated {count} commands for {symbol} {date_str} "
-             f"({len(lines)} lines x {len(brackets)} brackets x 2 directions)")
+             f"({len(lines)} lines x {len(brackets)} brackets x 2 directions, "
+             f"{skipped} skipped as already in flight)")
     return count
 
 
@@ -326,6 +348,17 @@ def self_test() -> bool:
             sell_rows2 = [r for r in rows if r["direction"] == "SELL" and r["line_price"] == 6510.0]
             assert any(r["entry_type"] == "STP" for r in buy_rows2),  "6510 BUY should be STP"
             assert any(r["entry_type"] == "LMT" for r in sell_rows2), "6510 SELL should be LMT"
+
+            # 1b. Dedup guard: calling generate_commands again (e.g. a session
+            # restart) with the same still-unresolved commands must not create
+            # duplicates -- this is the fix for the 2026-07-17 incident where
+            # repeated restarts piled up 425 stale MES orders with no cap.
+            n_again = generate_commands("MES", today, current_price, cfg, db_path)
+            assert n_again == 0, f"Expected 0 new commands (all in flight), got {n_again}"
+            with get_db(db_path) as con:
+                total_after = con.execute("SELECT COUNT(*) FROM commands").fetchone()[0]
+            assert total_after == expected, \
+                f"Dedup guard failed -- expected {expected} total commands, got {total_after}"
 
             # 2. Replenishment test
             # Mark one command as FILLED

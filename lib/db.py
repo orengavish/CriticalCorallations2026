@@ -592,14 +592,23 @@ def _migrate(path: Path = None):
                 pass
         # Always recreate the view so schema changes are picked up on restart.
         # Guard: if verified_trades exists as a TABLE (older DB), drop it as a table first.
-        row = con.execute(
-            "SELECT type FROM sqlite_master WHERE name='verified_trades'"
-        ).fetchone()
-        if row and row[0] == "table":
-            con.execute("DROP TABLE verified_trades")
-        elif row and row[0] == "view":
-            con.execute("DROP VIEW verified_trades")
-        con.execute(_VERIFIED_TRADES_VIEW)
+        # The whole check-drop-create dance is wrapped because broker.py and decider.py
+        # both call init_db() on startup and session.py launches them nearly
+        # simultaneously — two processes can race through this (one's CREATE landing
+        # between the other's SELECT and its own CREATE) and hit "already exists" /
+        # "no such view". Either process winning still leaves the same correct view
+        # definition in place, so a race-induced OperationalError here is harmless.
+        try:
+            row = con.execute(
+                "SELECT type FROM sqlite_master WHERE name='verified_trades'"
+            ).fetchone()
+            if row and row[0] == "table":
+                con.execute("DROP TABLE verified_trades")
+            elif row and row[0] == "view":
+                con.execute("DROP VIEW verified_trades")
+            con.execute(_VERIFIED_TRADES_VIEW)
+        except sqlite3.OperationalError:
+            pass
 
 
 # ── CRUD helpers ──────────────────────────────────────────────────────────────
