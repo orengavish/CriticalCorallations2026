@@ -1174,7 +1174,9 @@ body.busy-wait #busy-overlay{display:flex;}
   55%  {transform:rotate(180deg) scale(1.15);}
   100% {transform:rotate(360deg) scale(1);}
 }
-#top-bar{background:#161b22;height:40px;border-bottom:1px solid #30363d;display:flex;align-items:center;padding:0 8px;gap:0;overflow:hidden}
+#top-bar{background:#161b22;height:40px;border-bottom:1px solid #30363d;display:flex;align-items:center;padding:0 8px;gap:0;overflow-x:auto;overflow-y:hidden;scrollbar-width:thin}
+#top-bar::-webkit-scrollbar{height:4px}
+#top-bar::-webkit-scrollbar-thumb{background:#30363d;border-radius:2px}
 .top-tab{border:none!important;border-radius:0!important;background:transparent!important;color:#8b949e;font-size:.8rem;height:40px;border-bottom:2px solid transparent!important;display:flex;align-items:center;padding:0 9px;white-space:nowrap}
 .top-tab.icon-tab{padding:0 8px;font-size:.9rem}
 #menu-links{min-width:11rem}
@@ -1235,7 +1237,7 @@ body.busy-wait #busy-overlay{display:flex;}
     <span class="price-chip bg-secondary" id="chip-M2K">M2K —</span>
     <span class="text-muted ms-1" style="font-size:.75rem">Trading Dashboard</span>
     <span class="badge bg-info text-dark">:5003</span>
-    <span class="badge bg-secondary">v4.17</span>
+    <span class="badge bg-secondary">v4.18</span>
   </div>
 </div>
 
@@ -3520,6 +3522,14 @@ _RELEASE_NOTES = [
     ("v3.10", "Transpose bars mode — price on Y axis, ticks on X, lines align with other graphs", None),
     ("v3.11", "Fix Draw mode — remove !important, timed dblclick, robust _pixelToPrice fallback", None),
     ("v3.12", "Draw mode popup on dblclick — Support/Resistance color buttons, green/red lines", None),
+    ("v4.18", "Fix: top bar was overflowing and clipping controls (incl. the 🔗 menu) off-screen",
+              "#top-bar had overflow:hidden with a growing number of flex-shrink:0 groups packed "
+              "into one 40px row (7 tabs + 🔗 menu, date-range controls, session status/Start-Stop, "
+              "4 price chips, version badge) — on anything but a wide window, later items were "
+              "silently clipped past the edge rather than wrapping or scrolling, which is why the "
+              "🔗 menu added in v4.11 became invisible/unreachable. Changed to overflow-x:auto so "
+              "the whole bar scrolls horizontally instead of clipping — everything is reachable "
+              "again, just may need a scroll on narrow windows."),
     ("v4.17", "Fixed: 425 stale MES orders from repeated session restarts; decider.py dedup guard",
               "Diagnostic test-trade run (5 MES MKT orders) exposed a real incident: decider.py's "
               "generate_commands() had zero deduplication — every run_session_start() call "
