@@ -1179,7 +1179,7 @@ body.busy-wait #busy-overlay{display:flex;}
 #top-bar::-webkit-scrollbar-thumb{background:#30363d;border-radius:2px}
 .top-tab{border:none!important;border-radius:0!important;background:transparent!important;color:#8b949e;font-size:.8rem;height:40px;border-bottom:2px solid transparent!important;display:flex;align-items:center;padding:0 9px;white-space:nowrap}
 .top-tab.icon-tab{padding:0 8px;font-size:.9rem}
-#menu-links{min-width:11rem}
+#menu-links{min-width:11rem;position:fixed!important;top:auto;left:auto;z-index:2000}
 .top-tab:hover{color:#ccc;background:rgba(255,255,255,.05)!important}
 .top-tab.active{color:#fff!important;border-bottom-color:#0d6efd!important}
 /* Sandbox tab */
@@ -1206,14 +1206,14 @@ body.busy-wait #busy-overlay{display:flex;}
     <li class="nav-item"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-test" id="btn-test-tab">Test</button></li>
     <li class="nav-item"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-trades">Trades</button></li>
     <li class="nav-item"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-submitted" id="btn-sub-tab">Sub</button></li>
-    <li class="nav-item dropdown">
-      <button class="nav-link top-tab icon-tab" data-bs-toggle="dropdown" title="Other dashboards">🔗</button>
-      <ul class="dropdown-menu dropdown-menu-dark" id="menu-links">
-        <li><a class="dropdown-item" id="menu-link-cc2026"  target="_blank">CC2026 Dashboard (this)</a></li>
-        <li><a class="dropdown-item" id="menu-link-fetcher" target="_blank">Fetcher2026</a></li>
-        <li><a class="dropdown-item" id="menu-link-geva"    target="_blank">GevaExtract</a></li>
-      </ul>
+    <li class="nav-item">
+      <button class="nav-link top-tab icon-tab" onclick="toggleCrossMenu(event)" title="Other dashboards">🔗</button>
     </li>
+  </ul>
+  <ul class="dropdown-menu dropdown-menu-dark" id="menu-links">
+    <li><a class="dropdown-item" id="menu-link-cc2026"  target="_blank">CC2026 Dashboard (this)</a></li>
+    <li><a class="dropdown-item" id="menu-link-fetcher" target="_blank">Fetcher2026</a></li>
+    <li><a class="dropdown-item" id="menu-link-geva"    target="_blank">GevaExtract</a></li>
   </ul>
   <div class="vr mx-2 flex-shrink-0" style="height:20px;background:#30363d"></div>
   <div class="d-flex align-items-center gap-2 small flex-shrink-0">
@@ -1237,7 +1237,7 @@ body.busy-wait #busy-overlay{display:flex;}
     <span class="price-chip bg-secondary" id="chip-M2K">M2K —</span>
     <span class="text-muted ms-1" style="font-size:.75rem">Trading Dashboard</span>
     <span class="badge bg-info text-dark">:5003</span>
-    <span class="badge bg-secondary">v4.18</span>
+    <span class="badge bg-secondary">v4.19</span>
   </div>
 </div>
 
@@ -1748,13 +1748,34 @@ async function pollPrices(){
 }
 pollPrices();setInterval(pollPrices,5000);
 
-// ── Cross-dashboard menu links (localhost/LAN/VPN all work — same host, diff port) ─
+// ── Cross-dashboard menu (localhost/LAN/VPN all work — same host, diff port) ──
+// position:fixed + coordinates computed from the button's own screen rect,
+// so it escapes #top-bar's overflow-y:hidden (a position:absolute Bootstrap
+// dropdown got silently clipped there — button worked, popup was invisible).
 (function(){
   const base=location.protocol+'//'+location.hostname;
   document.getElementById('menu-link-cc2026').href  = base+':5003';
   document.getElementById('menu-link-fetcher').href = base+':5050';
   document.getElementById('menu-link-geva').href    = base+':5005';
 })();
+function toggleCrossMenu(ev){
+  ev.stopPropagation();
+  const dd=document.getElementById('menu-links');
+  const willShow=!dd.classList.contains('show');
+  dd.classList.remove('show');
+  if(willShow){
+    dd.classList.add('show');  // make measurable before positioning
+    const r=ev.currentTarget.getBoundingClientRect();
+    dd.style.top=r.bottom+'px';
+    dd.style.left=Math.max(4,r.right-dd.offsetWidth)+'px';
+  }
+}
+document.addEventListener('click',(e)=>{
+  const dd=document.getElementById('menu-links');
+  if(dd.classList.contains('show') && !e.target.closest('#menu-links') && !e.target.closest('.icon-tab')){
+    dd.classList.remove('show');
+  }
+});
 
 // ── Session manager (broker + decider) ──────────────────────────────────────
 let _sessionBusy=false;
@@ -3522,6 +3543,15 @@ _RELEASE_NOTES = [
     ("v3.10", "Transpose bars mode — price on Y axis, ticks on X, lines align with other graphs", None),
     ("v3.11", "Fix Draw mode — remove !important, timed dblclick, robust _pixelToPrice fallback", None),
     ("v3.12", "Draw mode popup on dblclick — Support/Resistance color buttons, green/red lines", None),
+    ("v4.19", "Fix: 🔗 menu click did nothing — Bootstrap dropdown was rendering invisible",
+              "v4.18 fixed the icon being clipped off-screen by giving #top-bar overflow-x:auto — "
+              "but that same fix's overflow-y:hidden clips a Bootstrap dropdown-menu, which uses "
+              "position:absolute and pops open *below* the 40px bar. The click was registering fine, "
+              "the popup was just invisible. Replaced with a small custom toggle: position:fixed "
+              "(escapes any ancestor's overflow clipping entirely, regardless of DOM nesting) with "
+              "coordinates computed from the button's own getBoundingClientRect() at click time, "
+              "plus a click-outside-to-close handler. Same approach already used successfully on "
+              "Fetcher2026 and GevaExtract's menus."),
     ("v4.18", "Fix: top bar was overflowing and clipping controls (incl. the 🔗 menu) off-screen",
               "#top-bar had overflow:hidden with a growing number of flex-shrink:0 groups packed "
               "into one 40px row (7 tabs + 🔗 menu, date-range controls, session status/Start-Stop, "
