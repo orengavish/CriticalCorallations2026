@@ -1319,7 +1319,7 @@ body.busy-wait #busy-overlay{display:flex;}
     <span class="price-chip bg-secondary" id="chip-M2K">M2K —</span>
     <span class="text-muted ms-1" style="font-size:.75rem">Trading Dashboard</span>
     <span class="badge bg-info text-dark">:5003</span>
-    <span class="badge bg-secondary">v4.22</span>
+    <span class="badge bg-secondary">v4.23</span>
   </div>
 </div>
 
@@ -3796,6 +3796,25 @@ _RELEASE_NOTES = [
     ("v3.10", "Transpose bars mode — price on Y axis, ticks on X, lines align with other graphs", None),
     ("v3.11", "Fix Draw mode — remove !important, timed dblclick, robust _pixelToPrice fallback", None),
     ("v3.12", "Draw mode popup on dblclick — Support/Resistance color buttons, green/red lines", None),
+    ("v4.23", "broker.py: naked-position reconciliation on startup; fix commands stuck forever",
+              "2026-07-20 incident follow-up. Broker/decider were externally terminated (not a "
+              "code crash) while a large order-rejection storm was in flight; on restart, two "
+              "existing positions (M2K, MNQ, filled days earlier) had zero resting protective "
+              "orders — nothing in the codebase ever re-checks an already-FILLED command's "
+              "position against IB reality, only fresh fills get TP/SL. Emergency-protected "
+              "manually in the moment (mistakenly using Position.avgCost, which is multiplier-"
+              "scaled for futures, as a raw price — turned two intended resting stops into "
+              "instant-fill market orders; ~-$782 realized on paper, not real money). "
+              "Two real fixes: (1) new reconcile_naked_positions(), called once at broker "
+              "startup — any symbol with a non-zero IB position and no resting order gets an "
+              "emergency stop, correctly priced via get_price() (fresh real quoted price) never "
+              "avgCost. Verified against the live paper account: MES/MNQ prices come back sane "
+              "and real-scale; MYM fails contract resolution (pre-existing CME-only hardcoding, "
+              "MYM is CBOT — function catches this and skips rather than crashing). "
+              "(2) poll_fills() was silently `continue`-ing forever on any SUBMITTED command "
+              "whose ib_order_id had aged out of IB's trades() cache — 96 commands were stuck "
+              "with zero visibility this way, some 18 days old. Now flags anything unmatched "
+              "past 10 minutes as RECONCILE_REQUIRED instead of ignoring it indefinitely."),
     ("v4.22", "All tab: Reset Zoom button for the overlay + diff charts",
               "One button resets both charts to full-data autorange — explicit on both divs "
               "rather than relying on the zoom-sync mirror between them, since an autorange "

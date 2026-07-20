@@ -42,6 +42,12 @@ _MAX_RECONNECT_ATTEMPTS = 5
 # Per-symbol minimum tick for TP/SL rebase rounding
 _TICK_BY_SYMBOL = {"MES": 0.25, "MNQ": 0.25, "MYM": 1.0, "M2K": 0.10}
 
+# 2026-07-20 incident: SUBMITTED commands whose ib_order_id had aged out of
+# ibc.paper.trades() were silently skipped by poll_fills() forever -- 96
+# commands stuck with no visibility, some from 18 days earlier. Past this
+# age with no match, flag for reconciliation instead of ignoring silently.
+_STALE_SUBMITTED_MINUTES = 10
+
 # Thread-safe queue: (cmd_id, fill_price) items pending TP/SL rebase
 _rebase_queue: list = []
 _rebase_lock  = threading.Lock()
@@ -187,6 +193,12 @@ def _now_utc() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _minutes_since(iso_ts: str) -> float:
+    """Minutes elapsed since an ISO UTC timestamp in this codebase's standard format."""
+    then = datetime.strptime(iso_ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - then).total_seconds() / 60
+
+
 def _is_shutdown(db_path) -> bool:
     with get_db(db_path) as con:
         val = get_system_state(con, "SESSION")
@@ -310,8 +322,20 @@ def poll_fills(ibc: IBClient, db_path) -> int:
         ib_info = ib_status_by_oid.get(entry_oid)
 
         if ib_info is None:
-            # Order not in IB's trade list at all — may have been silently dropped.
-            # Don't flip status here; wait for an explicit cancel event.
+            # Order not in IB's trade list at all. Could just be a brand-new
+            # order that hasn't synced into ibc.paper.trades() yet (normal,
+            # transient) -- but if it's been this long with no match, IB has
+            # no record of it (order ID aged out of the session cache, or it
+            # was lost some other way) and it will never resolve on its own.
+            age_min = _minutes_since(cmd["updated_at"])
+            if age_min > _STALE_SUBMITTED_MINUTES:
+                log.error(
+                    f"Command {cmd['id']} SUBMITTED {age_min:.0f}min ago, "
+                    f"ib_order_id={entry_oid} not found in IB trades — "
+                    "flagging RECONCILE_REQUIRED"
+                )
+                with get_db(db_path) as con:
+                    update_command_status(con, cmd["id"], "RECONCILE_REQUIRED")
             continue
 
         ib_status, fill_price = ib_info
@@ -595,6 +619,75 @@ def replenish_if_enabled(ibc: IBClient, db_path, cfg) -> int:
     return spawned
 
 
+def reconcile_naked_positions(ibc: IBClient, cfg) -> None:
+    """
+    Startup-only safety check (2026-07-20 incident): if broker was offline
+    while a position's TP/SL got cancelled or otherwise dropped, there is
+    normally no code path that would ever notice — poll_fills/poll_tp_sl_fills
+    only look at commands broker itself is actively tracking through a fill,
+    not at "does every currently-open IB position still have cover." Any
+    symbol with a non-zero IB position and zero resting orders gets a single
+    emergency protective stop, sized to the full position.
+
+    Price is taken fresh from get_price() (real quoted price via LIVE market
+    data), never from Position.avgCost — avgCost is multiplier-scaled for
+    futures (e.g. M2K x5, MNQ x2) and using it directly for an order price
+    is exactly the mistake that turned an intended resting stop into an
+    instant-fill market order during the 2026-07-20 incident.
+    """
+    try:
+        positions = [p for p in ibc.get_positions() if p.position != 0]
+    except Exception as e:
+        log.error(f"reconcile_naked_positions: could not fetch positions: {e}")
+        return
+    if not positions:
+        return
+
+    try:
+        protected_symbols = {t.contract.symbol for t in ibc.paper.openTrades()}
+    except Exception as e:
+        log.error(f"reconcile_naked_positions: could not fetch open orders: {e}")
+        return
+
+    bracket_pts = cfg.orders.active_brackets[0]
+
+    for pos in positions:
+        sym = pos.contract.symbol
+        if sym in protected_symbols:
+            continue
+
+        qty = abs(pos.position)
+        tick = _TICK_BY_SYMBOL.get(sym, 0.25)
+        log.error(
+            f"RECONCILE: {sym} has a naked position ({pos.position:+.0f} contracts, "
+            f"no resting protective order) — placing emergency stop"
+        )
+        try:
+            contract = ibc.get_contract(sym)
+            price = ibc.get_price(sym, contract=contract)
+        except Exception as e:
+            log.error(f"RECONCILE: could not price {sym}, skipping: {e}")
+            continue
+
+        if pos.position > 0:  # LONG -> protective SELL stop below market
+            sl_price = round_tick(price - bracket_pts, tick)
+            action = "SELL"
+        else:  # SHORT -> protective BUY stop above market
+            sl_price = round_tick(price + bracket_pts, tick)
+            action = "BUY"
+
+        from ib_insync import StopOrder
+        sl = StopOrder(action, qty, sl_price, tif="GTC")
+        try:
+            trade = ibc.paper.placeOrder(contract, sl)
+            log.error(
+                f"RECONCILE: {sym} emergency stop placed — orderId={trade.order.orderId} "
+                f"{action} qty={qty} @ {sl_price} (market was {price})"
+            )
+        except Exception as e:
+            log.error(f"RECONCILE: failed to place emergency stop for {sym}: {e}")
+
+
 def run_broker(db_path=None, dry_run: bool = False):
     """Main broker loop."""
     cfg = get_config()
@@ -625,6 +718,11 @@ def run_broker(db_path=None, dry_run: bool = False):
         sys.exit(1)
 
     register_ib_events(ibc, db_path)
+
+    try:
+        reconcile_naked_positions(ibc, cfg)
+    except Exception as e:
+        log.error(f"reconcile_naked_positions failed (continuing startup): {e}")
 
     poll_seconds     = cfg.broker.command_poll_seconds
     ib_poll_seconds  = cfg.broker.ib_poll_seconds
