@@ -1319,7 +1319,7 @@ body.busy-wait #busy-overlay{display:flex;}
     <span class="price-chip bg-secondary" id="chip-M2K">M2K —</span>
     <span class="text-muted ms-1" style="font-size:.75rem">Trading Dashboard</span>
     <span class="badge bg-info text-dark">:5003</span>
-    <span class="badge bg-secondary">v4.23</span>
+    <span class="badge bg-secondary">v4.24</span>
   </div>
 </div>
 
@@ -1719,7 +1719,7 @@ body.busy-wait #busy-overlay{display:flex;}
       <label class="mb-0"><input type="checkbox" id="all-pair-MES_MYM" checked onchange="_plotAllDiff()"> MES&minus;MYM</label>
       <label class="mb-0"><input type="checkbox" id="all-pair-MES_M2K" checked onchange="_plotAllDiff()"> MES&minus;M2K</label>
       <label class="mb-0"><input type="checkbox" id="all-pair-MYM_M2K" checked onchange="_plotAllDiff()"> MYM&minus;M2K</label>
-      <span class="ms-auto" style="font-size:.7rem" id="all-diff-note">Dotted = &plusmn;2&sigma; for the loaded period</span>
+      <span class="ms-auto" style="font-size:.7rem" id="all-diff-note">Lines are de-meaned (own avg over loaded period = 0). Dotted = &plusmn;2&sigma;</span>
     </div>
     <div id="chart-all-diff" style="height:285px;background:#1a1a2e;border-radius:4px"></div>
   </div>
@@ -2719,35 +2719,43 @@ async function _loadOverlayAll(reqDate,forcedRange){
   }
   await _plotAllDiff(forcedRange);
 
-  // Zoom handling, wired on both panels:
-  //  1. Auto-refine (Auto button on): re-fetch at a finer interval sized to
-  //     the new visible window, debounced, so zooming in reveals more bars.
-  //  2. Keep both panels' x-range in sync either way, since they're two
-  //     independent Plotly figures (not subplots) sharing one time axis.
-  // _allSyncingZoom guards against the mirrored relayout re-triggering itself.
+  // Zoom handling, wired on both panels — mirror is shared with Long View
+  // (_wireAllZoomMirror below); auto-refine is specific to the tick-CSV
+  // interval ladder so it's passed in as a callback rather than baked into
+  // the shared mirror function.
   const diffEl=document.getElementById('chart-all-diff');
-  const wireZoom=(srcEl,mirrorEl)=>{
-    srcEl.removeAllListeners?.('plotly_relayout');
-    srcEl.on('plotly_relayout',(ev)=>{
-      if(_allSyncingZoom){_allSyncingZoom=false;return;}
-      const x0=ev['xaxis.range[0]'], x1=ev['xaxis.range[1]'];
-      if(x0===undefined||x1===undefined)return;  // pan/autorange/other relayout, not a zoom range
-      _allSyncingZoom=true;
-      Plotly.relayout(mirrorEl,{'xaxis.range':[x0,x1]});
-      if(!_allAutoZoom)return;
-      clearTimeout(_allZoomTimer);
-      _allZoomTimer=setTimeout(()=>{
-        const windowSec=(new Date(x1)-new Date(x0))/1000;
-        const next=_allIntervalForWindow(windowSec);
-        if(next===_allInterval)return;
-        _allInterval=next;
-        _syncAllIntervalBtn();
-        _loadOverlayAll(reqDate,[x0,x1]);
-      },400);
-    });
+  const onZoomSettled=(x0,x1)=>{
+    if(!_allAutoZoom)return;
+    clearTimeout(_allZoomTimer);
+    _allZoomTimer=setTimeout(()=>{
+      const windowSec=(new Date(x1)-new Date(x0))/1000;
+      const next=_allIntervalForWindow(windowSec);
+      if(next===_allInterval)return;
+      _allInterval=next;
+      _syncAllIntervalBtn();
+      _loadOverlayAll(reqDate,[x0,x1]);
+    },400);
   };
-  wireZoom(el,diffEl);
-  wireZoom(diffEl,el);
+  _wireAllZoomMirror(el,diffEl,onZoomSettled);
+  _wireAllZoomMirror(diffEl,el,onZoomSettled);
+}
+
+// Mirrors zoom between the overlay and diff charts, since they're two
+// independent Plotly figures (not subplots) sharing one time axis rather
+// than a single figure with linked axes. _allSyncingZoom guards against the
+// mirrored relayout re-triggering itself (infinite ping-pong). onZoomSettled
+// is optional — short-range passes the interval auto-refine logic; Long
+// View just wants the mirror with no reload behavior attached.
+function _wireAllZoomMirror(srcEl, mirrorEl, onZoomSettled){
+  srcEl.removeAllListeners?.('plotly_relayout');
+  srcEl.on('plotly_relayout',(ev)=>{
+    if(_allSyncingZoom){_allSyncingZoom=false;return;}
+    const x0=ev['xaxis.range[0]'], x1=ev['xaxis.range[1]'];
+    if(x0===undefined||x1===undefined)return;  // pan/autorange/other relayout, not a zoom range
+    _allSyncingZoom=true;
+    Plotly.relayout(mirrorEl,{'xaxis.range':[x0,x1]});
+    if(onZoomSettled) onZoomSettled(x0,x1);
+  });
 }
 
 async function _plotAllDiff(forcedRange){
@@ -2769,14 +2777,21 @@ async function _plotAllDiff(forcedRange){
     if(!d)continue;
     const col=ALL_PAIR_COLORS[key];
     const label=`${a}−${b}`;
-    traces.push({name:label,type:'scatter',mode:'lines',x:d.x,y:d.y,
+    // De-meaned: each pair centers on its own average over the loaded window,
+    // so all 3 sit around zero regardless of absolute drift level (e.g. a
+    // pair that drifted -14% over a year no longer visually dwarfs one that
+    // stayed near 0) -- the +-2sigma band is the residual wobble around that.
+    // Note this deliberately hides the absolute drift direction/magnitude;
+    // that's the explicit tradeoff that was asked for.
+    const yDemeaned = d.y.map(v=>Math.round((v-d.mean)*100)/100);
+    traces.push({name:label,type:'scatter',mode:'lines',x:d.x,y:yDemeaned,
       line:{color:col,width:1.5},
-      hovertemplate:`<b>${label}</b><br>%{x}<br>%{y} ${unitLabel}<extra></extra>`});
+      hovertemplate:`<b>${label}</b><br>%{x}<br>%{y} ${unitLabel} (vs own avg)<extra></extra>`});
     traces.push({name:label+' +2σ',type:'scatter',mode:'lines',x:[d.x[0],d.x[d.x.length-1]],
-      y:[d.mean+2*d.std,d.mean+2*d.std],line:{color:col,width:1,dash:'dot'},
+      y:[2*d.std,2*d.std],line:{color:col,width:1,dash:'dot'},
       opacity:.6,hoverinfo:'skip',showlegend:false});
     traces.push({name:label+' -2σ',type:'scatter',mode:'lines',x:[d.x[0],d.x[d.x.length-1]],
-      y:[d.mean-2*d.std,d.mean-2*d.std],line:{color:col,width:1,dash:'dot'},
+      y:[-2*d.std,-2*d.std],line:{color:col,width:1,dash:'dot'},
       opacity:.6,hoverinfo:'skip',showlegend:false});
   }
   if(!traces.length){el.innerHTML='<div class="d-flex align-items-center justify-content-center h-100 text-muted small">No pairs selected</div>';return;}
@@ -3209,6 +3224,12 @@ async function _loadLongOverlay(){
     _allDiffCache[key]={x:xs,y:ys,mean,std};
   }
   await _plotAllDiff();
+
+  // Same zoom mirror as short-range (no auto-refine ladder here — Long View's
+  // resolution buttons cover that role instead).
+  const diffEl=document.getElementById('chart-all-diff');
+  _wireAllZoomMirror(el,diffEl);
+  _wireAllZoomMirror(diffEl,el);
 
   if(st)st.textContent=`Loaded ${_lvDays}d @ ${_lvRes}  ${new Date().toLocaleTimeString()}`;
 }
@@ -3796,6 +3817,21 @@ _RELEASE_NOTES = [
     ("v3.10", "Transpose bars mode — price on Y axis, ticks on X, lines align with other graphs", None),
     ("v3.11", "Fix Draw mode — remove !important, timed dblclick, robust _pixelToPrice fallback", None),
     ("v3.12", "Draw mode popup on dblclick — Support/Resistance color buttons, green/red lines", None),
+    ("v4.24", "All tab: diff lines de-meaned to zero; zoom-sync now covers Long View too",
+              "Follow-up on the year-view feedback: MES−MYM/MES−M2K/MYM−M2K each now subtract "
+              "their own mean over the loaded window, so all 3 pairs sit around zero regardless "
+              "of absolute drift level (e.g. a pair that drifted -14% over a year no longer "
+              "visually dwarfs one that stayed near 0). The Y-axis is not explicitly changed — "
+              "removing the mean shrinks the actual data range, so Plotly's existing autorange "
+              "is naturally far more sensitive without needing separate axis logic. The ±2σ band "
+              "is the residual wobble around that zero line. Trade-off, stated plainly: this "
+              "hides the absolute drift direction/magnitude a pair may have (that's what was "
+              "asked for — the earlier alternative of per-pair Y-axes, which would have kept "
+              "drift visible, was not what got picked). "
+              "Also extracted the zoom-mirror between the overlay and diff charts into a shared "
+              "_wireAllZoomMirror() and wired it into Long View (Month+) too — previously only "
+              "Reset Zoom was unified across both view modes (v4.22); drag-to-zoom sync between "
+              "upper/lower panels was still short-range-only until now."),
     ("v4.23", "broker.py: naked-position reconciliation on startup; fix commands stuck forever",
               "2026-07-20 incident follow-up. Broker/decider were externally terminated (not a "
               "code crash) while a large order-rejection storm was in flight; on restart, two "
