@@ -963,6 +963,26 @@ def api_bars_long():
                 return jsonify({"error": "pair must be SYM_A-SYM_B"}), 400
             sa, sb = parts
 
+            if freq == "30min":
+                # Native bars_30m granularity -- read the precomputed,
+                # sanity-checked normalized diff straight from
+                # bars_30m_diffs_normalized (scripts/build_bars_diffs.py)
+                # instead of recomputing normalize+diff on every request.
+                df = _pd.read_sql(
+                    "SELECT ts, close_norm_a, close_norm_b, diff_norm FROM bars_30m_diffs_normalized "
+                    "WHERE pair=? AND ts>=? ORDER BY ts",
+                    con, params=(f"{sa}-{sb}", cutoff), parse_dates=["ts"]
+                )
+                if df.empty:
+                    return jsonify({"error": f"No precomputed diff data for {sa}-{sb}"}), 404
+                return jsonify({
+                    "pair": pair,
+                    "ts":     df["ts"].dt.strftime("%Y-%m-%dT%H:%M:%SZ").tolist(),
+                    "spread": df["diff_norm"].round(6).tolist(),
+                    "sym_a":  df["close_norm_a"].round(6).tolist(),
+                    "sym_b":  df["close_norm_b"].round(6).tolist(),
+                })
+
             def _load(sym):
                 df = _pd.read_sql(
                     "SELECT ts, close FROM bars_30m WHERE symbol=? AND ts>=? ORDER BY ts",
@@ -1319,7 +1339,7 @@ body.busy-wait #busy-overlay{display:flex;}
     <span class="price-chip bg-secondary" id="chip-M2K">M2K —</span>
     <span class="text-muted ms-1" style="font-size:.75rem">Trading Dashboard</span>
     <span class="badge bg-info text-dark">:5003</span>
-    <span class="badge bg-secondary">v4.24</span>
+    <span class="badge bg-secondary">v4.25</span>
   </div>
 </div>
 
@@ -2767,7 +2787,7 @@ async function _plotAllDiff(forcedRange){
     const cur=el._fullLayout?.xaxis?.range;
     if(cur) forcedRange=[...cur];
   }
-  const unitLabel = _allDiffUnit==='pct' ? '%' : 'ticks';
+  const unitLabel = _allDiffUnit==='pct' ? '%' : (_allDiffUnit==='norm' ? 'norm' : 'ticks');
   const traces=[];
   for(const [a,b] of ALL_PAIRS){
     const key=_pairKey(a,b);
@@ -3206,22 +3226,46 @@ async function _loadLongOverlay(){
     dragmode:'zoom',
   },{responsive:true,displayModeBar:false,scrollZoom:true});
 
-  // Same pairwise-diff treatment as short-range, just in % instead of ticks —
-  // reuses the same checkboxes and _plotAllDiff() renderer.
-  _allDiffUnit='pct';
-  _allDiffCache={};
-  for(const [a,b] of ALL_PAIRS){
-    const key=_pairKey(a,b);
-    if(!tsToPct[a]||!tsToPct[b]){_allDiffCache[key]=null;continue;}
-    const xs=[],ys=[];
-    for(const [t,pa] of tsToPct[a]){
-      if(!tsToPct[b].has(t))continue;
-      xs.push(t); ys.push(Math.round((pa-tsToPct[b].get(t))*100)/100);
+  // Pairwise-diff panel: at native 30m resolution, read the precomputed,
+  // sanity-checked diff_norm straight from bars_30m_diffs_normalized (via
+  // /api/bars-long?pair=...) instead of recomputing it client-side from the
+  // % overlay lines above. 1h/4h/1d have no precomputed table at that
+  // granularity, so they keep the original on-the-fly calc.
+  if(_lvRes==='30m'){
+    _allDiffUnit='norm';
+    _allDiffCache={};
+    let pairData;
+    try{
+      pairData=await Promise.all(ALL_PAIRS.map(([a,b])=>
+        fetch(`/api/bars-long?pair=${a}-${b}&days=${_lvDays}&resolution=30m`).then(r=>r.json())
+      ));
+    }catch(e){pairData=ALL_PAIRS.map(()=>({error:String(e)}));}
+    for(let i=0;i<ALL_PAIRS.length;i++){
+      const [a,b]=ALL_PAIRS[i], key=_pairKey(a,b), d=pairData[i];
+      if(d.error||!d.spread||d.spread.length<2){_allDiffCache[key]=null;continue;}
+      const ys=d.spread;
+      const mean=ys.reduce((s,v)=>s+v,0)/ys.length;
+      const std=Math.sqrt(ys.reduce((s,v)=>s+(v-mean)**2,0)/ys.length);
+      _allDiffCache[key]={x:d.ts,y:ys,mean,std};
     }
-    if(ys.length<2){_allDiffCache[key]=null;continue;}
-    const mean=ys.reduce((s,v)=>s+v,0)/ys.length;
-    const std=Math.sqrt(ys.reduce((s,v)=>s+(v-mean)**2,0)/ys.length);
-    _allDiffCache[key]={x:xs,y:ys,mean,std};
+  } else {
+    // Same pairwise-diff treatment as short-range, just in % instead of ticks —
+    // reuses the same checkboxes and _plotAllDiff() renderer.
+    _allDiffUnit='pct';
+    _allDiffCache={};
+    for(const [a,b] of ALL_PAIRS){
+      const key=_pairKey(a,b);
+      if(!tsToPct[a]||!tsToPct[b]){_allDiffCache[key]=null;continue;}
+      const xs=[],ys=[];
+      for(const [t,pa] of tsToPct[a]){
+        if(!tsToPct[b].has(t))continue;
+        xs.push(t); ys.push(Math.round((pa-tsToPct[b].get(t))*100)/100);
+      }
+      if(ys.length<2){_allDiffCache[key]=null;continue;}
+      const mean=ys.reduce((s,v)=>s+v,0)/ys.length;
+      const std=Math.sqrt(ys.reduce((s,v)=>s+(v-mean)**2,0)/ys.length);
+      _allDiffCache[key]={x:xs,y:ys,mean,std};
+    }
   }
   await _plotAllDiff();
 
@@ -3805,6 +3849,17 @@ document.getElementById('btn-test-tab').addEventListener('click',function(){
 # ── Release notes ─────────────────────────────────────────────────────────────
 
 _RELEASE_NOTES = [
+    ("v4.25", "Long View diff panel now reads bars_30m_diffs_normalized directly at 30m res",
+              "Follow-up to the new bars.db sanity-checked normalized/diff tables: /api/bars-long's "
+              "pair mode, at native 30m resolution, now serves close_norm_a/close_norm_b/diff_norm "
+              "straight from bars_30m_diffs_normalized instead of recomputing normalize-to-first-bar "
+              "+ diff on every request. _loadLongOverlay() fetches this per-pair via the pair= query "
+              "and feeds it straight into the existing _plotAllDiff() de-mean/±2σ renderer (unit "
+              "label becomes 'norm' instead of '%'). 1h/4h/1d have no precomputed table at that "
+              "granularity, so they're untouched — same on-the-fly %-change-from-first-bar calc as "
+              "before. The top overlay price lines (all resolutions) are also untouched: normalizing "
+              "them to the new fixed full-year 0-1 basis instead of %-change-in-visible-range would "
+              "make short windows look flat, so that view stays range-relative by design."),
     ("v3.0",  "Full dashboard redesign — Lines/Graph/Trades/Submitted tabs", None),
     ("v3.2",  "Fix day/sym nav, bars x-axis range, reset zoom squeeze", None),
     ("v3.3",  "All Symbols tab + nav/zoom/bars fixes", None),
