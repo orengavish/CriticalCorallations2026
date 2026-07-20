@@ -1319,7 +1319,7 @@ body.busy-wait #busy-overlay{display:flex;}
     <span class="price-chip bg-secondary" id="chip-M2K">M2K —</span>
     <span class="text-muted ms-1" style="font-size:.75rem">Trading Dashboard</span>
     <span class="badge bg-info text-dark">:5003</span>
-    <span class="badge bg-secondary">v4.21</span>
+    <span class="badge bg-secondary">v4.22</span>
   </div>
 </div>
 
@@ -1710,6 +1710,9 @@ body.busy-wait #busy-overlay{display:flex;}
   <!-- ── Shared overlay + diff panel: same visualization for every preset, just a -->
   <!-- different data source/span behind it (tick-CSV for Day/Week, bars.db beyond) -->
   <div id="chart-all-overlay-wrap" style="display:none">
+    <div class="d-flex align-items-center gap-2 mb-1">
+      <button class="btn btn-sm btn-outline-secondary py-0 px-2" style="font-size:.72rem" onclick="resetAllZoom()">&#8634; Reset Zoom</button>
+    </div>
     <div id="chart-all-overlay" style="height:285px;background:#1a1a2e;border-radius:4px"></div>
     <div class="d-flex align-items-center gap-3 my-1 small text-muted">
       <span>Pairs:</span>
@@ -2601,6 +2604,17 @@ function _syncAllIntervalBtn(){
 function toggleAllAutoZoom(){
   _allAutoZoom=!_allAutoZoom;
   document.getElementById('all-auto-btn').classList.toggle('active',_allAutoZoom);
+}
+
+// Resets both overlay charts to full-data view. Explicit on both divs rather
+// than relying on the zoom-sync mirror — autorange relayout events don't
+// carry the same 'xaxis.range[0]/[1]' keys that mirror listens for, and Long
+// View charts (Month+) aren't zoom-synced at all.
+function resetAllZoom(){
+  clearTimeout(_allZoomTimer);
+  for(const id of ['chart-all-overlay','chart-all-diff']){
+    try{ Plotly.relayout(id,{'xaxis.autorange':true}); }catch(e){}
+  }
 }
 
 function toggleAllOverlay(){
@@ -3782,6 +3796,11 @@ _RELEASE_NOTES = [
     ("v3.10", "Transpose bars mode — price on Y axis, ticks on X, lines align with other graphs", None),
     ("v3.11", "Fix Draw mode — remove !important, timed dblclick, robust _pixelToPrice fallback", None),
     ("v3.12", "Draw mode popup on dblclick — Support/Resistance color buttons, green/red lines", None),
+    ("v4.22", "All tab: Reset Zoom button for the overlay + diff charts",
+              "One button resets both charts to full-data autorange — explicit on both divs "
+              "rather than relying on the zoom-sync mirror between them, since an autorange "
+              "relayout doesn't carry the same range keys the mirror listens for, and Long View "
+              "(Month+) charts aren't zoom-synced at all."),
     ("v4.21", "All tab: Month+ now uses the exact same overlay+diff chart as Week, just longer",
               "Feedback after v4.20: Week looked right (one overlay chart, 3 colored lines) but "
               "Month/2mo/6mo/Year still showed the original 3-separate-charts-plus-3-pair-charts "
