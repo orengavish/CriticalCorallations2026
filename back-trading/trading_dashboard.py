@@ -985,108 +985,6 @@ def api_history(symbol: str):
                     "total_ticks": total_ticks})
 
 
-_BARS_DB = Path(r"C:\Projects\CriticalCorallations2026\trader\data\bars.db")
-
-_RESAMPLE_FREQ = {"30m": "30min", "1h": "1h", "4h": "4h", "1d": "1d"}
-
-@app.route("/api/bars-long")
-def api_bars_long():
-    """
-    GET /api/bars-long?symbol=MES&days=365&resolution=30m
-    GET /api/bars-long?pair=MES-MYM&days=90&resolution=1h
-    Reads from trader/data/bars.db (pre-backfilled by scripts/backfill_bars.py).
-    """
-    import sqlite3 as _sq
-    import pandas as _pd
-
-    if not _BARS_DB.exists():
-        return jsonify({"error": "bars.db not found — run scripts/backfill_bars.py first"}), 404
-
-    days       = min(int(request.args.get("days", 365)), 365)
-    resolution = request.args.get("resolution", "30m")
-    pair       = request.args.get("pair", "")
-    symbol     = request.args.get("symbol", "MES").upper()
-    freq       = _RESAMPLE_FREQ.get(resolution, "30min")
-
-    con = _sq.connect(f"file:{_BARS_DB}?mode=ro", uri=True)
-    try:
-        cutoff = (_pd.Timestamp.utcnow() - _pd.Timedelta(days=days)).isoformat()
-
-        if pair:
-            parts = pair.upper().split("-")
-            if len(parts) != 2:
-                return jsonify({"error": "pair must be SYM_A-SYM_B"}), 400
-            sa, sb = parts
-
-            if freq == "30min":
-                # Native bars_30m granularity -- read the precomputed,
-                # sanity-checked normalized diff straight from
-                # bars_30m_diffs_normalized (scripts/build_bars_diffs.py)
-                # instead of recomputing normalize+diff on every request.
-                df = _pd.read_sql(
-                    "SELECT ts, close_norm_a, close_norm_b, diff_norm FROM bars_30m_diffs_normalized "
-                    "WHERE pair=? AND ts>=? ORDER BY ts",
-                    con, params=(f"{sa}-{sb}", cutoff), parse_dates=["ts"]
-                )
-                if df.empty:
-                    return jsonify({"error": f"No precomputed diff data for {sa}-{sb}"}), 404
-                return jsonify({
-                    "pair": pair,
-                    "ts":     df["ts"].dt.strftime("%Y-%m-%dT%H:%M:%SZ").tolist(),
-                    "spread": df["diff_norm"].round(6).tolist(),
-                    "sym_a":  df["close_norm_a"].round(6).tolist(),
-                    "sym_b":  df["close_norm_b"].round(6).tolist(),
-                })
-
-            def _load(sym):
-                df = _pd.read_sql(
-                    "SELECT ts, close FROM bars_30m WHERE symbol=? AND ts>=? ORDER BY ts",
-                    con, params=(sym, cutoff), parse_dates=["ts"]
-                ).set_index("ts").rename(columns={"close": sym})
-                return df
-
-            merged = _load(sa).join(_load(sb), how="inner")
-            if merged.empty:
-                return jsonify({"error": f"No overlapping data for {sa}/{sb}"}), 404
-            if freq != "30min":
-                merged = merged.resample(freq).agg("last").dropna()
-            # normalise to first bar
-            merged[sa] = merged[sa] / merged[sa].iloc[0]
-            merged[sb] = merged[sb] / merged[sb].iloc[0]
-            spread = (merged[sa] - merged[sb]).round(6)
-            return jsonify({
-                "pair": pair,
-                "ts":     merged.index.strftime("%Y-%m-%dT%H:%M:%SZ").tolist(),
-                "spread": spread.tolist(),
-                "sym_a":  merged[sa].round(6).tolist(),
-                "sym_b":  merged[sb].round(6).tolist(),
-            })
-        else:
-            df = _pd.read_sql(
-                "SELECT ts, open, high, low, close, volume FROM bars_30m "
-                "WHERE symbol=? AND ts>=? ORDER BY ts",
-                con, params=(symbol, cutoff), parse_dates=["ts"]
-            ).set_index("ts")
-            if df.empty:
-                return jsonify({"error": f"No data for {symbol} — run backfill first"}), 404
-            if freq != "30min":
-                df = df.resample(freq).agg(
-                    {"open": "first", "high": "max", "low": "min",
-                     "close": "last", "volume": "sum"}
-                ).dropna()
-            return jsonify({
-                "symbol": symbol,
-                "ts":     df.index.strftime("%Y-%m-%dT%H:%M:%SZ").tolist(),
-                "open":   df["open"].round(4).tolist(),
-                "high":   df["high"].round(4).tolist(),
-                "low":    df["low"].round(4).tolist(),
-                "close":  df["close"].round(4).tolist(),
-                "volume": df["volume"].round(0).tolist(),
-            })
-    finally:
-        con.close()
-
-
 @app.route("/api/volume_profile/<symbol>")
 def api_volume_profile(symbol: str):
     req_date_str = request.args.get("date")
@@ -1588,8 +1486,8 @@ body:not(.busy-wait) .busy-strip{background:var(--gl-border)}
     <button class="rail-item" data-group="correlation"><span class="ico">&#9678;</span><span class="lbl">Correlation</span></button>
     <button class="rail-item" data-group="algolab"><span class="ico">&#9879;</span><span class="lbl">Algo Lab</span></button>
     <button class="rail-item" data-group="trading"><span class="ico">&#9635;</span><span class="lbl">Trading</span></button>
-    <div class="rail-spacer"></div>
     <a class="rail-item" id="rail-link-geva" target="_blank"><span class="ico">&#128279;</span><span class="lbl">Geva Extract</span></a>
+    <div class="rail-spacer"></div>
   </nav>
 
   <div class="main-col">
@@ -1597,7 +1495,7 @@ body:not(.busy-wait) .busy-strip{background:var(--gl-border)}
     <!-- Header -->
     <div class="app-header">
       <span class="brand">Galao</span>
-      <span class="verchip">v5.02</span>
+      <span class="verchip">v5.03</span>
       <span class="gl-pill" id="session-broker-badge" style="color:var(--gl-muted)">Broker: —</span>
       <span class="gl-pill" id="session-decider-badge" style="color:var(--gl-muted)">Decider: —</span>
       <span class="text-muted" id="session-uptime" style="font-size:.7rem;min-width:3.5em"></span>
@@ -1622,11 +1520,11 @@ body:not(.busy-wait) .busy-strip{background:var(--gl-border)}
         <li class="nav-item" data-group="levels"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-lines" id="btn-lines-tab">Lines</button></li>
         <li class="nav-item" data-group="levels"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-sandbox" id="btn-sandbox-tab">Sandbox</button></li>
         <li class="nav-item" data-group="levels"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-trades" id="btn-trades-tab">Create Trades</button></li>
-        <li class="nav-item" data-group="charts"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-srviz" id="btn-srviz-tab">Sup/Res Viz</button></li>
         <li class="nav-item" data-group="correlation"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-correlation" id="btn-correlation-tab">Correlation</button></li>
         <li class="nav-item" data-group="charts"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-graph" id="btn-graph-tab">Graph</button></li>
         <li class="nav-item" data-group="charts"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-all" id="btn-all-tab">All</button></li>
         <li class="nav-item" data-group="charts"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-test" id="btn-test-tab">Test</button></li>
+        <li class="nav-item" data-group="charts"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-srviz" id="btn-srviz-tab">Sup/Res Viz</button></li>
         <li class="nav-item" data-group="algolab"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-algolab-grid" id="btn-algolab-grid-tab">Grid &amp; Submit</button></li>
         <li class="nav-item" data-group="algolab"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-algolab-pnl" id="btn-algolab-pnl-tab">P&amp;L Breakdown</button></li>
         <li class="nav-item" data-group="trading"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-submitted" id="btn-sub-tab">Submitted</button></li>
@@ -1754,43 +1652,43 @@ body:not(.busy-wait) .busy-strip{background:var(--gl-border)}
     <a href="#" class="text-muted ms-1 me-2" style="font-size:.75rem" onclick="setAllAlgos(false);return false">Clear</a>
     <span class="vr me-2"></span>
     <span class="text-muted me-1">OHLC:</span>
-    <label class="me-1"><input class="form-check-input algo-chk" type="checkbox" value="PDH" checked> PDH</label>
-    <label class="me-1"><input class="form-check-input algo-chk" type="checkbox" value="PDL" checked> PDL</label>
-    <label class="me-1"><input class="form-check-input algo-chk" type="checkbox" value="PDC" checked> PDC</label>
-    <label class="me-2"><input class="form-check-input algo-chk" type="checkbox" value="PDO" checked> PDO</label>
+    <label class="me-1" title="Previous Day High — max price across the full prior session"><input class="form-check-input algo-chk" type="checkbox" value="PDH" checked> PDH</label>
+    <label class="me-1" title="Previous Day Low — min price across the full prior session"><input class="form-check-input algo-chk" type="checkbox" value="PDL" checked> PDL</label>
+    <label class="me-1" title="Previous Day Close — prior session's final RTH price"><input class="form-check-input algo-chk" type="checkbox" value="PDC" checked> PDC</label>
+    <label class="me-2" title="Previous Day Open — prior session's first RTH price"><input class="form-check-input algo-chk" type="checkbox" value="PDO" checked> PDO</label>
     <span class="vr me-2"></span>
     <span class="text-muted me-1">Pivot:</span>
-    <label class="me-1"><input class="form-check-input algo-chk" type="checkbox" value="PIVOT_P" checked> P</label>
-    <label class="me-1"><input class="form-check-input algo-chk" type="checkbox" value="PIVOT_R1" checked> R1</label>
-    <label class="me-1"><input class="form-check-input algo-chk" type="checkbox" value="PIVOT_S1" checked> S1</label>
-    <label class="me-1"><input class="form-check-input algo-chk" type="checkbox" value="PIVOT_R2" checked> R2</label>
-    <label class="me-1"><input class="form-check-input algo-chk" type="checkbox" value="PIVOT_S2" checked> S2</label>
-    <label class="me-1"><input class="form-check-input algo-chk" type="checkbox" value="PIVOT_R3" checked> R3</label>
-    <label class="me-2"><input class="form-check-input algo-chk" type="checkbox" value="PIVOT_S3" checked> S3</label>
+    <label class="me-1" title="Pivot Point = (H+L+C)/3 of the prior RTH session"><input class="form-check-input algo-chk" type="checkbox" value="PIVOT_P" checked> P</label>
+    <label class="me-1" title="R1 = 2xP - L"><input class="form-check-input algo-chk" type="checkbox" value="PIVOT_R1" checked> R1</label>
+    <label class="me-1" title="S1 = 2xP - H"><input class="form-check-input algo-chk" type="checkbox" value="PIVOT_S1" checked> S1</label>
+    <label class="me-1" title="R2 = P + (H-L)"><input class="form-check-input algo-chk" type="checkbox" value="PIVOT_R2" checked> R2</label>
+    <label class="me-1" title="S2 = P - (H-L)"><input class="form-check-input algo-chk" type="checkbox" value="PIVOT_S2" checked> S2</label>
+    <label class="me-1" title="R3 = H + 2x(P-L)"><input class="form-check-input algo-chk" type="checkbox" value="PIVOT_R3" checked> R3</label>
+    <label class="me-2" title="S3 = L - 2x(H-P)"><input class="form-check-input algo-chk" type="checkbox" value="PIVOT_S3" checked> S3</label>
     <span class="vr me-2"></span>
     <span class="text-muted me-1">Overnight:</span>
-    <label class="me-1"><input class="form-check-input algo-chk" type="checkbox" value="OVERNIGHT_H" checked> ONH</label>
-    <label class="me-2"><input class="form-check-input algo-chk" type="checkbox" value="OVERNIGHT_L" checked> ONL</label>
+    <label class="me-1" title="Overnight High = max(Globex session, 17:00-09:30 CT)"><input class="form-check-input algo-chk" type="checkbox" value="OVERNIGHT_H" checked> ONH</label>
+    <label class="me-2" title="Overnight Low = min(Globex session, 17:00-09:30 CT)"><input class="form-check-input algo-chk" type="checkbox" value="OVERNIGHT_L" checked> ONL</label>
     <span class="vr me-2"></span>
     <span class="text-muted me-1">ORB:</span>
-    <label class="me-1"><input class="form-check-input algo-chk" type="checkbox" value="ORB15_H" checked> 15H</label>
-    <label class="me-1"><input class="form-check-input algo-chk" type="checkbox" value="ORB15_L" checked> 15L</label>
-    <label class="me-1"><input class="form-check-input algo-chk" type="checkbox" value="ORB30_H" checked> 30H</label>
-    <label class="me-2"><input class="form-check-input algo-chk" type="checkbox" value="ORB30_L" checked> 30L</label>
+    <label class="me-1" title="Opening Range Breakout: high of the first 15 min of RTH (09:30-09:45 CT)"><input class="form-check-input algo-chk" type="checkbox" value="ORB15_H" checked> 15H</label>
+    <label class="me-1" title="Opening Range Breakout: low of the first 15 min of RTH (09:30-09:45 CT)"><input class="form-check-input algo-chk" type="checkbox" value="ORB15_L" checked> 15L</label>
+    <label class="me-1" title="Opening Range Breakout: high of the first 30 min of RTH (09:30-10:00 CT)"><input class="form-check-input algo-chk" type="checkbox" value="ORB30_H" checked> 30H</label>
+    <label class="me-2" title="Opening Range Breakout: low of the first 30 min of RTH (09:30-10:00 CT)"><input class="form-check-input algo-chk" type="checkbox" value="ORB30_L" checked> 30L</label>
     <span class="vr me-2"></span>
-    <label class="me-2"><input class="form-check-input algo-chk" type="checkbox" value="VWAP" checked> VWAP</label>
+    <label class="me-2" title="Equal-weighted arithmetic mean of RTH tick prices (not true volume-weighted, despite the name)"><input class="form-check-input algo-chk" type="checkbox" value="VWAP" checked> VWAP</label>
     <span class="vr me-2"></span>
     <span class="text-muted me-1">Vol:</span>
-    <label class="me-1"><input class="form-check-input algo-chk" type="checkbox" value="POC" checked> POC</label>
-    <label class="me-1"><input class="form-check-input algo-chk" type="checkbox" value="VAH" checked> VAH</label>
-    <label class="me-2"><input class="form-check-input algo-chk" type="checkbox" value="VAL" checked> VAL</label>
+    <label class="me-1" title="Point of Control — the price with the most RTH tick volume (mode of the tick histogram)"><input class="form-check-input algo-chk" type="checkbox" value="POC" checked> POC</label>
+    <label class="me-1" title="Value Area High — top of the price range containing 70% of RTH tick volume, centered on POC"><input class="form-check-input algo-chk" type="checkbox" value="VAH" checked> VAH</label>
+    <label class="me-2" title="Value Area Low — bottom of the price range containing 70% of RTH tick volume, centered on POC"><input class="form-check-input algo-chk" type="checkbox" value="VAL" checked> VAL</label>
     <span class="vr me-2"></span>
     <span class="text-muted me-1">Round:</span>
-    <label class="me-1"><input class="form-check-input algo-chk" type="checkbox" value="ROUND_BIG" checked> Big</label>
-    <label class="me-1"><input class="form-check-input algo-chk" type="checkbox" value="ROUND_MED" checked> Med</label>
-    <label class="me-2"><input class="form-check-input algo-chk" type="checkbox" value="ROUND_SML"> Sml</label>
+    <label class="me-1" title="Major round-number levels (MES/M2K: every 100pts, MNQ/MYM: every 1000pts)"><input class="form-check-input algo-chk" type="checkbox" value="ROUND_BIG" checked> Big</label>
+    <label class="me-1" title="Medium round-number levels (MES/M2K: every 50pts, MNQ/MYM: every 500pts)"><input class="form-check-input algo-chk" type="checkbox" value="ROUND_MED" checked> Med</label>
+    <label class="me-2" title="Minor round-number levels (MES/M2K: every 25pts, MNQ/MYM: every 100pts)"><input class="form-check-input algo-chk" type="checkbox" value="ROUND_SML"> Sml</label>
     <span class="vr me-2"></span>
-    <label><input class="form-check-input algo-chk" type="checkbox" value="MANUAL" checked> Manual</label>
+    <label title="Lines you added yourself via the Add Line form below, or previously submitted manual trades"><input class="form-check-input algo-chk" type="checkbox" value="MANUAL" checked> Manual</label>
   </div>
   <!-- Merge + strength + refresh -->
   <div class="d-flex gap-3 align-items-center mb-2 flex-wrap">
@@ -2029,73 +1927,34 @@ body:not(.busy-wait) .busy-strip{background:var(--gl-border)}
 
 <!-- ══════════════════════ ALL SYMBOLS ══════════════════════ -->
 <div class="tab-pane fade" id="tab-all">
-  <!-- ── Unified range preset: Day/Week -> short-range tick charts; Month+ -> Long View bars ── -->
+  <!-- ── Range preset: tick-CSV data only, capped at 2 weeks (roughly all the ── -->
+  <!-- tick history reliably covers -- see /api/history's own days<=10 clamp)  -->
   <div class="d-flex align-items-center gap-2 mb-2 flex-wrap">
     <div class="btn-group btn-group-sm" id="all-preset-group">
       <button class="btn btn-outline-light active" data-preset="day"   onclick="setAllPreset('day')">Day</button>
       <button class="btn btn-outline-light"        data-preset="week"  onclick="setAllPreset('week')">Week</button>
-      <button class="btn btn-outline-light"        data-preset="month" onclick="setAllPreset('month')">Month</button>
-      <button class="btn btn-outline-light"        data-preset="2mo"   onclick="setAllPreset('2mo')">2mo</button>
-      <button class="btn btn-outline-light"        data-preset="6mo"   onclick="setAllPreset('6mo')">6mo</button>
-      <button class="btn btn-outline-light"        data-preset="year"  onclick="setAllPreset('year')">Year</button>
+      <button class="btn btn-outline-light"        data-preset="2week" onclick="setAllPreset('2week')">2 Week</button>
     </div>
     <span id="all-preset-note" class="small text-muted"></span>
   </div>
 
-  <!-- ── Short range (Day/Week) controls: tick-CSV based, fine intraday detail ── -->
-  <div id="all-shortrange">
-    <div class="d-flex align-items-center gap-2 mb-2 flex-wrap">
-      <div class="btn-group btn-group-sm" role="group" id="all-interval-group">
-        <button class="btn btn-outline-secondary" onclick="setAllInterval(0.5,this)">30s</button>
-        <button class="btn btn-outline-secondary" onclick="setAllInterval(1,this)">1m</button>
-        <button id="btn-all-int-5" class="btn btn-outline-secondary active" onclick="setAllInterval(5,this)">5m</button>
-        <button class="btn btn-outline-secondary" onclick="setAllInterval(15,this)">15m</button>
-        <button class="btn btn-outline-secondary" onclick="setAllInterval(30,this)">30m</button>
-      </div>
-      <span class="vr"></span>
-      <button class="btn btn-sm btn-outline-secondary px-2" onclick="navAllDay(-1)">&#9664;D</button>
-      <span id="all-day-info" class="small text-muted px-1" style="min-width:100px;text-align:center">&#8212;</span>
-      <button class="btn btn-sm btn-outline-secondary px-2" onclick="navAllDay(1)">D&#9654;</button>
-      <span class="vr"></span>
-      <button class="btn btn-sm btn-outline-info" id="all-overlay-btn" onclick="toggleAllOverlay()" style="display:none">&#8853; Overlay</button>
-      <button class="btn btn-sm btn-outline-warning active" id="all-auto-btn" onclick="toggleAllAutoZoom()"
-              title="Auto-refine bar resolution when you zoom the overlay chart">&#9889; Auto</button>
+  <div class="d-flex align-items-center gap-2 mb-2 flex-wrap">
+    <div class="btn-group btn-group-sm" role="group" id="all-interval-group">
+      <button class="btn btn-outline-secondary" onclick="setAllInterval(0.5,this)">30s</button>
+      <button class="btn btn-outline-secondary" onclick="setAllInterval(1,this)">1m</button>
+      <button id="btn-all-int-5" class="btn btn-outline-secondary active" onclick="setAllInterval(5,this)">5m</button>
+      <button class="btn btn-outline-secondary" onclick="setAllInterval(15,this)">15m</button>
+      <button class="btn btn-outline-secondary" onclick="setAllInterval(30,this)">30m</button>
     </div>
+    <span class="vr"></span>
+    <button class="btn btn-sm btn-outline-secondary px-2" onclick="navAllDay(-1)">&#9664;D</button>
+    <span id="all-day-info" class="small text-muted px-1" style="min-width:100px;text-align:center">&#8212;</span>
+    <button class="btn btn-sm btn-outline-secondary px-2" onclick="navAllDay(1)">D&#9654;</button>
   </div>
-
-  <!-- ── Long View (Month/2mo/6mo/Year) controls: pre-backfilled 30-min bars, coarser ── -->
-  <div id="all-longview" style="display:none">
-    <div class="d-flex align-items-center gap-2 mb-2 flex-wrap">
-      <div class="btn-group btn-group-sm" id="lv-res-group">
-        <button class="btn btn-outline-secondary" data-res="30m" onclick="setLVRes('30m',this)">30m</button>
-        <button class="btn btn-outline-secondary" data-res="1h"  onclick="setLVRes('1h',this)">1h</button>
-        <button class="btn btn-outline-secondary" data-res="4h"  onclick="setLVRes('4h',this)">4h</button>
-        <button class="btn btn-outline-secondary" data-res="1d"  onclick="setLVRes('1d',this)">1d</button>
-      </div>
-      <span id="lv-status" class="small text-muted"></span>
-    </div>
-  </div>
-
-  <!-- ── Shared overlay + diff panel: same visualization for every preset, just a -->
-  <!-- different data source/span behind it (tick-CSV for Day/Week, bars.db beyond) -->
-  <div id="chart-all-overlay-wrap" style="display:none">
-    <div class="d-flex align-items-center gap-2 mb-1">
-      <button class="btn btn-sm btn-outline-secondary py-0 px-2" style="font-size:.72rem" onclick="resetAllZoom()">&#8634; Reset Zoom</button>
-      <span class="ms-2 small text-muted">Symbols:</span>
-      <label class="mb-0"><input type="checkbox" id="all-sym-MES" checked onchange="_plotAllOverlay()"> MES</label>
-      <label class="mb-0"><input type="checkbox" id="all-sym-MYM" checked onchange="_plotAllOverlay()"> MYM</label>
-      <label class="mb-0"><input type="checkbox" id="all-sym-M2K" checked onchange="_plotAllOverlay()"> M2K</label>
-    </div>
-    <div id="chart-all-overlay" style="height:285px;background:#1a1a2e;border-radius:4px"></div>
-    <div class="d-flex align-items-center gap-3 my-1 small text-muted">
-      <span>Pairs:</span>
-      <label class="mb-0"><input type="checkbox" id="all-pair-MES_MYM" checked onchange="_plotAllDiff()"> MES&minus;MYM</label>
-      <label class="mb-0"><input type="checkbox" id="all-pair-MES_M2K" checked onchange="_plotAllDiff()"> MES&minus;M2K</label>
-      <label class="mb-0"><input type="checkbox" id="all-pair-MYM_M2K" checked onchange="_plotAllDiff()"> MYM&minus;M2K</label>
-      <span class="ms-auto" style="font-size:.7rem" id="all-diff-note">Lines are de-meaned (own avg over loaded period = 0). Dotted = &plusmn;2&sigma;</span>
-    </div>
-    <div id="chart-all-diff" style="height:285px;background:#1a1a2e;border-radius:4px"></div>
-  </div>
+  <p class="text-muted small mb-2">
+    Hover a line on any chart for its detection method and price -- same critical S/R lines as
+    the Lines tab, color-coded by source, solid if armed.
+  </p>
   <div id="all-grid" class="row g-2">
     <div class="col-4">
       <div class="text-center small text-muted mb-1">MES</div>
@@ -2996,94 +2855,39 @@ document.getElementById('btn-graph-tab').addEventListener('click',function(){
 });
 
 // ── ALL SYMBOLS ───────────────────────────────────────────────────────────────
-let _allInterval=5, _allOverlay=false, _allAutoZoom=true, _allZoomTimer=null, _allDaysSpan=1;
-let _allPreset='day';
+let _allInterval=5, _allPreset='day', _allDaysSpan=1;
 
-// Day/Week -> short-range tick-CSV path (fine intraday detail, capped at 10
-// days since that's roughly all the tick data reliably covers). Month+ ->
-// Long View / bars.db path (pre-backfilled, coarser, actually goes back a
-// year). Each preset also picks a sensible default Long View resolution;
-// the resolution buttons stay as a user override on top of that default.
+// Tick-CSV only, capped at 2 weeks — /api/history's own days<=10 clamp is the
+// real limit here (roughly all the tick data reliably covers regardless of
+// what's requested). No overlay/diff mode, no bars.db Long View -- just the
+// per-symbol candlestick grid below, same as it always showed by default.
 const ALL_PRESETS={
-  day:   {days:1,   overlay:false, lvDays:null, lvRes:null},
-  week:  {days:5,   overlay:true,  lvDays:null, lvRes:null},
-  month: {days:null,overlay:null,  lvDays:30,   lvRes:'1h'},
-  '2mo': {days:null,overlay:null,  lvDays:60,   lvRes:'4h'},
-  '6mo': {days:null,overlay:null,  lvDays:180,  lvRes:'1d'},
-  year:  {days:null,overlay:null,  lvDays:365,  lvRes:'1d'},
+  day:    {days:1},
+  week:   {days:5},
+  '2week':{days:10},
 };
 const ALL_PRESET_NOTES={
-  day:   'Single trading day — fine intraday detail (tick data).',
-  week:  '~5 trading days, correlation overlay — tick data.',
-  month: '30 days @ hourly bars (pre-backfilled, updates via backfill_bars.py).',
-  '2mo': '60 days @ 4h bars.',
-  '6mo': '180 days @ daily bars.',
-  year:  '365 days @ daily bars.',
+  day:    'Single trading day — fine intraday detail (tick data).',
+  week:   '~5 trading days (tick data).',
+  '2week':'~10 trading days — as far back as tick history reliably covers (tick data).',
 };
+
+// Hides weekends + outside-RTH hours so a multi-day span isn't mostly blank gaps.
+const ALL_RANGEBREAKS=[
+  {pattern:'day of week', bounds:[6,1]},
+  {pattern:'hour', bounds:[16,9.5]},
+];
+const ALL_SYMS=['MES','MYM','M2K'];
 
 function setAllPreset(preset){
   const cfg=ALL_PRESETS[preset];
   if(!cfg)return;
   _allPreset=preset;
+  _allDaysSpan=cfg.days;
   document.querySelectorAll('#all-preset-group .btn').forEach(b=>
     b.classList.toggle('active', b.dataset.preset===preset));
   document.getElementById('all-preset-note').textContent=ALL_PRESET_NOTES[preset]||'';
-
-  const shortRange = (preset==='day' || preset==='week');
-  document.getElementById('all-shortrange').style.display = shortRange ? 'block' : 'none';
-  document.getElementById('all-longview').style.display   = shortRange ? 'none'  : 'block';
-  // Overlay is a user choice only for Day (grid vs correlation lines); Week and
-  // Month+ always show the overlay+diff panel, just fed by a different source.
-  document.getElementById('all-overlay-btn').style.display = (preset==='day') ? '' : 'none';
-
-  if(shortRange){
-    _allDaysSpan=cfg.days;
-    if(_allOverlay!==cfg.overlay){
-      // toggleAllOverlay() flips _allOverlay and reloads itself
-      toggleAllOverlay();
-    }else{
-      loadAllSymbols();
-    }
-  }else{
-    _lvDays=cfg.lvDays;
-    _lvRes=cfg.lvRes;
-    document.querySelectorAll('#lv-res-group .btn').forEach(b=>
-      b.classList.toggle('active', b.dataset.res===_lvRes));
-    document.getElementById('all-grid').style.display='none';
-    document.getElementById('chart-all-overlay-wrap').style.display='block';
-    _loadLongOverlay();
-  }
-}
-
-// Hides weekends + outside-RTH hours so a multi-day span isn't mostly blank gaps.
-// Long View bars aren't RTH-restricted (near-continuous futures session), so
-// only the weekend break applies there — the hour break would carve out real data.
-const ALL_RANGEBREAKS=[
-  {pattern:'day of week', bounds:[6,1]},
-  {pattern:'hour', bounds:[16,9.5]},
-];
-const ALL_RANGEBREAKS_LONG=[
-  {pattern:'day of week', bounds:[6,1]},
-];
-let _allDiffCache=null, _allSyncingZoom=false, _allDiffUnit='ticks';
-let _allOverlayCache=null, _allOverlayUnit='ticks', _allOverlayRangebreaks=null;
-const ALL_PAIRS=[['MES','MYM'],['MES','M2K'],['MYM','M2K']];
-const ALL_PAIR_COLORS={MES_MYM:'#E8A838',MES_M2K:'#9B59B6',MYM_M2K:'#17A2B8'};
-const ALL_SYMS=['MES','MYM','M2K'];
-const ALL_SYM_COLORS={MES:'#5B8DD9',MYM:'#32BA64',M2K:'#D25050'};
-
-// Auto-zoom bar resolution ladder: wider visible window -> coarser bars, so
-// zooming in always reveals more bars instead of the same handful stretched out.
-const _ALL_ZOOM_LADDER=[
-  {maxSec:4*3600, interval:30},
-  {maxSec:2*3600, interval:15},
-  {maxSec:40*60,  interval:5},
-  {maxSec:8*60,   interval:1},
-  {maxSec:0,      interval:0.5},
-];
-function _allIntervalForWindow(sec){
-  for(const {maxSec,interval} of _ALL_ZOOM_LADDER) if(sec>maxSec) return interval;
-  return 0.5;
+  loadAllSymbols();
 }
 
 function setAllInterval(v,btn){
@@ -3091,36 +2895,6 @@ function setAllInterval(v,btn){
   document.querySelectorAll('#all-interval-group .btn').forEach(b=>b.classList.remove('active'));
   if(btn)btn.classList.add('active');
   loadAllSymbols();
-}
-function _syncAllIntervalBtn(){
-  document.querySelectorAll('#all-interval-group .btn').forEach(b=>{
-    b.classList.toggle('active', parseFloat(b.getAttribute('onclick').match(/setAllInterval\(([\d.]+)/)[1])===_allInterval);
-  });
-}
-
-function toggleAllAutoZoom(){
-  _allAutoZoom=!_allAutoZoom;
-  document.getElementById('all-auto-btn').classList.toggle('active',_allAutoZoom);
-}
-
-// Resets both overlay charts to full-data view. Explicit on both divs rather
-// than relying on the zoom-sync mirror — autorange relayout events don't
-// carry the same 'xaxis.range[0]/[1]' keys that mirror listens for, and Long
-// View charts (Month+) aren't zoom-synced at all.
-function resetAllZoom(){
-  clearTimeout(_allZoomTimer);
-  for(const id of ['chart-all-overlay','chart-all-diff']){
-    try{ Plotly.relayout(id,{'xaxis.autorange':true}); }catch(e){}
-  }
-}
-
-function toggleAllOverlay(){
-  _allOverlay=!_allOverlay;
-  document.getElementById('all-overlay-btn').classList.toggle('active',_allOverlay);
-  document.getElementById('chart-all-overlay-wrap').style.display=_allOverlay?'block':'none';
-  document.getElementById('all-grid').style.display=_allOverlay?'none':'flex';
-  // Wait one frame so browser reflows the newly-visible div before Plotly queries its dimensions
-  requestAnimationFrame(()=>loadAllSymbols());
 }
 
 async function navAllDay(delta){
@@ -3143,196 +2917,15 @@ async function loadAllSymbols(){
     `${_graphDateIdx+1}/${_graphDates.length}  ${reqDate}`;
   _enterBusy();
   try{
-    if(_allOverlay) await _loadOverlayAll(reqDate);
-    else await Promise.all(['MES','MYM','M2K'].map(sym=>_loadOneSymAll(sym,reqDate)));
+    await Promise.all(ALL_SYMS.map(sym=>_loadOneSymAll(sym,reqDate)));
   }finally{_exitBusy();}
-}
-
-function _pairKey(a,b){return a+'_'+b;}
-
-async function _loadOverlayAll(reqDate,forcedRange){
-  const el=document.getElementById('chart-all-overlay');
-  let data;
-  try{
-    data=await Promise.all(ALL_SYMS.map(s=>
-      fetch(`/api/history/${s}?interval=${_allInterval}&date=${reqDate}&days=${_allDaysSpan}`).then(r=>r.json())
-    ));
-  }catch(e){el.innerHTML=`<div class="text-danger small p-2">${e}</div>`;return;}
-  const spanRange=(data.find(d=>d.date_range)||{}).date_range;
-  if(spanRange){
-    document.getElementById('all-day-info').textContent=
-      _allDaysSpan>1 ? `${spanRange[0]} → ${spanRange[1]}  (${_allDaysSpan}d)` : spanRange[1];
-  }
-
-  _allOverlayUnit='ticks';
-  _allOverlayCache={};
-  _allOverlayRangebreaks=_allDaysSpan>1 ? ALL_RANGEBREAKS : null;
-  const tsToY={};  // per-symbol map: timestamp -> ticks-from-open (for the diff panel below)
-  for(let i=0;i<ALL_SYMS.length;i++){
-    const sym=ALL_SYMS[i],bars=data[i].bars||[];
-    if(!bars.length)continue;
-    const base=bars[0].close??bars[0].open;
-    const tick=SB_TICKS[sym]||0.25;
-    const ys=bars.map(b=>Math.round((b.close-base)/tick));
-    tsToY[sym]=new Map(bars.map((b,j)=>[b.t,ys[j]]));
-    _allOverlayCache[sym]={x:bars.map(b=>b.t), y:ys};
-  }
-  if(!Object.keys(_allOverlayCache).length){el.innerHTML='<div class="d-flex align-items-center justify-content-center h-100 text-muted small">No data</div>';return;}
-  await _plotAllOverlay(forcedRange);
-
-  // Pairwise diffs for the opportunity panel below — only over timestamps
-  // present in BOTH symbols of a pair (a data gap in one shouldn't silently
-  // misalign the other). Session-wide mean/std gives a flat +-2sigma band:
-  // "what's normal scatter for this pair today."
-  _allDiffUnit='ticks';
-  _allDiffCache={};
-  for(const [a,b] of ALL_PAIRS){
-    const key=_pairKey(a,b);
-    if(!tsToY[a]||!tsToY[b]){_allDiffCache[key]=null;continue;}
-    const xs=[],ys=[];
-    for(const [t,ya] of tsToY[a]){
-      if(!tsToY[b].has(t))continue;
-      xs.push(t); ys.push(ya-tsToY[b].get(t));
-    }
-    if(ys.length<2){_allDiffCache[key]=null;continue;}
-    const mean=ys.reduce((s,v)=>s+v,0)/ys.length;
-    const std=Math.sqrt(ys.reduce((s,v)=>s+(v-mean)**2,0)/ys.length);
-    _allDiffCache[key]={x:xs,y:ys,mean,std};
-  }
-  await _plotAllDiff(forcedRange);
-
-  // Zoom handling, wired on both panels — mirror is shared with Long View
-  // (_wireAllZoomMirror below); auto-refine is specific to the tick-CSV
-  // interval ladder so it's passed in as a callback rather than baked into
-  // the shared mirror function.
-  const diffEl=document.getElementById('chart-all-diff');
-  const onZoomSettled=(x0,x1)=>{
-    if(!_allAutoZoom)return;
-    clearTimeout(_allZoomTimer);
-    _allZoomTimer=setTimeout(()=>{
-      const windowSec=(new Date(x1)-new Date(x0))/1000;
-      const next=_allIntervalForWindow(windowSec);
-      if(next===_allInterval)return;
-      _allInterval=next;
-      _syncAllIntervalBtn();
-      _loadOverlayAll(reqDate,[x0,x1]);
-    },400);
-  };
-  _wireAllZoomMirror(el,diffEl,onZoomSettled);
-  _wireAllZoomMirror(diffEl,el,onZoomSettled);
-}
-
-// Mirrors zoom between the overlay and diff charts, since they're two
-// independent Plotly figures (not subplots) sharing one time axis rather
-// than a single figure with linked axes. _allSyncingZoom guards against the
-// mirrored relayout re-triggering itself (infinite ping-pong). onZoomSettled
-// is optional — short-range passes the interval auto-refine logic; Long
-// View just wants the mirror with no reload behavior attached.
-function _wireAllZoomMirror(srcEl, mirrorEl, onZoomSettled){
-  srcEl.removeAllListeners?.('plotly_relayout');
-  srcEl.on('plotly_relayout',(ev)=>{
-    if(_allSyncingZoom){_allSyncingZoom=false;return;}
-    const x0=ev['xaxis.range[0]'], x1=ev['xaxis.range[1]'];
-    if(x0===undefined||x1===undefined)return;  // pan/autorange/other relayout, not a zoom range
-    _allSyncingZoom=true;
-    Plotly.relayout(mirrorEl,{'xaxis.range':[x0,x1]});
-    if(onZoomSettled) onZoomSettled(x0,x1);
-  });
-}
-
-async function _plotAllOverlay(forcedRange){
-  const el=document.getElementById('chart-all-overlay');
-  if(!_allOverlayCache){el.innerHTML='<div class="d-flex align-items-center justify-content-center h-100 text-muted small">No data</div>';return;}
-  // Preserve the current zoom on checkbox-toggle redraws, same as _plotAllDiff —
-  // and since only checked symbols' traces get passed to Plotly.newPlot below,
-  // the y-axis autorange (no explicit yaxis.range set) rescales to fit only
-  // those traces' valid points within the current x-window on every redraw.
-  if(!forcedRange){
-    const cur=el._fullLayout?.xaxis?.range;
-    if(cur) forcedRange=[...cur];
-  }
-  const unitLabel = _allOverlayUnit==='pct' ? '%' : 'ticks';
-  const traces=[];
-  for(const sym of ALL_SYMS){
-    const chk=document.getElementById('all-sym-'+sym);
-    if(chk&&!chk.checked)continue;
-    const d=_allOverlayCache[sym];
-    if(!d||!d.y||!d.y.length)continue;
-    traces.push({name:sym,type:'scatter',mode:'lines',x:d.x,y:d.y,
-      line:{color:ALL_SYM_COLORS[sym],width:1.5},
-      hovertemplate:`<b>${sym}</b><br>%{x}<br>%{y} ${unitLabel}<extra></extra>`});
-  }
-  if(!traces.length){el.innerHTML='<div class="d-flex align-items-center justify-content-center h-100 text-muted small">No symbols selected</div>';return;}
-  const xaxis={gridcolor:'#252535',zeroline:false,rangeslider:{visible:false}};
-  if(_allOverlayRangebreaks) xaxis.rangebreaks=_allOverlayRangebreaks;
-  if(forcedRange) xaxis.range=forcedRange;
-  await Plotly.newPlot(el,traces,{
-    paper_bgcolor:'#1a1a2e',plot_bgcolor:'#1a1a2e',
-    font:{color:'#ccc',size:10},margin:{t:8,b:20,l:50,r:8},
-    xaxis,
-    yaxis:{gridcolor:'#252535',zeroline:true,zerolinecolor:'#555',
-           title:_allOverlayUnit==='pct'?'% change':'Ticks from open'},
-    showlegend:true,legend:{x:0,y:1,bgcolor:'rgba(0,0,0,0)',font:{size:11}},
-    dragmode:'zoom',
-  },{responsive:true,displayModeBar:false,scrollZoom:true});
-}
-
-async function _plotAllDiff(forcedRange){
-  const el=document.getElementById('chart-all-diff');
-  if(!_allDiffCache){el.innerHTML='<div class="d-flex align-items-center justify-content-center h-100 text-muted small">No data</div>';return;}
-  // Preserve the current zoom on checkbox-toggle redraws (no explicit range passed) —
-  // otherwise ticking a pair on/off would silently reset the view to full-day.
-  if(!forcedRange){
-    const cur=el._fullLayout?.xaxis?.range;
-    if(cur) forcedRange=[...cur];
-  }
-  const unitLabel = _allDiffUnit==='pct' ? '%' : (_allDiffUnit==='norm' ? 'norm' : 'ticks');
-  const traces=[];
-  for(const [a,b] of ALL_PAIRS){
-    const key=_pairKey(a,b);
-    const chk=document.getElementById('all-pair-'+key);
-    if(chk&&!chk.checked)continue;
-    const d=_allDiffCache[key];
-    if(!d)continue;
-    const col=ALL_PAIR_COLORS[key];
-    const label=`${a}−${b}`;
-    // De-meaned: each pair centers on its own average over the loaded window,
-    // so all 3 sit around zero regardless of absolute drift level (e.g. a
-    // pair that drifted -14% over a year no longer visually dwarfs one that
-    // stayed near 0) -- the +-2sigma band is the residual wobble around that.
-    // Note this deliberately hides the absolute drift direction/magnitude;
-    // that's the explicit tradeoff that was asked for.
-    const yDemeaned = d.y.map(v=>Math.round((v-d.mean)*100)/100);
-    traces.push({name:label,type:'scatter',mode:'lines',x:d.x,y:yDemeaned,
-      line:{color:col,width:1.5},
-      hovertemplate:`<b>${label}</b><br>%{x}<br>%{y} ${unitLabel} (vs own avg)<extra></extra>`});
-    traces.push({name:label+' +2σ',type:'scatter',mode:'lines',x:[d.x[0],d.x[d.x.length-1]],
-      y:[2*d.std,2*d.std],line:{color:col,width:1,dash:'dot'},
-      opacity:.6,hoverinfo:'skip',showlegend:false});
-    traces.push({name:label+' -2σ',type:'scatter',mode:'lines',x:[d.x[0],d.x[d.x.length-1]],
-      y:[-2*d.std,-2*d.std],line:{color:col,width:1,dash:'dot'},
-      opacity:.6,hoverinfo:'skip',showlegend:false});
-  }
-  if(!traces.length){el.innerHTML='<div class="d-flex align-items-center justify-content-center h-100 text-muted small">No pairs selected</div>';return;}
-  const xaxis={gridcolor:'#252535',zeroline:false,rangeslider:{visible:false}};
-  if(_allPreset==='week')                      xaxis.rangebreaks=ALL_RANGEBREAKS;
-  else if(_allPreset!=='day')                  xaxis.rangebreaks=ALL_RANGEBREAKS_LONG;
-  if(forcedRange) xaxis.range=forcedRange;
-  await Plotly.newPlot(el,traces,{
-    paper_bgcolor:'#1a1a2e',plot_bgcolor:'#1a1a2e',
-    font:{color:'#ccc',size:10},margin:{t:8,b:30,l:50,r:8},
-    xaxis,
-    yaxis:{gridcolor:'#252535',zeroline:true,zerolinecolor:'#777',title:`Diff (${unitLabel})`},
-    showlegend:true,legend:{x:0,y:1,bgcolor:'rgba(0,0,0,0)',font:{size:11}},
-    dragmode:'zoom',
-  },{responsive:true,displayModeBar:false,scrollZoom:true});
 }
 
 async function _loadOneSymAll(sym,reqDate){
   const el=document.getElementById(`chart-all-${sym}`);
   try{
     const [hd,ld]=await Promise.all([
-      fetch(`/api/history/${sym}?interval=${_allInterval}&date=${reqDate}`).then(r=>r.json()),
+      fetch(`/api/history/${sym}?interval=${_allInterval}&date=${reqDate}&days=${_allDaysSpan}`).then(r=>r.json()),
       fetch(`/api/lines?symbol=${sym}&date=${reqDate}`).then(r=>r.json())
     ]);
     const bars=hd.bars||[];
@@ -3340,6 +2933,9 @@ async function _loadOneSymAll(sym,reqDate){
       Plotly.purge(el);
       el.innerHTML='<div class="d-flex align-items-center justify-content-center h-100 text-muted small">No data</div>';
       return;
+    }
+    if(hd.date_range && _allDaysSpan>1){
+      document.getElementById('all-day-info').textContent=`${hd.date_range[0]} → ${hd.date_range[1]}`;
     }
     const yLow=Math.min(...bars.map(b=>b.low));
     const yHigh=Math.max(...bars.map(b=>b.high));
@@ -3357,9 +2953,11 @@ async function _loadOneSymAll(sym,reqDate){
         hovertemplate:`<b>${l.algo_type}</b> ${l.price.toFixed(2)}<extra></extra>`,
         showlegend:false};
     });
+    const xaxis={rangeslider:{visible:false},gridcolor:'#333'};
+    if(_allDaysSpan>1) xaxis.rangebreaks=ALL_RANGEBREAKS;
     const layout={paper_bgcolor:'#1a1a2e',plot_bgcolor:'#1a1a2e',
       font:{color:'#ccc',size:9},margin:{l:50,r:5,t:5,b:30},
-      xaxis:{rangeslider:{visible:false},gridcolor:'#333'},
+      xaxis,
       yaxis:{range:[yLow-yPad,yHigh+yPad],gridcolor:'#333'},
       showlegend:false,dragmode:'zoom'};
     Plotly.newPlot(el,[candleTrace,...lineTraces],layout,{responsive:true,displayModeBar:false});
@@ -3672,98 +3270,6 @@ function toggleAutoRef(){
 }
 
 document.getElementById('btn-sub-tab').addEventListener('click',loadSubmitted);
-
-// ── Long View — same overlay+diff visualization as short-range, fed by bars.db ──
-let _lvRes='1h', _lvDays=180;
-
-function setLVRes(v,btn){
-  _lvRes=v;
-  document.querySelectorAll('#lv-res-group .btn').forEach(b=>b.classList.remove('active'));
-  btn.classList.add('active');
-  _loadLongOverlay();
-}
-
-async function _loadLongOverlay(){
-  const el=document.getElementById('chart-all-overlay');
-  const st=document.getElementById('lv-status');
-  if(st)st.textContent='Loading...';
-  let data;
-  try{
-    data=await Promise.all(ALL_SYMS.map(s=>
-      fetch(`/api/bars-long?symbol=${s}&days=${_lvDays}&resolution=${_lvRes}`).then(r=>r.json())
-    ));
-  }catch(e){el.innerHTML=`<div class="text-danger small p-2">${e}</div>`;return;}
-
-  _allOverlayUnit='pct';
-  _allOverlayCache={};
-  _allOverlayRangebreaks=ALL_RANGEBREAKS_LONG;
-  const tsToPct={};  // per-symbol map: timestamp -> % change from first bar
-  for(let i=0;i<ALL_SYMS.length;i++){
-    const sym=ALL_SYMS[i], d=data[i];
-    if(d.error||!d.close||!d.close.length)continue;
-    const base=d.close[0];
-    const pct=d.close.map(c=>Math.round(((c/base)-1)*10000)/100);
-    tsToPct[sym]=new Map(d.ts.map((t,j)=>[t,pct[j]]));
-    _allOverlayCache[sym]={x:d.ts,y:pct};
-  }
-  if(!Object.keys(_allOverlayCache).length){
-    el.innerHTML='<div class="d-flex align-items-center justify-content-center h-100 text-muted small">No data — run scripts/backfill_bars.py</div>';
-    if(st)st.textContent='';
-    return;
-  }
-  await _plotAllOverlay();
-
-  // Pairwise-diff panel: at native 30m resolution, read the precomputed,
-  // sanity-checked diff_norm straight from bars_30m_diffs_normalized (via
-  // /api/bars-long?pair=...) instead of recomputing it client-side from the
-  // % overlay lines above. 1h/4h/1d have no precomputed table at that
-  // granularity, so they keep the original on-the-fly calc.
-  if(_lvRes==='30m'){
-    _allDiffUnit='norm';
-    _allDiffCache={};
-    let pairData;
-    try{
-      pairData=await Promise.all(ALL_PAIRS.map(([a,b])=>
-        fetch(`/api/bars-long?pair=${a}-${b}&days=${_lvDays}&resolution=30m`).then(r=>r.json())
-      ));
-    }catch(e){pairData=ALL_PAIRS.map(()=>({error:String(e)}));}
-    for(let i=0;i<ALL_PAIRS.length;i++){
-      const [a,b]=ALL_PAIRS[i], key=_pairKey(a,b), d=pairData[i];
-      if(d.error||!d.spread||d.spread.length<2){_allDiffCache[key]=null;continue;}
-      const ys=d.spread;
-      const mean=ys.reduce((s,v)=>s+v,0)/ys.length;
-      const std=Math.sqrt(ys.reduce((s,v)=>s+(v-mean)**2,0)/ys.length);
-      _allDiffCache[key]={x:d.ts,y:ys,mean,std};
-    }
-  } else {
-    // Same pairwise-diff treatment as short-range, just in % instead of ticks —
-    // reuses the same checkboxes and _plotAllDiff() renderer.
-    _allDiffUnit='pct';
-    _allDiffCache={};
-    for(const [a,b] of ALL_PAIRS){
-      const key=_pairKey(a,b);
-      if(!tsToPct[a]||!tsToPct[b]){_allDiffCache[key]=null;continue;}
-      const xs=[],ys=[];
-      for(const [t,pa] of tsToPct[a]){
-        if(!tsToPct[b].has(t))continue;
-        xs.push(t); ys.push(Math.round((pa-tsToPct[b].get(t))*100)/100);
-      }
-      if(ys.length<2){_allDiffCache[key]=null;continue;}
-      const mean=ys.reduce((s,v)=>s+v,0)/ys.length;
-      const std=Math.sqrt(ys.reduce((s,v)=>s+(v-mean)**2,0)/ys.length);
-      _allDiffCache[key]={x:xs,y:ys,mean,std};
-    }
-  }
-  await _plotAllDiff();
-
-  // Same zoom mirror as short-range (no auto-refine ladder here — Long View's
-  // resolution buttons cover that role instead).
-  const diffEl=document.getElementById('chart-all-diff');
-  _wireAllZoomMirror(el,diffEl);
-  _wireAllZoomMirror(diffEl,el);
-
-  if(st)st.textContent=`Loaded ${_lvDays}d @ ${_lvRes}  ${new Date().toLocaleTimeString()}`;
-}
 
 // ── Sandbox ───────────────────────────────────────────────────────────────────
 // Line shape helpers — Support=green, Resistance=red; !=solid bright, blank=solid, ?=dashed dim
@@ -4664,6 +4170,31 @@ document.addEventListener('shown.bs.tab',function(e){
 # ── Release notes ─────────────────────────────────────────────────────────────
 
 _RELEASE_NOTES = [
+    ("v5.03", "Charts: Graph is now the default; All tab capped at 2 weeks, overlay mode removed; "
+              "Geva Extract moved into the rail menu; Lines gets deep algo tooltips",
+              "Nav: Geva Extract was a rail-item styled/positioned as a standalone link (after the "
+              "rail-spacer) -- moved it into the normal menu-item list, right after Trading. Charts "
+              "group tab order changed to Graph/All/Test/Sup-Res Viz so Graph (not Sup/Res Viz) is "
+              "both first and the tab that auto-activates on rail click. "
+              "All tab: removed the Overlay toggle and the multi-symbol normalized overlay+diff "
+              "panel entirely (_loadOverlayAll/_plotAllOverlay/_plotAllDiff/_wireAllZoomMirror/"
+              "_pairKey and the chart-all-overlay/chart-all-diff divs), along with the Month/2mo/"
+              "6mo/Year presets and their whole Long View/bars.db code path (_loadLongOverlay/"
+              "setLVRes, the /api/bars-long route) -- all dead weight once the tab is capped at Day/"
+              "Week/2 Week (tick-CSV only, matching /api/history's own days<=10 clamp -- 2 Week "
+              "requests exactly that ceiling). The always-on 3-column per-symbol grid "
+              "(_loadOneSymAll) is now the All tab's only view; it already drew critical S/R lines "
+              "with hover tooltips (color-coded by source, solid if armed) on top of each candle "
+              "chart, so that requirement was already met -- just needed to make the grid the "
+              "permanent view instead of one mode among several. Extended _loadOneSymAll to actually "
+              "request the preset's day span (previously only the removed overlay path passed "
+              "days= to /api/history -- the grid always silently rendered 1 day regardless of "
+              "preset) and to apply weekend/RTH-hour rangebreaks when spanning more than 1 day. "
+              "Lines tab: added title-attribute tooltips to every algo checkbox (PDH/PDL/PIVOT_*/"
+              "OVERNIGHT_*/ORB*/VWAP/POC/VAH/VAL/ROUND_*) with the actual formula/window each one "
+              "uses, pulled directly from _build_lines_for()'s own add() calls -- e.g. VWAP's tooltip "
+              "now honestly says it's an equal-weighted mean of RTH ticks, not true volume-weighted, "
+              "matching what the code comment already admitted."),
     ("v5.02", "Real price feed wired up; Explore group removed; Create Trades merged into Levels",
               "Header price chips (and /api/trades/create's live-price filter) were silently dead: "
               "_TRADER_URL pointed at 127.0.0.1:5001, a copy-paste carryover from the legacy "
