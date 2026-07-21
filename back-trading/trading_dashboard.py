@@ -1481,18 +1481,6 @@ body{font-size:.85rem;}
 body.busy-wait{cursor:wait!important;}
 body.busy-wait *{pointer-events:none!important;}
 body.busy-wait button,body.busy-wait input,body.busy-wait select{opacity:.55;}
-#busy-overlay{display:none;position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,.45);
-  align-items:center;justify-content:center;flex-direction:column;gap:10px;pointer-events:none;}
-body.busy-wait #busy-overlay{display:flex;}
-#busy-overlay .hourglass{font-size:4rem;line-height:1;animation:busy-flip 1s ease-in-out infinite;
-  filter:drop-shadow(0 0 10px rgba(255,193,7,.7));}
-#busy-overlay .busy-label{color:#fff;font-size:.85rem;letter-spacing:.05em;text-shadow:0 1px 3px #000;}
-@keyframes busy-flip{
-  0%   {transform:rotate(0deg)   scale(1);}
-  45%  {transform:rotate(180deg) scale(1.15);}
-  55%  {transform:rotate(180deg) scale(1.15);}
-  100% {transform:rotate(360deg) scale(1);}
-}
 #top-bar{background:#161b22;height:40px;border-bottom:1px solid #30363d;display:flex;align-items:center;padding:0 8px;gap:0;overflow-x:auto;overflow-y:hidden;scrollbar-width:thin}
 #top-bar::-webkit-scrollbar{height:4px}
 #top-bar::-webkit-scrollbar-thumb{background:#30363d;border-radius:2px}
@@ -1507,61 +1495,168 @@ body.busy-wait #busy-overlay{display:flex;}
 #sb-popup{display:none;position:fixed;z-index:1050;min-width:215px;background:#1e2530;border:1px solid #30363d;border-radius:6px;padding:8px 10px;box-shadow:0 4px 20px rgba(0,0,0,.7);}
 #sb-popup table td{padding:2px 6px;}
 #sb-chart{cursor:crosshair;}
+
+/* ══════════════════════ v5.00: rail + header + tabstrip + filterbar ══════════ */
+:root{
+  --rail-w:64px;
+  --gl-bg:#12141a; --gl-panel:#171a22; --gl-panel-2:#1f2330; --gl-border:#2c3140;
+  --gl-ink:#eae7df; --gl-muted:#8b90a0; --gl-faint:#5b6070;
+  --gl-accent:#d98d2b; --gl-accent-ink:#2a1a05; --gl-accent-dim:#8a5c22;
+  --gl-good:#3fbb82; --gl-bad:#e05a5a;
+  --gl-mono:"SF Mono","Cascadia Code","Consolas","Roboto Mono",ui-monospace,monospace;
+}
+html,body{height:100%}
+body{background:var(--gl-bg)!important}
+.app-shell{display:flex; height:100vh; overflow:hidden}
+
+/* Left rail */
+.rail{
+  width:var(--rail-w); flex:none; background:var(--gl-panel); border-right:1px solid var(--gl-border);
+  display:flex; flex-direction:column; align-items:stretch; padding:8px 0; overflow-y:auto;
+}
+.rail-mark{display:flex;align-items:center;justify-content:center;height:36px;margin-bottom:4px;
+  font-family:var(--gl-mono);font-weight:700;color:var(--gl-accent);font-size:14px;letter-spacing:.5px}
+.rail-item{
+  display:flex;flex-direction:column;align-items:center;gap:3px;padding:9px 2px;margin:1px 6px;
+  border-radius:6px;cursor:pointer;color:var(--gl-muted);border:1px solid transparent;background:none;
+  font-family:inherit;position:relative;
+}
+.rail-item .ico{font-size:16px;line-height:1}
+.rail-item .lbl{font-size:9px;text-transform:uppercase;letter-spacing:.05em;font-weight:600;text-align:center}
+.rail-item:hover{background:var(--gl-panel-2);color:var(--gl-ink)}
+.rail-item.active{background:var(--gl-panel-2);color:var(--gl-accent)}
+.rail-item.active::before{content:"";position:absolute;left:-6px;top:8px;bottom:8px;width:3px;
+  background:var(--gl-accent);border-radius:2px}
+.rail-spacer{flex:1}
+
+/* Main column */
+.main-col{flex:1; min-width:0; display:flex; flex-direction:column; height:100vh}
+
+/* App header (replaces the old single-row #top-bar branding area) */
+.app-header{
+  display:flex;align-items:center;gap:14px;padding:0 14px;height:44px;flex:none;
+  background:var(--gl-panel);border-bottom:1px solid var(--gl-border);color:var(--gl-ink);
+}
+.app-header .brand{font-weight:700;font-size:13.5px;letter-spacing:.2px}
+.app-header .verchip{font-family:var(--gl-mono);font-size:10px;color:var(--gl-muted);
+  background:var(--gl-panel-2);padding:2px 6px;border-radius:4px}
+.gl-pill{font-family:var(--gl-mono);font-size:10.5px;padding:3px 9px;border-radius:20px;
+  display:flex;align-items:center;gap:5px;background:var(--gl-panel-2)}
+.gl-ticker{display:flex;gap:12px;margin-left:4px}
+.gl-tick{display:flex;flex-direction:column;align-items:flex-end;line-height:1.1;font-family:var(--gl-mono)}
+.gl-tick .sym{font-size:8.5px;color:var(--gl-faint);letter-spacing:.04em}
+.gl-tick .px{font-size:11.5px;font-variant-numeric:tabular-nums;color:var(--gl-ink)}
+.app-header-spacer{flex:1}
+
+/* Busy strip — unified hourglass (replaces full-screen #busy-overlay) */
+.busy-strip{height:2.5px;flex:none;background:var(--gl-border);position:relative;overflow:hidden}
+.busy-strip::after{content:"";position:absolute;inset:0;width:40%;
+  background:linear-gradient(90deg,transparent,var(--gl-accent),transparent);
+  animation:gl-sweep 1.3s linear infinite}
+.busy-strip.idle::after{display:none}
+@keyframes gl-sweep{from{transform:translateX(-120%)}to{transform:translateX(320%)}}
+body:not(.busy-wait) .busy-strip{background:var(--gl-border)}
+
+/* Tabstrip (repurposed #top-bar / #mainTab) */
+#top-bar{background:var(--gl-panel-2)!important;height:36px!important;border-bottom:1px solid var(--gl-border)}
+.rail-group-caption{font-size:9.5px;text-transform:uppercase;letter-spacing:.07em;color:var(--gl-faint);
+  padding:0 10px 0 4px;border-right:1px solid var(--gl-border);margin-right:4px;white-space:nowrap;flex-shrink:0}
+.top-tab{color:var(--gl-muted)!important}
+.top-tab.active{color:var(--gl-ink)!important;border-bottom-color:var(--gl-accent)!important}
+.top-tab:hover{color:var(--gl-ink)!important}
+.nav-item[data-group].gl-hidden{display:none!important}
+/* .d-flex etc. carry !important, so plain el.style.display can't hide them -- use this instead */
+.gl-force-hidden{display:none!important}
+
+/* Consistent filter-bar treatment for simple single-row filter views */
+.filterbar{
+  display:flex;align-items:center;gap:14px;flex-wrap:wrap;padding:8px 10px;margin-bottom:10px;
+  background:var(--gl-panel);border:1px solid var(--gl-border);border-radius:6px;
+}
+.filterbar .text-muted{color:var(--gl-faint)!important}
+
+/* Session/action buttons restyled to the amber accent */
+.btn-success,.btn-primary{background:var(--gl-accent)!important;border-color:var(--gl-accent)!important;color:var(--gl-accent-ink)!important}
+.btn-outline-primary{color:var(--gl-accent)!important;border-color:var(--gl-accent-dim)!important}
+.btn-outline-primary:hover{background:var(--gl-accent)!important;color:var(--gl-accent-ink)!important}
+
+/* Overview tab stat cards */
+.gl-card{background:var(--gl-panel);border:1px solid var(--gl-border);border-radius:8px;padding:14px}
+.gl-card h6{font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--gl-muted);font-weight:700;margin-bottom:10px}
+.gl-stat-k{font-size:10px;color:var(--gl-faint);text-transform:uppercase;letter-spacing:.05em}
+.gl-stat-v{font-family:var(--gl-mono);font-size:22px;font-variant-numeric:tabular-nums}
 </style>
 </head>
 <body>
 
-<div id="busy-overlay">
-  <span class="hourglass">&#8987;</span>
-  <span class="busy-label">Working…</span>
-</div>
+<div class="app-shell">
 
-<div id="top-bar">
-  <ul class="nav mb-0 flex-shrink-0" id="mainTab" role="tablist" style="height:40px;gap:0;list-style:none;padding:0;margin:0;display:flex">
-    <li class="nav-item"><button class="nav-link top-tab active" data-bs-toggle="tab" data-bs-target="#tab-lines">Lines</button></li>
-    <li class="nav-item"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-graph" id="btn-graph-tab">Graph</button></li>
-    <li class="nav-item"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-sandbox" id="btn-sandbox-tab">Sandbox</button></li>
-    <li class="nav-item"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-all" id="btn-all-tab">All</button></li>
-    <li class="nav-item"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-test" id="btn-test-tab">Test</button></li>
-    <li class="nav-item"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-trades">Trades</button></li>
-    <li class="nav-item"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-submitted" id="btn-sub-tab">Sub</button></li>
-    <li class="nav-item"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-srviz" id="btn-srviz-tab">Sup/Res Viz</button></li>
-    <li class="nav-item"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-algolab" id="btn-algolab-tab">Algo Lab</button></li>
-    <li class="nav-item"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-correlation" id="btn-correlation-tab">Correlation</button></li>
-    <li class="nav-item">
-      <button class="nav-link top-tab icon-tab" onclick="toggleCrossMenu(event)" title="Other dashboards">🔗</button>
-    </li>
-  </ul>
-  <ul class="dropdown-menu dropdown-menu-dark" id="menu-links">
-    <li><a class="dropdown-item" id="menu-link-cc2026"  target="_blank">CC2026 Dashboard (this)</a></li>
-    <li><a class="dropdown-item" id="menu-link-fetcher" target="_blank">Fetcher2026</a></li>
-    <li><a class="dropdown-item" id="menu-link-geva"    target="_blank">GevaExtract</a></li>
-  </ul>
-  <div class="vr mx-2 flex-shrink-0" style="height:20px;background:#30363d"></div>
-  <div class="d-flex align-items-center gap-2 small flex-shrink-0">
-    <label class="mb-0 user-select-none"><input type="radio" name="date-range" value="day" checked onchange="onDateRangeChange()"> 1D</label>
-    <label class="mb-0 user-select-none"><input type="radio" name="date-range" value="week" onchange="onDateRangeChange()"> 1W</label>
-    <label class="mb-0 user-select-none"><input type="radio" name="date-range" value="2weeks" onchange="onDateRangeChange()"> 2W</label>
-    <label class="mb-0 user-select-none"><input type="radio" name="date-range" value="custom" onchange="onDateRangeChange()"> Custom</label>
-    <input type="date" id="range-from" class="form-control form-control-sm py-0" style="width:120px;display:none;font-size:.75rem;height:24px" onchange="onDateRangeChange()">
-    <span id="range-sep" style="display:none" class="text-muted">–</span>
-    <input type="date" id="range-to"   class="form-control form-control-sm py-0" style="width:120px;display:none;font-size:.75rem;height:24px" onchange="onDateRangeChange()">
-  </div>
-  <div class="d-flex align-items-center gap-2 ms-auto flex-shrink-0">
-    <span class="badge" id="session-broker-badge"  style="background:#6c757d">Broker: —</span>
-    <span class="badge" id="session-decider-badge" style="background:#6c757d">Decider: —</span>
-    <span class="text-muted" id="session-uptime" style="font-size:.7rem;min-width:3.5em"></span>
-    <button class="btn btn-sm btn-success" id="session-toggle-btn" onclick="toggleSession()">Start Session</button>
-    <div class="vr mx-1" style="height:20px;background:#30363d"></div>
-    <span class="price-chip bg-secondary" id="chip-MES">MES —</span>
-    <span class="price-chip bg-secondary" id="chip-MNQ">MNQ —</span>
-    <span class="price-chip bg-secondary" id="chip-MYM">MYM —</span>
-    <span class="price-chip bg-secondary" id="chip-M2K">M2K —</span>
-    <span class="text-muted ms-1" style="font-size:.75rem">Trading Dashboard</span>
-    <span class="badge bg-info text-dark">:5003</span>
-    <span class="badge bg-secondary">v4.27</span>
-  </div>
-</div>
+  <!-- ══════════════════════ LEFT RAIL ══════════════════════ -->
+  <nav class="rail" id="rail">
+    <div class="rail-mark">GL</div>
+    <button class="rail-item" data-group="overview"><span class="ico">&#9671;</span><span class="lbl">Overview</span></button>
+    <button class="rail-item" data-group="levels"><span class="ico">&#9638;</span><span class="lbl">Levels</span></button>
+    <button class="rail-item" data-group="explore"><span class="ico">&#9678;</span><span class="lbl">Explore</span></button>
+    <button class="rail-item" data-group="charts"><span class="ico">&#128200;</span><span class="lbl">Charts</span></button>
+    <button class="rail-item" data-group="algolab"><span class="ico">&#9879;</span><span class="lbl">Algo Lab</span></button>
+    <button class="rail-item" data-group="trading"><span class="ico">&#9635;</span><span class="lbl">Trading</span></button>
+    <div class="rail-spacer"></div>
+  </nav>
+
+  <div class="main-col">
+
+    <!-- Header -->
+    <div class="app-header">
+      <span class="brand">Galao</span>
+      <span class="verchip">v5.00</span>
+      <span class="gl-pill" id="session-broker-badge" style="color:var(--gl-muted)">Broker: —</span>
+      <span class="gl-pill" id="session-decider-badge" style="color:var(--gl-muted)">Decider: —</span>
+      <span class="text-muted" id="session-uptime" style="font-size:.7rem;min-width:3.5em"></span>
+      <div class="gl-ticker">
+        <div class="gl-tick"><span class="sym">MES</span><span class="px" id="chip-MES">—</span></div>
+        <div class="gl-tick"><span class="sym">MNQ</span><span class="px" id="chip-MNQ">—</span></div>
+        <div class="gl-tick"><span class="sym">MYM</span><span class="px" id="chip-MYM">—</span></div>
+        <div class="gl-tick"><span class="sym">M2K</span><span class="px" id="chip-M2K">—</span></div>
+      </div>
+      <div class="app-header-spacer"></div>
+      <button class="nav-link top-tab icon-tab" onclick="toggleCrossMenu(event)" title="Other dashboards" style="color:var(--gl-muted)">&#128279;</button>
+      <button class="btn btn-sm btn-success" id="session-toggle-btn" onclick="toggleSession()">Start Session</button>
+    </div>
+
+    <!-- Unified busy indicator (replaces the old full-screen hourglass overlay) -->
+    <div class="busy-strip idle" id="busy-strip"></div>
+
+    <div id="top-bar">
+      <span class="rail-group-caption" id="rail-group-caption">Overview</span>
+      <ul class="nav mb-0 flex-shrink-0" id="mainTab" role="tablist" style="height:36px;gap:0;list-style:none;padding:0;margin:0;display:flex">
+        <li class="nav-item" data-group="overview"><button class="nav-link top-tab active" data-bs-toggle="tab" data-bs-target="#tab-overview" id="btn-overview-tab">Overview</button></li>
+        <li class="nav-item" data-group="levels"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-lines" id="btn-lines-tab">Lines</button></li>
+        <li class="nav-item" data-group="levels"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-sandbox" id="btn-sandbox-tab">Sandbox</button></li>
+        <li class="nav-item" data-group="explore"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-srviz" id="btn-srviz-tab">Sup/Res Viz</button></li>
+        <li class="nav-item" data-group="explore"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-correlation" id="btn-correlation-tab">Correlation</button></li>
+        <li class="nav-item" data-group="charts"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-graph" id="btn-graph-tab">Graph</button></li>
+        <li class="nav-item" data-group="charts"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-all" id="btn-all-tab">All</button></li>
+        <li class="nav-item" data-group="charts"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-test" id="btn-test-tab">Test</button></li>
+        <li class="nav-item" data-group="algolab"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-algolab-grid" id="btn-algolab-grid-tab">Grid &amp; Submit</button></li>
+        <li class="nav-item" data-group="algolab"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-algolab-pnl" id="btn-algolab-pnl-tab">P&amp;L Breakdown</button></li>
+        <li class="nav-item" data-group="trading"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-trades" id="btn-trades-tab">Create Trades</button></li>
+        <li class="nav-item" data-group="trading"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-submitted" id="btn-sub-tab">Submitted</button></li>
+      </ul>
+      <ul class="dropdown-menu dropdown-menu-dark" id="menu-links">
+        <li><a class="dropdown-item" id="menu-link-cc2026"  target="_blank">CC2026 Dashboard (this)</a></li>
+        <li><a class="dropdown-item" id="menu-link-fetcher" target="_blank">Fetcher2026</a></li>
+        <li><a class="dropdown-item" id="menu-link-geva"    target="_blank">GevaExtract</a></li>
+      </ul>
+      <div class="d-flex align-items-center gap-2 small flex-shrink-0 ms-auto gl-force-hidden" id="date-range-wrap">
+        <label class="mb-0 user-select-none"><input type="radio" name="date-range" value="day" checked onchange="onDateRangeChange()"> 1D</label>
+        <label class="mb-0 user-select-none"><input type="radio" name="date-range" value="week" onchange="onDateRangeChange()"> 1W</label>
+        <label class="mb-0 user-select-none"><input type="radio" name="date-range" value="2weeks" onchange="onDateRangeChange()"> 2W</label>
+        <label class="mb-0 user-select-none"><input type="radio" name="date-range" value="custom" onchange="onDateRangeChange()"> Custom</label>
+        <input type="date" id="range-from" class="form-control form-control-sm py-0" style="width:120px;display:none;font-size:.75rem;height:24px" onchange="onDateRangeChange()">
+        <span id="range-sep" style="display:none" class="text-muted">–</span>
+        <input type="date" id="range-to"   class="form-control form-control-sm py-0" style="width:120px;display:none;font-size:.75rem;height:24px" onchange="onDateRangeChange()">
+      </div>
+    </div>
 
 <!-- Line detail modal -->
 <div class="modal fade" id="lineModal" tabindex="-1" aria-hidden="true">
@@ -1625,8 +1720,44 @@ body.busy-wait #busy-overlay{display:flex;}
 
 <div class="tab-content">
 
+<!-- ══════════════════════ OVERVIEW ══════════════════════ -->
+<div class="tab-pane fade show active" id="tab-overview">
+  <div class="row g-3 mb-1">
+    <div class="col-3"><div class="gl-card"><div class="gl-stat-k">Session Uptime</div>
+      <div class="gl-stat-v" id="ov-uptime">—</div></div></div>
+    <div class="col-3"><div class="gl-card"><div class="gl-stat-k">Broker / Decider</div>
+      <div class="gl-stat-v" id="ov-session" style="font-size:16px">—</div></div></div>
+    <div class="col-3"><div class="gl-card"><div class="gl-stat-k">Trades Tracked</div>
+      <div class="gl-stat-v" id="ov-trades">—</div></div></div>
+    <div class="col-3"><div class="gl-card"><div class="gl-stat-k">Net P&amp;L (tracked)</div>
+      <div class="gl-stat-v" id="ov-pnl">—</div></div></div>
+  </div>
+  <div class="row g-3">
+    <div class="col-6">
+      <div class="gl-card">
+        <h6>P&amp;L by Source</h6>
+        <table class="table table-sm table-hover table-borderless mb-0">
+          <thead><tr><th>Symbol</th><th>Source</th><th>Trades</th><th>Win%</th><th>$ P&amp;L</th></tr></thead>
+          <tbody id="ov-summary-tbody"><tr><td colspan="5" class="text-muted small">Loading…</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+    <div class="col-6">
+      <div class="gl-card">
+        <h6>Quick Links</h6>
+        <div class="d-flex flex-column gap-2">
+          <a href="#" class="text-decoration-none" onclick="selectGroupTab('algolab','tab-algolab-grid');return false">&#9879; Algo Lab &rarr; Grid &amp; Submit</a>
+          <a href="#" class="text-decoration-none" onclick="selectGroupTab('explore','tab-correlation');return false">&#9678; Explore &rarr; Correlation</a>
+          <a href="#" class="text-decoration-none" onclick="selectGroupTab('explore','tab-srviz');return false">&#9678; Explore &rarr; Sup/Res Viz</a>
+          <a href="#" class="text-decoration-none" onclick="selectGroupTab('trading','tab-submitted');return false">&#9635; Trading &rarr; Submitted</a>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
 <!-- ══════════════════════ LINES ══════════════════════ -->
-<div class="tab-pane fade show active" id="tab-lines">
+<div class="tab-pane fade" id="tab-lines">
   <!-- Algo types row -->
   <div class="d-flex flex-wrap gap-1 align-items-center mb-1 small border rounded px-2 py-1 bg-body-tertiary">
     <span class="fw-semibold text-muted me-1">Algos</span>
@@ -1985,7 +2116,7 @@ body.busy-wait #busy-overlay{display:flex;}
 
 <!-- ══════════════════════ CREATE TRADES ══════════════════════ -->
 <div class="tab-pane fade" id="tab-trades">
-  <div class="d-flex flex-wrap gap-2 align-items-center mb-2">
+  <div class="filterbar">
     <span class="text-muted small">Symbols:</span>
     <div id="sym-trades" class="d-flex gap-2">
       <label class="small"><input class="form-check-input" type="checkbox" value="MES" checked> MES</label>
@@ -2026,7 +2157,7 @@ body.busy-wait #busy-overlay{display:flex;}
 
 <!-- ══════════════════════ TEST ══════════════════════ -->
 <div class="tab-pane fade" id="tab-test">
-  <div class="d-flex align-items-center flex-wrap gap-2 mb-2">
+  <div class="filterbar">
     <span class="fw-bold text-info">MES · 5-Day · 15m</span>
     <span class="text-muted small">dbl-click line to hide · dbl-click chart to add</span>
     <button class="btn btn-sm btn-outline-success ms-auto" onclick="testShowAll()">Show All</button>
@@ -2045,7 +2176,7 @@ body.busy-wait #busy-overlay{display:flex;}
 
 <!-- ══════════════════════ SUBMITTED ══════════════════════ -->
 <div class="tab-pane fade" id="tab-submitted">
-  <div class="d-flex gap-2 align-items-center mb-2">
+  <div class="filterbar">
     <button class="btn btn-sm btn-outline-secondary" onclick="loadSubmitted()">Refresh</button>
     <label class="small ms-2"><input type="checkbox" id="auto-ref" onchange="toggleAutoRef()"> Auto-refresh (5s)</label>
   </div>
@@ -2066,7 +2197,7 @@ body.busy-wait #busy-overlay{display:flex;}
     what price actually did. Hover a line for its formula/inputs; click a legend chip to
     toggle that source on/off.
   </p>
-  <div class="d-flex align-items-center gap-2 flex-wrap mb-2">
+  <div class="filterbar">
     <span class="text-muted small">Symbol:</span>
     <select id="sv-sym" class="form-select form-select-sm d-inline-block" style="width:90px" onchange="loadSrViz()">
       <option>MES</option><option>MNQ</option><option>MYM</option><option>M2K</option>
@@ -2079,42 +2210,43 @@ body.busy-wait #busy-overlay{display:flex;}
   <div id="sv-chart" style="width:100%;height:520px;background:#1a1a2e;border-radius:4px;"></div>
 </div>
 
-<!-- ══════════════════════ ALGO LAB ══════════════════════ -->
-<div class="tab-pane fade" id="tab-algolab">
+<!-- ══════════════════════ ALGO LAB — GRID & SUBMIT ══════════════════════ -->
+<div class="tab-pane fade" id="tab-algolab-grid">
   <p class="text-muted small mb-2">
     Submits many parameter combinations of the critical-line strategies (BOUNCE/BREAKOUT/
-    DIRECTIONAL/FADE/BOTH, asymmetric TP/SL) as paper trades in one batch, tagged so P&amp;L
-    below can be broken down per exact combo and per originating S/R-detection method.
-    Paper trading only — writes PENDING rows the same broker already polls.
+    DIRECTIONAL/FADE/BOTH, asymmetric TP/SL) as paper trades in one batch, tagged so the
+    P&amp;L Breakdown tab can attribute results per exact combo and per originating
+    S/R-detection method. Paper trading only — writes PENDING rows the same broker already polls.
   </p>
-  <div class="d-flex flex-wrap gap-2 align-items-center mb-2">
-    <span class="text-muted small">Symbols:</span>
+  <div class="filterbar">
+    <div class="filter-group"><span class="text-muted small">Symbols:</span>
     <div id="sym-algolab" class="d-flex gap-2">
       <label class="small"><input class="form-check-input al-sym-chk" type="checkbox" value="MES" checked> MES</label>
       <label class="small"><input class="form-check-input al-sym-chk" type="checkbox" value="MNQ" checked> MNQ</label>
       <label class="small"><input class="form-check-input al-sym-chk" type="checkbox" value="MYM" checked> MYM</label>
       <label class="small"><input class="form-check-input al-sym-chk" type="checkbox" value="M2K" checked> M2K</label>
-    </div>
+    </div></div>
     <span class="badge bg-info text-dark" id="al-grid-badge">grid: — / —</span>
+    <div class="ms-auto d-flex align-items-center gap-2">
+      <button class="btn btn-sm btn-outline-primary" onclick="algoLabPreview()">Preview (dry-run)</button>
+      <button class="btn btn-sm btn-success" onclick="algoLabSubmit()">Submit Grid (paper trades)</button>
+    </div>
   </div>
-  <div class="mb-2 d-flex align-items-center gap-2 flex-wrap">
-    <button class="btn btn-sm btn-outline-primary" onclick="algoLabPreview()">Preview (dry-run)</button>
-    <button class="btn btn-sm btn-success" onclick="algoLabSubmit()">Submit Grid (paper trades)</button>
-    <span id="al-msg" class="small text-muted"></span>
-  </div>
+  <div class="small text-muted mb-2" id="al-msg"></div>
   <div id="al-preview-wrap" class="mb-3" style="display:none">
     <table class="table table-sm table-bordered">
       <thead class="table-dark"><tr><th>Symbol</th><th>Combos w/ candidates</th><th>Est. commands</th></tr></thead>
       <tbody id="al-preview-tbody"></tbody>
     </table>
   </div>
+</div>
 
-  <hr>
-  <h6 class="text-info">P&amp;L Breakdown — by source, algo &amp; params</h6>
-  <div class="d-flex align-items-center gap-2 flex-wrap mb-2">
-    <label class="small">From <input type="date" id="al-pnl-from" class="form-control form-control-sm d-inline-block" style="width:150px"></label>
-    <label class="small">To <input type="date" id="al-pnl-to" class="form-control form-control-sm d-inline-block" style="width:150px"></label>
-    <button class="btn btn-sm btn-outline-secondary" onclick="loadAlgoPnl()">Refresh P&amp;L</button>
+<!-- ══════════════════════ ALGO LAB — P&L BREAKDOWN ══════════════════════ -->
+<div class="tab-pane fade" id="tab-algolab-pnl">
+  <div class="filterbar">
+    <div class="filter-group"><label class="small mb-0">From <input type="date" id="al-pnl-from" class="form-control form-control-sm d-inline-block" style="width:150px"></label></div>
+    <div class="filter-group"><label class="small mb-0">To <input type="date" id="al-pnl-to" class="form-control form-control-sm d-inline-block" style="width:150px"></label></div>
+    <button class="btn btn-sm btn-outline-secondary ms-auto" onclick="loadAlgoPnl()">Refresh P&amp;L</button>
   </div>
   <div class="small text-muted mb-1">By source (coarse):</div>
   <table class="table table-sm table-hover table-bordered mb-3">
@@ -2137,7 +2269,7 @@ body.busy-wait #busy-overlay{display:flex;}
     (trader/data/bars.db). Exploration only — no trades. Meant to surface correlation ideas
     since none exist yet.
   </p>
-  <div class="d-flex align-items-center gap-2 flex-wrap mb-2">
+  <div class="filterbar">
     <span class="text-muted small">Window (30m bars):</span>
     <select id="corr-window" class="form-select form-select-sm d-inline-block" style="width:90px" onchange="loadCorrMatrix()">
       <option value="20">20</option>
@@ -2169,6 +2301,9 @@ body.busy-wait #busy-overlay{display:flex;}
 </div><!-- tab-content -->
 </div><!-- container -->
 
+  </div><!-- main-col -->
+</div><!-- app-shell -->
+
 <script>
 // ── Constants ─────────────────────────────────────────────────────────────────
 const SOURCE_COLORS={
@@ -2181,6 +2316,7 @@ let _busyCount=0,_busyDisabled=[];
 function _enterBusy(){
   if(++_busyCount===1){
     document.body.classList.add('busy-wait');
+    document.getElementById('busy-strip')?.classList.remove('idle');
     _busyDisabled=[];
     document.querySelectorAll('button:not(:disabled),input:not(:disabled),select:not(:disabled)').forEach(el=>{
       _busyDisabled.push(el);el.disabled=true;
@@ -2191,6 +2327,7 @@ function _exitBusy(){
   if(--_busyCount<=0){
     _busyCount=0;
     document.body.classList.remove('busy-wait');
+    document.getElementById('busy-strip')?.classList.add('idle');
     _busyDisabled.forEach(el=>el.disabled=false);
     _busyDisabled=[];
   }
@@ -2199,12 +2336,18 @@ const STATUS_CLS={PENDING:'secondary',SUBMITTED:'primary',SUBMITTING:'info',
                   FILLED:'warning',CLOSED:'success',CANCELLED:'dark',ERROR:'danger'};
 
 // ── Price polling ─────────────────────────────────────────────────────────────
+let _lastPrices={};
 async function pollPrices(){
   try{
     const d=await (await fetch('/api/prices')).json();
     for(const [s,p] of Object.entries(d)){
       const el=document.getElementById('chip-'+s);
-      if(el) el.textContent=s+' '+(p!=null?p.toFixed(2):'--');
+      if(!el) continue;
+      el.textContent=p!=null?p.toFixed(2):'—';
+      const prev=_lastPrices[s];
+      el.classList.remove('text-success','text-danger');
+      if(p!=null && prev!=null && p!==prev) el.classList.add(p>prev?'text-success':'text-danger');
+      if(p!=null) _lastPrices[s]=p;
     }
   }catch(e){}
 }
@@ -4191,6 +4334,8 @@ async function loadSrViz(){
   if(!dateEl.value)dateEl.value=_svLastWeekday();
   const dt=dateEl.value;
   document.getElementById('sv-msg').textContent='Loading…';
+  _enterBusy();
+  try{
 
   const [histResp,linesResp]=await Promise.all([
     fetch(`/api/history/${sym}?interval=15&date=${dt}&days=1`).then(r=>r.json()).catch(()=>({bars:[]})),
@@ -4241,6 +4386,7 @@ async function loadSrViz(){
     yaxis:{gridcolor:'#252535'},
     shapes,annotations
   },{responsive:true,displayModeBar:false});
+  }finally{_exitBusy();}
 }
 
 function _svToggleSource(src){
@@ -4285,6 +4431,7 @@ async function algoLabPreview(){
   const syms=alSelectedSymbols();
   if(!syms.length){document.getElementById('al-msg').textContent='Select at least one symbol.';return;}
   document.getElementById('al-msg').textContent='Previewing…';
+  _enterBusy();
   try{
     const r=await fetch('/api/algo-lab/preview',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({symbols:syms})});
@@ -4295,7 +4442,7 @@ async function algoLabPreview(){
       `Estimated ${d.total_estimate} commands across ${d.combos_used} combos (dry-run, nothing submitted).`;
   }catch(e){
     document.getElementById('al-msg').textContent='Preview failed: '+e;
-  }
+  }finally{_exitBusy();}
 }
 
 async function algoLabSubmit(){
@@ -4304,6 +4451,7 @@ async function algoLabSubmit(){
   if(!confirm(`Submit paper trades for ${syms.join(', ')} across the configured param grid? `+
               'This inserts real PENDING orders that trader/broker.py will submit to the IB paper gateway.'))return;
   document.getElementById('al-msg').textContent='Submitting…';
+  _enterBusy();
   try{
     const r=await fetch('/api/algo-lab/submit',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({symbols:syms})});
@@ -4315,7 +4463,7 @@ async function algoLabSubmit(){
     loadAlgoPnl();
   }catch(e){
     document.getElementById('al-msg').textContent='Submit failed: '+e;
-  }
+  }finally{_exitBusy();}
 }
 
 function _fmtPct(x){return (x*100).toFixed(1)+'%';}
@@ -4330,6 +4478,7 @@ async function loadAlgoPnl(){
   const qs=new URLSearchParams();
   if(from)qs.set('date_from',from);
   if(to)qs.set('date_to',to);
+  _enterBusy();
   try{
     const d=await (await fetch('/api/algo-lab/pnl?'+qs.toString())).json();
     const sTbody=document.getElementById('al-summary-tbody');
@@ -4349,17 +4498,16 @@ async function loadAlgoPnl(){
       <td class="${g.total_pnl_dollars>=0?'text-success':'text-danger'}">${_fmtMoney(g.total_pnl_dollars)}</td>
       <td>${g.profit_factor===Infinity?'∞':g.profit_factor.toFixed(2)}</td>
     </tr>`).join('')||'<tr><td colspan="10" class="text-muted">No completed trades yet.</td></tr>';
-  }catch(e){}
+  }catch(e){}finally{_exitBusy();}
 }
 
-document.getElementById('btn-algolab-tab').addEventListener('click',function(){
-  algoLabLoadConfig();
-  loadAlgoPnl();
-});
+document.getElementById('btn-algolab-grid-tab').addEventListener('click',algoLabLoadConfig);
+document.getElementById('btn-algolab-pnl-tab').addEventListener('click',loadAlgoPnl);
 
 // ── Correlation ───────────────────────────────────────────────────────────────
 async function loadCorrMatrix(){
   const window_=document.getElementById('corr-window').value;
+  _enterBusy();
   try{
     const d=await (await fetch('/api/correlation/matrix?window='+window_)).json();
     const missEl=document.getElementById('corr-missing');
@@ -4380,13 +4528,14 @@ async function loadCorrMatrix(){
       paper_bgcolor:'#1a1a2e',plot_bgcolor:'#1a1a2e',font:{color:'#ccc'},
       margin:{l:50,r:20,t:20,b:40}
     },{displayModeBar:false,responsive:true});
-  }catch(e){}
+  }catch(e){}finally{_exitBusy();}
 }
 
 async function loadCorrSeries(){
   const a=document.getElementById('corr-sym-a').value;
   const b=document.getElementById('corr-sym-b').value;
   const window_=document.getElementById('corr-window').value;
+  _enterBusy();
   try{
     const d=await (await fetch(`/api/correlation/timeseries?a=${a}&b=${b}&window=${window_}`)).json();
     if(!d.series.length){
@@ -4401,7 +4550,7 @@ async function loadCorrSeries(){
       paper_bgcolor:'#1a1a2e',plot_bgcolor:'#1a1a2e',font:{color:'#ccc'},
       yaxis:{range:[-1,1],title:'correlation'},margin:{l:45,r:20,t:20,b:40}
     },{displayModeBar:false,responsive:true});
-  }catch(e){}
+  }catch(e){}finally{_exitBusy();}
 }
 
 document.getElementById('btn-correlation-tab').addEventListener('click',function(){
@@ -4409,8 +4558,96 @@ document.getElementById('btn-correlation-tab').addEventListener('click',function
   loadCorrSeries();
 });
 
+// ── Overview ──────────────────────────────────────────────────────────────────
+async function loadOverview(){
+  _enterBusy();
+  try{
+    const s=await (await fetch('/api/session/status')).json();
+    document.getElementById('ov-session').textContent=`${s.broker} / ${s.decider}`;
+    const up=s.uptime_seconds||0;
+    document.getElementById('ov-uptime').textContent=
+      up>0?`${Math.floor(up/3600)}h ${Math.floor(up%3600/60)}m`:'—';
+  }catch(e){}
+  try{
+    const d=await (await fetch('/api/algo-lab/pnl')).json();
+    const rows=d.summary||[];
+    const tbody=document.getElementById('ov-summary-tbody');
+    tbody.innerHTML=rows.map(r=>`<tr>
+      <td>${r.symbol}</td><td>${r.source}</td><td>${r.n_trades}</td>
+      <td>${(r.win_rate*100).toFixed(1)}%</td>
+      <td class="${r.total_pnl_dollars>=0?'text-success':'text-danger'}">${_fmtMoney(r.total_pnl_dollars)}</td>
+    </tr>`).join('')||'<tr><td colspan="5" class="text-muted small">No completed trades yet.</td></tr>';
+    const totalTrades=rows.reduce((a,r)=>a+r.n_trades,0);
+    const totalPnl=rows.reduce((a,r)=>a+r.total_pnl_dollars,0);
+    document.getElementById('ov-trades').textContent=totalTrades;
+    const pnlEl=document.getElementById('ov-pnl');
+    pnlEl.textContent=_fmtMoney(totalPnl);
+    pnlEl.className='gl-stat-v '+(totalPnl>=0?'text-success':'text-danger');
+  }catch(e){}finally{_exitBusy();}
+}
+document.getElementById('btn-overview-tab').addEventListener('click',loadOverview);
+
+// ── Rail navigation (groups) ─────────────────────────────────────────────────
+const GROUP_LABELS={overview:'Overview',levels:'Levels',explore:'Explore',
+  charts:'Charts',algolab:'Algo Lab',trading:'Trading'};
+
+function setActiveRailGroup(group){
+  document.querySelectorAll('.rail-item').forEach(b=>b.classList.toggle('active',b.dataset.group===group));
+}
+
+function updateDateRangeVisibility(){
+  const activeTarget=document.querySelector('#mainTab .nav-link.active')?.dataset?.bsTarget;
+  const show=(activeTarget==='#tab-lines'||activeTarget==='#tab-graph');
+  document.getElementById('date-range-wrap').classList.toggle('gl-force-hidden',!show);
+}
+
+function showGroupTabs(group,autoClickFirst){
+  document.querySelectorAll('#mainTab li[data-group]').forEach(li=>{
+    li.classList.toggle('gl-hidden',li.dataset.group!==group);
+  });
+  const cap=document.getElementById('rail-group-caption');
+  if(cap)cap.textContent=GROUP_LABELS[group]||group;
+  if(autoClickFirst){
+    const firstBtn=document.querySelector(`#mainTab li[data-group="${group}"] .top-tab`);
+    if(firstBtn && !firstBtn.classList.contains('active'))firstBtn.click();
+  }
+  updateDateRangeVisibility();
+}
+
+// Programmatic navigation (Overview quick-links, cross-group redirects like
+// sendManualLines() -> Trades): switches the rail group AND clicks the right
+// tab button by its target pane id.
+function selectGroupTab(groupId,paneId){
+  setActiveRailGroup(groupId);
+  showGroupTabs(groupId,false);
+  const btn=document.querySelector(`#mainTab [data-bs-target="#${paneId}"]`);
+  if(btn)btn.click();
+}
+
+document.querySelectorAll('.rail-item[data-group]').forEach(b=>{
+  b.addEventListener('click',function(){
+    setActiveRailGroup(b.dataset.group);
+    showGroupTabs(b.dataset.group,true);
+  });
+});
+
+// Single source of truth for "which tab is active now", regardless of how it
+// got activated (rail click, direct top-tab click, tab-switch guard redirect,
+// or a programmatic .click() from elsewhere) -- Bootstrap fires this on the
+// tab trigger itself whenever its pane becomes the shown one.
+document.addEventListener('shown.bs.tab',function(e){
+  const li=e.target.closest('li[data-group]');
+  if(!li)return;
+  const group=li.dataset.group;
+  showGroupTabs(group,false);
+  setActiveRailGroup(group);
+});
+
 // ── Init ──────────────────────────────────────────────────────────────────────
 (function(){
+  setActiveRailGroup('overview');
+  showGroupTabs('overview',false);
+  loadOverview();
   const lw=_lastWeekday();
   document.getElementById('range-from').value=lw;
   document.getElementById('range-to').value=lw;
@@ -4428,6 +4665,34 @@ document.getElementById('btn-correlation-tab').addEventListener('click',function
 # ── Release notes ─────────────────────────────────────────────────────────────
 
 _RELEASE_NOTES = [
+    ("v5.00", "Full navigation rebuild -- left rail + contextual top tabs + unified filter bar "
+              "+ busy strip, replacing 12 flat top-level tabs",
+              "Requested redesign: header (status/prices/session), a left rail of 6 groups "
+              "(Overview/Levels/Explore/Charts/Algo Lab/Trading), and a top tab strip that shows "
+              "only the active group's tabs -- validated first as a static no-op mockup (separate "
+              "artifact), approved, then implemented for real with zero changes to any existing "
+              "load/render function: every original tab-pane id, button id, and lazy-load "
+              "addEventListener hook is untouched, Bootstrap's native data-bs-toggle=\"tab\" "
+              "mechanism still does all pane-switching -- the rail only shows/hides which subset "
+              "of #mainTab's <li> elements is visible and, on rail click, .click()s the first "
+              "visible tab's button. A single delegated shown.bs.tab listener re-syncs the rail's "
+              "active state and visible tab subset no matter how a pane was activated (rail click, "
+              "direct top-tab click, the Graph draw-mode unsaved-changes guard, or "
+              "sendManualLines()'s programmatic redirect to Trades) -- so no per-call-site changes "
+              "were needed there either. New: a real Overview landing tab (session status + P&L-"
+              "by-source rollup via the existing /api/algo-lab/pnl + quick links), and Algo Lab "
+              "split into two tabs (Grid & Submit / P&L Breakdown) instead of one stacked pane. "
+              "The old full-screen hourglass overlay (#busy-overlay, a flipping hourglass emoji "
+              "dimming the whole page) is replaced by a slim amber strip under the header, wired "
+              "into the exact same global _enterBusy()/_exitBusy() counters every fetch call "
+              "already used -- so it lights up everywhere automatically. The global 1D/1W/2W/"
+              "Custom date-range control (only ever consumed by Lines and Graph, per "
+              "onDateRangeChange()) moved from always-visible in the header to the tabstrip row, "
+              "shown only when one of those two tabs is active. Applied a consistent .filterbar "
+              "visual treatment (background/border/padding) to the simple single-row filter views "
+              "(Sup/Res Viz, Correlation, Create Trades, Test, Submitted, Algo Lab) -- Lines/Graph/"
+              "Sandbox/All keep their existing bespoke multi-row control panels rather than being "
+              "force-fit into a template that doesn't suit that much content."),
     ("v4.27", "Algo Lab, Sup/Res Viz, and Correlation tabs — parameterized paper-trade algo "
               "framework with P&L-by-params attribution",
               "New 'Claude-designed algo' layer on top of the existing critical-line strategies "
