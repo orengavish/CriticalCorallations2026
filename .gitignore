@@ -12,6 +12,13 @@ june/trader/data/*.db-shm
 back-trading/data/
 /data/
 logs/
+# trader data — track galao.db only; bars.db is derived/regenerable and too
+# large for GitHub's 100MB push limit once backfilled to multiple years
+# (scripts/backfill_bars.py, scripts/import_7year_bars.py)
+trader/data/bars.db
+trader/data/*.bak
+trader/data/*.db-wal
+trader/data/*.db-shm
 *.pptx
 *.csv
 .claude/settings.local.json

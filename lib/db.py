@@ -809,6 +809,23 @@ def get_fetch_log_latest(con, symbol: str, date: str) -> list:
     ).fetchall()
 
 
+def update_price_cache(con, symbol: str, price: float, fill_ts: str, source: str = "fill"):
+    """Save/update last known price for symbol. Call on every real fill --
+    bypasses paper trading's ~15min market-data delay for later commands."""
+    con.execute(
+        "INSERT INTO price_cache (symbol, last_price, last_fill_ts, source)"
+        " VALUES (?,?,?,?)"
+        " ON CONFLICT(symbol) DO UPDATE SET"
+        "   last_price=excluded.last_price, last_fill_ts=excluded.last_fill_ts,"
+        "   source=excluded.source, updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')",
+        (symbol, price, fill_ts, source)
+    )
+
+
+def get_cached_price(con, symbol: str) -> float | None:
+    row = con.execute("SELECT last_price FROM price_cache WHERE symbol=?", (symbol,)).fetchone()
+    return row["last_price"] if row else None
+
 
 # ── Self-test ─────────────────────────────────────────────────────────────────
 
@@ -921,6 +938,20 @@ def self_test() -> bool:
                 ).fetchone()
             assert row["algo_type"] == "BOUNCE", f"algo_type: {row['algo_type']}"
             assert '"tp_ticks": 8' in row["params_json"], "params_json not stored"
+
+            # 9b. price_cache round-trip -- write then read back, upsert not dup
+            with get_db(db_path) as con:
+                assert get_cached_price(con, "MES") is None
+                update_price_cache(con, "MES", 6500.25, "2026-04-07T10:00:05Z", source="fill")
+            with get_db(db_path) as con:
+                assert get_cached_price(con, "MES") == 6500.25
+                update_price_cache(con, "MES", 6501.0, "2026-04-07T10:05:00Z", source="fill")
+                count = con.execute(
+                    "SELECT COUNT(*) FROM price_cache WHERE symbol='MES'"
+                ).fetchone()[0]
+            assert count == 1, "price_cache upsert created a duplicate row"
+            with get_db(db_path) as con:
+                assert get_cached_price(con, "MES") == 6501.0
 
             # 10. Rollback on error — no partial writes
             try:

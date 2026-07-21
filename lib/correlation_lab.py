@@ -10,17 +10,18 @@ read-only exploration tool over bars.db, meant to surface correlation ideas
 that could later become a third algo type.
 
 Uses trader/data/bars.db's `bars_30m` table (30-min OHLCV, built by
-scripts/backfill_bars.py). Correlation is computed on log-returns of the close,
-not raw price or the existing bars_30m_normalized table -- normalized-to-
-window-start price levels aren't comparable across arbitrary correlation
-windows, but returns are.
+scripts/backfill_bars.py plus scripts/import_7year_bars.py -- see that script
+for the Databento-sourced 7-year backfill merged in 2026-07-21, extending
+coverage for all 4 symbols back to 2019-05-05). Correlation is computed on
+log-returns of the close, not raw price or the existing bars_30m_normalized
+table -- normalized-to-window-start price levels aren't comparable across
+arbitrary correlation windows, but returns are.
 
-Known gap (see GALGO2027 handoff docs, confirmed live 2026-07-21): bars.db
-currently only has MES/MYM/M2K (11,814 bars each) -- MNQ was never backfilled.
-Every function here treats a symbol with no bars.db coverage as "missing" and
-returns None/empty rather than raising, so the Correlation tab can still render
-for the 3 available symbols and clearly flag the 4th instead of erroring the
-whole page out.
+Every function here still treats a symbol with no bars.db coverage as
+"missing" and returns None/empty rather than raising (rather than assuming
+all 4 symbols always have data), so the Correlation tab degrades gracefully
+if a symbol's backfill ever falls behind instead of erroring the whole page
+out.
 
 Usage:
     from lib.correlation_lab import correlation_matrix, rolling_correlation_series

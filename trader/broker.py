@@ -31,7 +31,7 @@ import sys; sys.path.insert(0, str(_ROOT)) if str(_ROOT) not in sys.path else No
 
 from lib.config_loader import get_config
 from lib.logger import get_logger
-from lib.db import get_db, init_db, get_pending_commands, update_command_status, get_system_state, record_completed_trade, spawn_replenishment
+from lib.db import get_db, init_db, get_pending_commands, update_command_status, get_system_state, record_completed_trade, spawn_replenishment, update_price_cache
 from lib.ib_client import IBClient
 from lib.order_builder import build_bracket, place_bracket, round_tick
 
@@ -80,7 +80,7 @@ def _handle_exec_fill(order_id: int, fill_price: float, db_path):
     try:
         with get_db(db_path) as con:
             row = con.execute(
-                "SELECT id FROM commands WHERE ib_order_id=? AND status='SUBMITTED'",
+                "SELECT id, symbol FROM commands WHERE ib_order_id=? AND status='SUBMITTED'",
                 (order_id,)
             ).fetchone()
             if row:
@@ -89,6 +89,7 @@ def _handle_exec_fill(order_id: int, fill_price: float, db_path):
                     fill_price=fill_price,
                     fill_time=now,
                 )
+                update_price_cache(con, row["symbol"], fill_price, now, source="fill")
                 log.info(
                     f"[event] Command {row['id']} FILLED "
                     f"(execDetails orderId={order_id} price={fill_price})"
@@ -350,6 +351,7 @@ def poll_fills(ibc: IBClient, db_path) -> int:
                     fill_price = fill_price,
                     fill_time  = now,
                 )
+                update_price_cache(con, cmd["symbol"], fill_price, now, source="fill")
             # Queue TP/SL rebase if not already queued by event handler
             if cmd["id"] not in queued_ids:
                 with _rebase_lock:
@@ -445,6 +447,7 @@ def poll_tp_sl_fills(ibc: IBClient, db_path) -> int:
                                   exit_reason=exit_reason,
                                   pnl_points=round(pnl, 4))
             record_completed_trade(con, cmd["id"])
+            update_price_cache(con, cmd["symbol"], exit_price, now, source="fill")
         closed += 1
 
     return closed

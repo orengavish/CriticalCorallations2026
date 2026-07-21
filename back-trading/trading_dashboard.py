@@ -24,10 +24,9 @@ _ROOT = _HERE.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-import requests
 from flask import Flask, jsonify, request, render_template_string
 
-from lib.db import get_db
+from lib.db import get_db, get_cached_price
 from lib.price_profile import ensure_profile as _ensure_price_profile, get_price_profile
 from trader.session import get_session_manager
 from lib import algo_lab, algo_pnl, correlation_lab
@@ -38,7 +37,6 @@ ALL_SYMBOLS      = ["MES", "MNQ", "MYM", "M2K"]
 TICKS            = {"MES": 0.25, "MNQ": 0.25, "MYM": 1.0, "M2K": 0.10}
 DEFAULT_BRACKETS = [2.0, 4.0, 10.0]   # points
 
-_TRADER_URL = "http://127.0.0.1:5001"
 _HIST_DIR   = Path(r"C:\Projects\Galgo2026\june\trader\data\history")
 
 SOURCE_COLORS = {
@@ -479,12 +477,9 @@ def index():
 @app.route("/api/prices")
 def api_prices():
     out = {}
-    for sym in ALL_SYMBOLS:
-        try:
-            r = requests.get(f"{_TRADER_URL}/api/price", params={"symbol": sym}, timeout=1.5)
-            out[sym] = r.json().get("price") if r.ok else None
-        except Exception:
-            out[sym] = None
+    with get_db(_resolve_db()) as con:
+        for sym in ALL_SYMBOLS:
+            out[sym] = get_cached_price(con, sym)
     return jsonify(out)
 
 
@@ -1136,16 +1131,9 @@ def api_trades_create():
     db_path      = _resolve_db()
     _ensure_columns(db_path)
 
-    prices: dict = {}
-    for sym in symbols:
-        try:
-            r = requests.get(f"{_TRADER_URL}/api/price", params={"symbol": sym}, timeout=1.5)
-            prices[sym] = r.json().get("price") if r.ok else None
-        except Exception:
-            prices[sym] = None
-
     ph = ",".join("?" * len(symbols))
     with get_db(db_path) as con:
+        prices = {sym: get_cached_price(con, sym) for sym in symbols}
         lines = [dict(r) for r in con.execute(
             f"SELECT id, symbol, price, line_type, strength,"
             f" COALESCE(source,'manual') AS source,"
@@ -1519,7 +1507,7 @@ body{background:var(--gl-bg)!important}
 .rail-item{
   display:flex;flex-direction:column;align-items:center;gap:3px;padding:9px 2px;margin:1px 6px;
   border-radius:6px;cursor:pointer;color:var(--gl-muted);border:1px solid transparent;background:none;
-  font-family:inherit;position:relative;
+  font-family:inherit;position:relative;text-decoration:none;
 }
 .rail-item .ico{font-size:16px;line-height:1}
 .rail-item .lbl{font-size:9px;text-transform:uppercase;letter-spacing:.05em;font-weight:600;text-align:center}
@@ -1596,11 +1584,12 @@ body:not(.busy-wait) .busy-strip{background:var(--gl-border)}
     <div class="rail-mark">GL</div>
     <button class="rail-item" data-group="overview"><span class="ico">&#9671;</span><span class="lbl">Overview</span></button>
     <button class="rail-item" data-group="levels"><span class="ico">&#9638;</span><span class="lbl">Levels</span></button>
-    <button class="rail-item" data-group="explore"><span class="ico">&#9678;</span><span class="lbl">Explore</span></button>
     <button class="rail-item" data-group="charts"><span class="ico">&#128200;</span><span class="lbl">Charts</span></button>
+    <button class="rail-item" data-group="correlation"><span class="ico">&#9678;</span><span class="lbl">Correlation</span></button>
     <button class="rail-item" data-group="algolab"><span class="ico">&#9879;</span><span class="lbl">Algo Lab</span></button>
     <button class="rail-item" data-group="trading"><span class="ico">&#9635;</span><span class="lbl">Trading</span></button>
     <div class="rail-spacer"></div>
+    <a class="rail-item" id="rail-link-geva" target="_blank"><span class="ico">&#128279;</span><span class="lbl">Geva Extract</span></a>
   </nav>
 
   <div class="main-col">
@@ -1608,7 +1597,7 @@ body:not(.busy-wait) .busy-strip{background:var(--gl-border)}
     <!-- Header -->
     <div class="app-header">
       <span class="brand">Galao</span>
-      <span class="verchip">v5.00</span>
+      <span class="verchip">v5.02</span>
       <span class="gl-pill" id="session-broker-badge" style="color:var(--gl-muted)">Broker: —</span>
       <span class="gl-pill" id="session-decider-badge" style="color:var(--gl-muted)">Decider: —</span>
       <span class="text-muted" id="session-uptime" style="font-size:.7rem;min-width:3.5em"></span>
@@ -1632,14 +1621,14 @@ body:not(.busy-wait) .busy-strip{background:var(--gl-border)}
         <li class="nav-item" data-group="overview"><button class="nav-link top-tab active" data-bs-toggle="tab" data-bs-target="#tab-overview" id="btn-overview-tab">Overview</button></li>
         <li class="nav-item" data-group="levels"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-lines" id="btn-lines-tab">Lines</button></li>
         <li class="nav-item" data-group="levels"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-sandbox" id="btn-sandbox-tab">Sandbox</button></li>
-        <li class="nav-item" data-group="explore"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-srviz" id="btn-srviz-tab">Sup/Res Viz</button></li>
-        <li class="nav-item" data-group="explore"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-correlation" id="btn-correlation-tab">Correlation</button></li>
+        <li class="nav-item" data-group="levels"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-trades" id="btn-trades-tab">Create Trades</button></li>
+        <li class="nav-item" data-group="charts"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-srviz" id="btn-srviz-tab">Sup/Res Viz</button></li>
+        <li class="nav-item" data-group="correlation"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-correlation" id="btn-correlation-tab">Correlation</button></li>
         <li class="nav-item" data-group="charts"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-graph" id="btn-graph-tab">Graph</button></li>
         <li class="nav-item" data-group="charts"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-all" id="btn-all-tab">All</button></li>
         <li class="nav-item" data-group="charts"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-test" id="btn-test-tab">Test</button></li>
         <li class="nav-item" data-group="algolab"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-algolab-grid" id="btn-algolab-grid-tab">Grid &amp; Submit</button></li>
         <li class="nav-item" data-group="algolab"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-algolab-pnl" id="btn-algolab-pnl-tab">P&amp;L Breakdown</button></li>
-        <li class="nav-item" data-group="trading"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-trades" id="btn-trades-tab">Create Trades</button></li>
         <li class="nav-item" data-group="trading"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-submitted" id="btn-sub-tab">Submitted</button></li>
       </ul>
       <ul class="dropdown-menu dropdown-menu-dark" id="menu-links">
@@ -1747,8 +1736,8 @@ body:not(.busy-wait) .busy-strip{background:var(--gl-border)}
         <h6>Quick Links</h6>
         <div class="d-flex flex-column gap-2">
           <a href="#" class="text-decoration-none" onclick="selectGroupTab('algolab','tab-algolab-grid');return false">&#9879; Algo Lab &rarr; Grid &amp; Submit</a>
-          <a href="#" class="text-decoration-none" onclick="selectGroupTab('explore','tab-correlation');return false">&#9678; Explore &rarr; Correlation</a>
-          <a href="#" class="text-decoration-none" onclick="selectGroupTab('explore','tab-srviz');return false">&#9678; Explore &rarr; Sup/Res Viz</a>
+          <a href="#" class="text-decoration-none" onclick="selectGroupTab('correlation','tab-correlation');return false">&#9678; Correlation</a>
+          <a href="#" class="text-decoration-none" onclick="selectGroupTab('charts','tab-srviz');return false">&#128200; Charts &rarr; Sup/Res Viz</a>
           <a href="#" class="text-decoration-none" onclick="selectGroupTab('trading','tab-submitted');return false">&#9635; Trading &rarr; Submitted</a>
         </div>
       </div>
@@ -1818,9 +1807,18 @@ body:not(.busy-wait) .busy-strip{background:var(--gl-border)}
     <button class="btn btn-sm btn-outline-secondary" onclick="refreshLines()">Refresh</button>
   </div>
   <!-- Create buttons -->
+  <p class="text-muted small mb-2">
+    Scans the last <code>weeks_back</code> weeks (default 2, capped to the 10 most recent
+    weekday/market days) of tick history for each of the 4 symbols and detects S/R lines using
+    the checked algo types above, merged within the selected pt threshold, writing rows into
+    <code>critical_lines</code>. <b>Create</b> skips symbol/dates already built;
+    <b>Force Create</b> re-detects everything regardless.
+  </p>
   <div class="d-flex gap-2 align-items-center mb-2">
-    <button class="btn btn-sm btn-primary" onclick="buildLinesDB(false)">Create</button>
-    <button class="btn btn-sm btn-outline-danger" onclick="buildLinesDB(true)">Force Create</button>
+    <button class="btn btn-sm btn-primary" onclick="buildLinesDB(false)"
+            title="Skips already-built symbol/dates">Create</button>
+    <button class="btn btn-sm btn-outline-danger" onclick="buildLinesDB(true)"
+            title="Re-detects lines even for symbol/dates already built">Force Create</button>
     <span id="build-db-msg" class="small text-muted ms-1"></span>
   </div>
   <!-- Build progress panel -->
@@ -2362,6 +2360,7 @@ pollPrices();setInterval(pollPrices,5000);
   document.getElementById('menu-link-cc2026').href  = base+':5003';
   document.getElementById('menu-link-fetcher').href = base+':5050';
   document.getElementById('menu-link-geva').href    = base+':5005';
+  document.getElementById('rail-link-geva').href    = base+':5005';
 })();
 function toggleCrossMenu(ev){
   ev.stopPropagation();
@@ -4588,8 +4587,8 @@ async function loadOverview(){
 document.getElementById('btn-overview-tab').addEventListener('click',loadOverview);
 
 // ── Rail navigation (groups) ─────────────────────────────────────────────────
-const GROUP_LABELS={overview:'Overview',levels:'Levels',explore:'Explore',
-  charts:'Charts',algolab:'Algo Lab',trading:'Trading'};
+const GROUP_LABELS={overview:'Overview',levels:'Levels',
+  charts:'Charts',correlation:'Correlation',algolab:'Algo Lab',trading:'Trading'};
 
 function setActiveRailGroup(group){
   document.querySelectorAll('.rail-item').forEach(b=>b.classList.toggle('active',b.dataset.group===group));
@@ -4665,6 +4664,54 @@ document.addEventListener('shown.bs.tab',function(e){
 # ── Release notes ─────────────────────────────────────────────────────────────
 
 _RELEASE_NOTES = [
+    ("v5.02", "Real price feed wired up; Explore group removed; Create Trades merged into Levels",
+              "Header price chips (and /api/trades/create's live-price filter) were silently dead: "
+              "_TRADER_URL pointed at 127.0.0.1:5001, a copy-paste carryover from the legacy "
+              "back-trading/algo_dashboard.py (itself pointing at the forbidden trader/visualizer/"
+              "app.py) that nobody runs, so every price request timed out and chips always showed "
+              "'-'. The DB already had a price_cache table (owned by broker per the handoff doc) "
+              "that nothing ever wrote to. Added update_price_cache()/get_cached_price() to lib/db.py "
+              "and wired all 3 places trader/broker.py learns a real fill price (_handle_exec_fill, "
+              "poll_fills, poll_tp_sl_fills) to save it. Dashboard's /api/prices and /api/trades/"
+              "create now read price_cache directly instead of proxying to the dead port -- no more "
+              "requests/_TRADER_URL in this file. Side effect worth knowing: /api/trades/create's "
+              "'already crossed by live price' candidate filter and proximity sort were a silent "
+              "no-op the whole time (live was always None) -- they'll actually start filtering/"
+              "sorting now that real prices exist. "
+              "Also found (not fixed, flagged only): 412 MNQ + 400 MES commands rows tagged "
+              "source='geva_extract', all created within a single 4-day window (2026-07-16 to "
+              "07-20), shaped as symmetric BUY+SELL pairs across a graduated bracket grid (1.0/2.0/"
+              "3.75/4.0/7.75/8.0/15.5/30.75/31.0 pts) -- the shape of a parameter grid like "
+              "algo_lab's, not a single scraped Facebook trade call. GevaExtract writes to galao.db "
+              "directly from a separate project outside this repo; per instruction, galao.db was "
+              "left untouched -- this is a data finding for later cleanup, not a code fix. It's "
+              "currently distorting the geva_extract row on both P&L-by-source views (Overview, "
+              "Algo Lab -> P&L Breakdown). "
+              "Nav: removed the 'Explore' rail group (redundant with Charts) -- Sup/Res Viz moved "
+              "into Charts, Correlation promoted to its own top-level rail group instead of being "
+              "lumped in. Added a Geva Extract rail link (opens :5005 in a new tab, mirrors the "
+              "existing cross-dashboard dropdown link, deliberately has no data-group so it doesn't "
+              "also hide the current tab strip on click). Create Trades moved from Trading into "
+              "Levels (now Lines / Sandbox / Create Trades) so the build-lines -> generate-trades "
+              "workflow lives in one place; Trading keeps just Submitted. Added plain-language help "
+              "text + tooltips above Lines' Create/Force Create buttons explaining what weeks_back/"
+              "algo-type/merge-threshold params they use and skip-vs-force-rebuild semantics."),
+    ("v5.01", "Correlation tab now runs on 7 years of history instead of 1",
+              "trader/data/bars.db's bars_30m table only ever held ~1 year (the backfill_bars.py "
+              "window). Merged in data/bars_7years_30m_{MES,MNQ,MYM,M2K}.csv (Databento, "
+              "2019-05-05 onward) via new scripts/import_7year_bars.py -- INSERT OR IGNORE so the "
+              "live-IB-backfilled recent rows are never clobbered, only the older gap underneath "
+              "them is filled in. bars_30m per symbol went from 11.8k rows to ~85k. Reran "
+              "scripts/build_bars_normalized.py and build_bars_diffs.py so bars_30m_normalized / "
+              "bars_30m_diffs_normalized (used by the All tab) cover the same full range -- MNQ is "
+              "still deliberately excluded from those two tables (matches the existing All-tab "
+              "scope, unchanged since v4.15). lib/correlation_lab.py's stale docstring claiming "
+              "MNQ was never backfilled is fixed -- MNQ has had bars.db coverage for a while, this "
+              "session just confirmed it and updated the comment. No code changes to "
+              "correlation_lab.py's math -- it already reads full bars_30m history and windows "
+              "client-side, so the bigger table alone is enough. Verified: matrix (4x4, window=50) "
+              "computed in ~1.1s, rolling series (500 points, window=50) in ~2.8s against the full "
+              "85k-row history -- both fine for an explore-tab click, not a hot path."),
     ("v5.00", "Full navigation rebuild -- left rail + contextual top tabs + unified filter bar "
               "+ busy strip, replacing 12 flat top-level tabs",
               "Requested redesign: header (status/prices/session), a left rail of 6 groups "
