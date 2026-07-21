@@ -67,6 +67,7 @@ paths:
   db: data/galao.db
   test_db: data/test_galao.db
   backtest_db: data/backtest.db
+  bars: data/bars.db          # 30m bars, read-only for algo_lab/correlation_lab
   critical_lines: data/critical_lines
   history: data/history
   logs: logs
@@ -83,3 +84,44 @@ grader:
 
 backtest:
   symbol: MES
+
+# ── Algo Lab ─────────────────────────────────────────────────────────────────
+# "Claude-designed algo for sup/res": submits many (strategy x tp/sl x
+# direction_filter x strength_max) paper trades in one batch over whatever
+# critical_lines already exist (any detection method — manual/ohlc/pivot/
+# overnight/orb/vwap/volume/round), tagged source='algo_lab' so P&L can be
+# broken down per exact combo later (lib/algo_pnl.py). Paper only — writes
+# PENDING rows into `commands`, same DB/broker as everything else, no separate
+# IB connection. Scoped to its own `symbols` list, independent of the
+# top-level `symbols:` (decider/broker's single-symbol MES flow, unchanged).
+algo_lab:
+  enabled: true
+  symbols: [MES, MNQ, MYM, M2K]
+  quantity: 1
+  # Trade strategy (lib/algo_engine.AlgoType) — which side(s) of each line to trade
+  strategies: [BOUNCE, BREAKOUT, DIRECTIONAL, FADE, BOTH]
+  tp_ticks: [4, 8, 16]
+  sl_ticks: [4, 8, 16]
+  direction_filters: [ALL, BUY_ONLY, SELL_ONLY]
+  strength_max: [1, 2, 3]           # 1=strong lines only, 2=+medium, 3=all
+  # Full grid above = 5x3x3x3x3 = 405 combos/symbol — way too many resting
+  # orders even in paper. Deterministically downsampled to this many per
+  # symbol per submit (same subset every time so P&L-by-params stays
+  # meaningful across repeated runs, see lib/algo_lab.build_param_grid).
+  max_param_combos: 24
+  # Hard safety valve on total commands inserted in one submit_grid() call,
+  # across all symbols/combos combined.
+  max_commands_per_submit: 500
+
+# ── Correlation Lab ────────────────────────────────────────────────────────────
+# Read-only exploration module (lib/correlation_lab.py) — rolling pairwise
+# correlation across the 4 symbols from trader/data/bars.db. Does not trade;
+# purely a visualization aid for the Correlation dashboard tab, meant to
+# surface ideas for a future correlation-based algo type. MNQ is not yet
+# backfilled into bars.db as of this writing — the module reports it as
+# "missing" rather than erroring; see scripts/backfill_bars.py.
+correlation:
+  symbols: [MES, MNQ, MYM, M2K]
+  windows: [20, 50, 100]           # rolling window choices offered in the UI, in 30m bars
+  default_window: 50
+  max_series_points: 500           # cap on rolling-correlation-over-time chart points

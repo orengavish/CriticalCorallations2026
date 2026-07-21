@@ -74,8 +74,11 @@ CREATE TABLE IF NOT EXISTS commands (
     sl_price            REAL    NOT NULL,
     bracket_size        REAL    NOT NULL,
     source              TEXT,               -- critical_line | random_mkt | random_lmt | random_stp | test
+                                              -- | algo_lab | geva_extract | trading_dashboard | cl_algo
     parent_command_id   INTEGER,            -- set when this command was auto-replenished from another
     critical_line_id    INTEGER REFERENCES critical_lines(id),  -- origin line when source=critical_line
+    algo_type           TEXT,               -- trade strategy when source=algo_lab: BOUNCE|BREAKOUT|DIRECTIONAL|FADE|BOTH
+    params_json         TEXT,               -- full param combo (JSON) when source=algo_lab, for P&L attribution
     quantity            INTEGER NOT NULL DEFAULT 1,
     status              TEXT    NOT NULL DEFAULT 'PENDING',
     -- PENDING | SUBMITTING | SUBMITTED | FILLED | EXITING | CLOSED
@@ -135,6 +138,11 @@ CREATE TABLE IF NOT EXISTS critical_lines (
     price       REAL    NOT NULL,
     strength    INTEGER NOT NULL,           -- 1=strong 2=medium 3=low
     armed       INTEGER NOT NULL DEFAULT 1, -- 0 after SL cool-down disarms
+    source      TEXT    DEFAULT 'manual',   -- manual | D (sandbox) | ohlc | pivot | overnight
+                                             -- | orb | vwap | volume | round (auto-detected)
+    algo_type   TEXT    DEFAULT 'MANUAL',   -- detection method label, mirrors `source` above
+    note        TEXT,                       -- JSON: {label, formula, inputs, from_date, merged}
+    confidence  TEXT    DEFAULT '',         -- '!'=strong '?'=weak ''=normal (Sandbox convention)
     created_at  TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
 );
 
@@ -431,6 +439,9 @@ SELECT
     END AS exit_reason,
     ct.exit_reason AS raw_exit_reason,
     ct.pnl_points,
+    -- Algo attribution (NULL for pre-algo_lab rows / other sources)
+    c.algo_type,
+    c.params_json,
     -- Direct lineage
     c.parent_command_id,
     c.critical_line_id,
@@ -472,6 +483,17 @@ def _migrate(path: Path = None):
         "ALTER TABLE commands ADD COLUMN source TEXT",
         "ALTER TABLE commands ADD COLUMN parent_command_id INTEGER",
         "ALTER TABLE commands ADD COLUMN critical_line_id INTEGER REFERENCES critical_lines(id)",
+        "ALTER TABLE commands ADD COLUMN algo_type TEXT",
+        "ALTER TABLE commands ADD COLUMN params_json TEXT",
+        # critical_lines.source/algo_type/note/confidence: originally added ad-hoc
+        # by back-trading/trading_dashboard.py's own _ensure_columns() helper, not
+        # part of this canonical schema -- folded in here too so any module
+        # (not just the dashboard) can rely on them existing. Idempotent/safe to
+        # run even on a DB where the dashboard already added them.
+        "ALTER TABLE critical_lines ADD COLUMN source TEXT DEFAULT 'manual'",
+        "ALTER TABLE critical_lines ADD COLUMN algo_type TEXT DEFAULT 'MANUAL'",
+        "ALTER TABLE critical_lines ADD COLUMN note TEXT",
+        "ALTER TABLE critical_lines ADD COLUMN confidence TEXT DEFAULT ''",
         "ALTER TABLE cl_algo_score_history ADD COLUMN top_n_fills INTEGER",
         # Idempotent CREATE IF NOT EXISTS for tables added after initial schema
         """CREATE TABLE IF NOT EXISTS price_cache (
@@ -583,6 +605,7 @@ def _migrate(path: Path = None):
             UNIQUE(symbol, date, price)
         )""",
         "CREATE INDEX IF NOT EXISTS idx_price_profile_sd ON price_profile(symbol, date)",
+        "CREATE INDEX IF NOT EXISTS idx_commands_source_algo ON commands(source, algo_type)",
     ]
     with get_db(path) as con:
         for stmt in alter_stmts:
@@ -882,7 +905,24 @@ def self_test() -> bool:
                 again = record_completed_trade(con, cmd_id)
             assert not again, "record_completed_trade must be idempotent"
 
-            # 9. Rollback on error — no partial writes
+            # 9. algo_type / params_json columns exist and round-trip
+            with get_db(db_path) as con:
+                con.execute("""
+                    INSERT INTO commands
+                        (symbol, line_price, line_type, line_strength,
+                         direction, entry_type, entry_price, tp_price, sl_price,
+                         bracket_size, source, algo_type, params_json)
+                    VALUES ('MES', 6500.0, 'SUPPORT', 2, 'BUY', 'LMT',
+                            6500.0, 6502.0, 6498.0, 2.0, 'algo_lab', 'BOUNCE',
+                            '{"tp_ticks": 8, "sl_ticks": 4}')
+                """)
+                row = con.execute(
+                    "SELECT algo_type, params_json FROM commands WHERE source='algo_lab'"
+                ).fetchone()
+            assert row["algo_type"] == "BOUNCE", f"algo_type: {row['algo_type']}"
+            assert '"tp_ticks": 8' in row["params_json"], "params_json not stored"
+
+            # 10. Rollback on error — no partial writes
             try:
                 with get_db(db_path) as con:
                     con.execute("INSERT INTO system_state(key,value) VALUES('ROLLBACK_TEST','yes')")

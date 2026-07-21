@@ -30,6 +30,7 @@ from flask import Flask, jsonify, request, render_template_string
 from lib.db import get_db
 from lib.price_profile import ensure_profile as _ensure_price_profile, get_price_profile
 from trader.session import get_session_manager
+from lib import algo_lab, algo_pnl, correlation_lab
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
@@ -134,6 +135,65 @@ def _resolve_db() -> Path:
         except Exception:
             pass
     return (_ROOT / "trader" / "data" / "galao.db").resolve()
+
+
+def _trader_config() -> dict:
+    """
+    Load trader/config.yaml directly as a raw dict -- deliberately bypasses
+    lib.config_loader's global process-wide cache (documented footgun, see
+    CC2026 handoff docs Rule 7): that cache is keyed on whichever config.yaml
+    some module loads first via a bare get_config(), and back-trading/ has its
+    own separate config.yaml for the backtest engine, so a bare get_config()
+    call from this file is not reliable. _resolve_db() above already works
+    around the same footgun for paths.db this same way.
+    """
+    cfg_path = _ROOT / "trader" / "config.yaml"
+    try:
+        import yaml
+        with open(cfg_path) as f:
+            return yaml.safe_load(f) or {}
+    except Exception:
+        return {}
+
+
+def _ns(d: dict):
+    """dict -> SimpleNamespace (recursively), for attribute-style config access."""
+    from types import SimpleNamespace
+    if isinstance(d, dict):
+        return SimpleNamespace(**{k: _ns(v) for k, v in d.items()})
+    if isinstance(d, list):
+        return [_ns(v) for v in d]
+    return d
+
+
+_ALGO_LAB_DEFAULTS = {
+    "enabled": True, "symbols": ALL_SYMBOLS, "quantity": 1,
+    "strategies": ["BOUNCE", "BREAKOUT", "DIRECTIONAL", "FADE", "BOTH"],
+    "tp_ticks": [4, 8, 16], "sl_ticks": [4, 8, 16],
+    "direction_filters": ["ALL", "BUY_ONLY", "SELL_ONLY"],
+    "strength_max": [1, 2, 3],
+    "max_param_combos": 24, "max_commands_per_submit": 500,
+}
+
+_CORRELATION_DEFAULTS = {
+    "symbols": ALL_SYMBOLS, "windows": [20, 50, 100],
+    "default_window": 50, "max_series_points": 500,
+}
+
+
+def _algo_lab_cfg():
+    merged = {**_ALGO_LAB_DEFAULTS, **(_trader_config().get("algo_lab") or {})}
+    return _ns(merged)
+
+
+def _correlation_cfg():
+    merged = {**_CORRELATION_DEFAULTS, **(_trader_config().get("correlation") or {})}
+    return _ns(merged)
+
+
+def _bars_db_path() -> str:
+    rel = (_trader_config().get("paths") or {}).get("bars", "data/bars.db")
+    return str((_ROOT / "trader" / rel).resolve())
 
 
 def _ensure_columns(db_path: Path) -> None:
@@ -1230,6 +1290,163 @@ def api_sandbox_profile(symbol: str, date_str: str):
     return jsonify({"symbol": symbol, "date": date_str, "rows": rows})
 
 
+# ── Algo Lab ("Claude-designed algo for sup/res") ─────────────────────────────
+# Submits many (strategy x tp/sl x direction_filter x strength_max) paper
+# trades in one batch over whatever critical_lines already exist (any
+# detection method), tagged source='algo_lab' for later P&L attribution.
+# Paper only -- writes PENDING rows into the same `commands` table trader/
+# broker.py already polls; this route never talks to IB for order submission,
+# only (briefly, on-demand) for a current-price snapshot used to evaluate the
+# toggle rule. See lib/algo_lab.py and lib/algo_pnl.py docstrings for detail.
+
+def _fetch_live_prices(symbols: list) -> dict:
+    """
+    Ephemeral IB LIVE-data-only connection (paper=False -- data only, no order
+    capability) to snapshot current prices for the requested symbols. Connects,
+    fetches, disconnects -- never held open between requests, unlike broker.py/
+    decider.py's long-lived connections. Uses the same live_client_ids pool;
+    IBClient's connect-retry already shuffles through free IDs so this can't
+    collide with an ID broker/decider currently holds.
+    """
+    prices = {s: None for s in symbols}
+    try:
+        from lib.ib_client import IBClient
+        from lib.config_loader import get_config
+        cfg_path = _ROOT / "trader" / "config.yaml"
+        ibc = IBClient(get_config(cfg_path))
+        ibc.connect(live=True, paper=False)
+        try:
+            for sym in symbols:
+                try:
+                    prices[sym] = ibc.get_price(sym)
+                except Exception:
+                    prices[sym] = None
+        finally:
+            ibc.disconnect()
+    except Exception as e:
+        log_msg = f"Algo Lab: live price fetch unavailable ({e})"
+        print(log_msg)
+    return prices
+
+
+@app.route("/api/algo-lab/config")
+def api_algo_lab_config():
+    cfg = _algo_lab_cfg()
+    combos = algo_lab.build_param_grid(cfg)
+    full_grid = (len(cfg.strategies) * len(cfg.tp_ticks) * len(cfg.sl_ticks)
+                * len(cfg.direction_filters) * len(cfg.strength_max))
+    return jsonify({
+        "enabled": cfg.enabled, "symbols": list(cfg.symbols),
+        "strategies": list(cfg.strategies), "tp_ticks": list(cfg.tp_ticks),
+        "sl_ticks": list(cfg.sl_ticks), "direction_filters": list(cfg.direction_filters),
+        "strength_max": list(cfg.strength_max), "quantity": cfg.quantity,
+        "max_param_combos": cfg.max_param_combos,
+        "full_grid_size": full_grid, "combo_count": len(combos),
+    })
+
+
+@app.route("/api/algo-lab/preview", methods=["POST"])
+def api_algo_lab_preview():
+    body    = request.get_json(silent=True) or {}
+    cfg     = _algo_lab_cfg()
+    symbols = body.get("symbols") or list(cfg.symbols)
+    db_path = _resolve_db()
+    _ensure_columns(db_path)
+    today   = date.today().isoformat()
+
+    combos = algo_lab.build_param_grid(cfg)
+    prices = _fetch_live_prices(symbols)
+    ticks  = {s: TICKS.get(s, 0.25) for s in symbols}
+
+    result = algo_lab.preview_grid(symbols, today, prices, ticks, combos, db_path)
+    return jsonify({**result, "combos_used": len(combos), "prices": prices})
+
+
+@app.route("/api/algo-lab/submit", methods=["POST"])
+def api_algo_lab_submit():
+    body    = request.get_json(silent=True) or {}
+    cfg     = _algo_lab_cfg()
+    symbols = body.get("symbols") or list(cfg.symbols)
+    db_path = _resolve_db()
+    _ensure_columns(db_path)
+    today   = date.today().isoformat()
+
+    combos = algo_lab.build_param_grid(cfg)
+    prices = _fetch_live_prices(symbols)
+    ticks  = {s: TICKS.get(s, 0.25) for s in symbols}
+
+    result = algo_lab.submit_grid(
+        symbols, today, prices, ticks, combos, db_path,
+        quantity=cfg.quantity, max_commands_total=cfg.max_commands_per_submit,
+    )
+    return jsonify({**result, "combos_used": len(combos), "prices": prices})
+
+
+@app.route("/api/algo-lab/pnl")
+def api_algo_lab_pnl():
+    db_path   = _resolve_db()
+    date_from = request.args.get("date_from") or None
+    date_to   = request.args.get("date_to") or None
+    breakdown = algo_pnl.get_breakdown(db_path, date_from, date_to)
+    summary   = algo_pnl.rollup_by_source(breakdown)
+    return jsonify({"summary": summary, "breakdown": breakdown})
+
+
+# ── Sup/Res visualization data (feeds the Graph tab's line overlay) ───────────
+
+@app.route("/api/srviz/<symbol>")
+def api_srviz(symbol: str):
+    """Critical lines for one symbol/date, with source/algo_type/note kept for
+    color-coding + tooltips on the Graph tab overlay -- lets 'theoretical,
+    half-baked' S/R lines be visually judged against real price action."""
+    date_str = request.args.get("date", date.today().isoformat())
+    db_path  = _resolve_db()
+    _ensure_columns(db_path)
+    with get_db(db_path) as con:
+        rows = con.execute(
+            "SELECT id, price, line_type, strength,"
+            " COALESCE(source,'manual') AS source,"
+            " COALESCE(algo_type,'MANUAL') AS algo_type, note, armed"
+            " FROM critical_lines WHERE symbol=? AND date=? ORDER BY price",
+            (symbol.upper(), date_str)
+        ).fetchall()
+    return jsonify({"symbol": symbol.upper(), "date": date_str,
+                    "lines": [dict(r) for r in rows]})
+
+
+# ── Correlation Lab ────────────────────────────────────────────────────────────
+# Read-only exploration module -- no correlation-analysis code existed
+# anywhere in this repo before this (verified by grep). Purely a
+# visualization aid meant to surface ideas for a future correlation-based
+# algo type; does not trade.
+
+@app.route("/api/correlation/config")
+def api_correlation_config():
+    cfg = _correlation_cfg()
+    missing = [s for s in cfg.symbols if not correlation_lab.has_data(_bars_db_path(), s)]
+    return jsonify({"symbols": list(cfg.symbols), "windows": list(cfg.windows),
+                    "default_window": cfg.default_window, "missing": missing})
+
+
+@app.route("/api/correlation/matrix")
+def api_correlation_matrix():
+    cfg    = _correlation_cfg()
+    window = int(request.args.get("window", cfg.default_window))
+    return jsonify(correlation_lab.correlation_matrix(_bars_db_path(), list(cfg.symbols), window))
+
+
+@app.route("/api/correlation/timeseries")
+def api_correlation_timeseries():
+    cfg    = _correlation_cfg()
+    sym_a  = request.args.get("a", "MES").upper()
+    sym_b  = request.args.get("b", "MYM").upper()
+    window = int(request.args.get("window", cfg.default_window))
+    series = correlation_lab.rolling_correlation_series(
+        _bars_db_path(), sym_a, sym_b, window, max_points=cfg.max_series_points
+    )
+    return jsonify({"symbol_a": sym_a, "symbol_b": sym_b, "window": window, "series": series})
+
+
 # ── HTML ───────────────────────────────────────────────────────────────────────
 
 HTML = r"""<!doctype html>
@@ -1308,6 +1525,9 @@ body.busy-wait #busy-overlay{display:flex;}
     <li class="nav-item"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-test" id="btn-test-tab">Test</button></li>
     <li class="nav-item"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-trades">Trades</button></li>
     <li class="nav-item"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-submitted" id="btn-sub-tab">Sub</button></li>
+    <li class="nav-item"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-srviz" id="btn-srviz-tab">Sup/Res Viz</button></li>
+    <li class="nav-item"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-algolab" id="btn-algolab-tab">Algo Lab</button></li>
+    <li class="nav-item"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-correlation" id="btn-correlation-tab">Correlation</button></li>
     <li class="nav-item">
       <button class="nav-link top-tab icon-tab" onclick="toggleCrossMenu(event)" title="Other dashboards">🔗</button>
     </li>
@@ -1339,7 +1559,7 @@ body.busy-wait #busy-overlay{display:flex;}
     <span class="price-chip bg-secondary" id="chip-M2K">M2K —</span>
     <span class="text-muted ms-1" style="font-size:.75rem">Trading Dashboard</span>
     <span class="badge bg-info text-dark">:5003</span>
-    <span class="badge bg-secondary">v4.26</span>
+    <span class="badge bg-secondary">v4.27</span>
   </div>
 </div>
 
@@ -1836,6 +2056,114 @@ body.busy-wait #busy-overlay{display:flex;}
     </thead>
     <tbody id="sub-tbody"></tbody>
   </table>
+</div>
+
+<!-- ══════════════════════ SUP/RES VIZ ══════════════════════ -->
+<div class="tab-pane fade" id="tab-srviz">
+  <p class="text-muted small mb-2">
+    All critical lines for one symbol/date overlaid on real price action, color-coded by
+    detection method — every S/R line here is theoretical/half-baked until judged against
+    what price actually did. Hover a line for its formula/inputs; click a legend chip to
+    toggle that source on/off.
+  </p>
+  <div class="d-flex align-items-center gap-2 flex-wrap mb-2">
+    <span class="text-muted small">Symbol:</span>
+    <select id="sv-sym" class="form-select form-select-sm d-inline-block" style="width:90px" onchange="loadSrViz()">
+      <option>MES</option><option>MNQ</option><option>MYM</option><option>M2K</option>
+    </select>
+    <label class="small">Date <input type="date" id="sv-date" class="form-control form-control-sm d-inline-block" style="width:150px" onchange="loadSrViz()"></label>
+    <button class="btn btn-sm btn-outline-secondary" onclick="loadSrViz()">Reload</button>
+    <span id="sv-msg" class="small text-muted"></span>
+  </div>
+  <div id="sv-legend" class="d-flex gap-2 flex-wrap mb-2" style="font-size:.75rem"></div>
+  <div id="sv-chart" style="width:100%;height:520px;background:#1a1a2e;border-radius:4px;"></div>
+</div>
+
+<!-- ══════════════════════ ALGO LAB ══════════════════════ -->
+<div class="tab-pane fade" id="tab-algolab">
+  <p class="text-muted small mb-2">
+    Submits many parameter combinations of the critical-line strategies (BOUNCE/BREAKOUT/
+    DIRECTIONAL/FADE/BOTH, asymmetric TP/SL) as paper trades in one batch, tagged so P&amp;L
+    below can be broken down per exact combo and per originating S/R-detection method.
+    Paper trading only — writes PENDING rows the same broker already polls.
+  </p>
+  <div class="d-flex flex-wrap gap-2 align-items-center mb-2">
+    <span class="text-muted small">Symbols:</span>
+    <div id="sym-algolab" class="d-flex gap-2">
+      <label class="small"><input class="form-check-input al-sym-chk" type="checkbox" value="MES" checked> MES</label>
+      <label class="small"><input class="form-check-input al-sym-chk" type="checkbox" value="MNQ" checked> MNQ</label>
+      <label class="small"><input class="form-check-input al-sym-chk" type="checkbox" value="MYM" checked> MYM</label>
+      <label class="small"><input class="form-check-input al-sym-chk" type="checkbox" value="M2K" checked> M2K</label>
+    </div>
+    <span class="badge bg-info text-dark" id="al-grid-badge">grid: — / —</span>
+  </div>
+  <div class="mb-2 d-flex align-items-center gap-2 flex-wrap">
+    <button class="btn btn-sm btn-outline-primary" onclick="algoLabPreview()">Preview (dry-run)</button>
+    <button class="btn btn-sm btn-success" onclick="algoLabSubmit()">Submit Grid (paper trades)</button>
+    <span id="al-msg" class="small text-muted"></span>
+  </div>
+  <div id="al-preview-wrap" class="mb-3" style="display:none">
+    <table class="table table-sm table-bordered">
+      <thead class="table-dark"><tr><th>Symbol</th><th>Combos w/ candidates</th><th>Est. commands</th></tr></thead>
+      <tbody id="al-preview-tbody"></tbody>
+    </table>
+  </div>
+
+  <hr>
+  <h6 class="text-info">P&amp;L Breakdown — by source, algo &amp; params</h6>
+  <div class="d-flex align-items-center gap-2 flex-wrap mb-2">
+    <label class="small">From <input type="date" id="al-pnl-from" class="form-control form-control-sm d-inline-block" style="width:150px"></label>
+    <label class="small">To <input type="date" id="al-pnl-to" class="form-control form-control-sm d-inline-block" style="width:150px"></label>
+    <button class="btn btn-sm btn-outline-secondary" onclick="loadAlgoPnl()">Refresh P&amp;L</button>
+  </div>
+  <div class="small text-muted mb-1">By source (coarse):</div>
+  <table class="table table-sm table-hover table-bordered mb-3">
+    <thead class="table-dark"><tr><th>Symbol</th><th>Source</th><th>Trades</th><th>Win%</th>
+        <th>Pts</th><th>$ P&amp;L</th></tr></thead>
+    <tbody id="al-summary-tbody"></tbody>
+  </table>
+  <div class="small text-muted mb-1">By exact algo + params + line-detection method:</div>
+  <table class="table table-sm table-hover table-bordered">
+    <thead class="table-dark"><tr><th>Symbol</th><th>Source</th><th>Strategy</th><th>Params</th>
+        <th>Line detect</th><th>Trades</th><th>Win%</th><th>Pts</th><th>$ P&amp;L</th><th>PF</th></tr></thead>
+    <tbody id="al-breakdown-tbody"></tbody>
+  </table>
+</div>
+
+<!-- ══════════════════════ CORRELATION ══════════════════════ -->
+<div class="tab-pane fade" id="tab-correlation">
+  <p class="text-muted small mb-2">
+    Rolling pairwise correlation across the 4 symbols, computed from 30-min bar log-returns
+    (trader/data/bars.db). Exploration only — no trades. Meant to surface correlation ideas
+    since none exist yet.
+  </p>
+  <div class="d-flex align-items-center gap-2 flex-wrap mb-2">
+    <span class="text-muted small">Window (30m bars):</span>
+    <select id="corr-window" class="form-select form-select-sm d-inline-block" style="width:90px" onchange="loadCorrMatrix()">
+      <option value="20">20</option>
+      <option value="50" selected>50</option>
+      <option value="100">100</option>
+    </select>
+    <span id="corr-missing" class="badge bg-warning text-dark" style="display:none"></span>
+  </div>
+  <div id="corr-heatmap" style="width:100%;max-width:520px;height:420px;"></div>
+
+  <hr>
+  <h6 class="text-info">Rolling correlation over time</h6>
+  <div class="d-flex align-items-center gap-2 flex-wrap mb-2">
+    <label class="small">A
+      <select id="corr-sym-a" class="form-select form-select-sm d-inline-block" style="width:90px">
+        <option>MES</option><option>MNQ</option><option>MYM</option><option>M2K</option>
+      </select>
+    </label>
+    <label class="small">B
+      <select id="corr-sym-b" class="form-select form-select-sm d-inline-block" style="width:90px">
+        <option>MES</option><option>MNQ</option><option selected>MYM</option><option>M2K</option>
+      </select>
+    </label>
+    <button class="btn btn-sm btn-outline-primary" onclick="loadCorrSeries()">Load</button>
+  </div>
+  <div id="corr-series-chart" style="width:100%;height:340px;background:#1a1a2e;border-radius:4px;"></div>
 </div>
 
 </div><!-- tab-content -->
@@ -3847,6 +4175,240 @@ document.getElementById('btn-test-tab').addEventListener('click',function(){
   if(!_testAllBars.length)loadTest();
 });
 
+// ── Sup/Res Viz ───────────────────────────────────────────────────────────────
+let _svHidden=new Set();
+
+function _svLastWeekday(){
+  const d=new Date();
+  d.setDate(d.getDate()-1);
+  while(d.getDay()===0||d.getDay()===6)d.setDate(d.getDate()-1);
+  return d.toISOString().slice(0,10);
+}
+
+async function loadSrViz(){
+  const sym=document.getElementById('sv-sym').value;
+  const dateEl=document.getElementById('sv-date');
+  if(!dateEl.value)dateEl.value=_svLastWeekday();
+  const dt=dateEl.value;
+  document.getElementById('sv-msg').textContent='Loading…';
+
+  const [histResp,linesResp]=await Promise.all([
+    fetch(`/api/history/${sym}?interval=15&date=${dt}&days=1`).then(r=>r.json()).catch(()=>({bars:[]})),
+    fetch(`/api/srviz/${sym}?date=${dt}`).then(r=>r.json()).catch(()=>({lines:[]}))
+  ]);
+
+  const bars=histResp.bars||[];
+  const lines=(linesResp.lines||[]).filter(l=>!_svHidden.has(l.source));
+
+  const legendSrcs=[...new Set((linesResp.lines||[]).map(l=>l.source))];
+  document.getElementById('sv-legend').innerHTML=legendSrcs.map(s=>{
+    const color=SOURCE_COLORS[s]||'#888';
+    const off=_svHidden.has(s);
+    return `<span class="badge" style="background:${color};opacity:${off?0.3:1};cursor:pointer"
+              onclick="_svToggleSource('${s}')">${s}</span>`;
+  }).join('')||'<span class="text-muted">No lines for this symbol/date.</span>';
+
+  if(!bars.length){
+    document.getElementById('sv-chart').innerHTML=
+      '<div class="d-flex align-items-center justify-content-center h-100 text-muted">No price history for this date.</div>';
+    document.getElementById('sv-msg').textContent=histResp.error||'';
+    return;
+  }
+  document.getElementById('sv-msg').textContent=
+    `${bars.length} bars · ${lines.length} of ${(linesResp.lines||[]).length} lines shown`;
+
+  const shapes=[],annotations=[];
+  for(const ln of lines){
+    const color=SOURCE_COLORS[ln.source]||'#fff';
+    shapes.push({type:'line',x0:0,x1:1,y0:ln.price,y1:ln.price,xref:'paper',yref:'y',
+      line:{color,width:ln.strength===1?2:1,dash:ln.strength===1?'solid':'dot'}});
+    let tip=`${ln.line_type} ${ln.price.toFixed(2)} [${ln.source}]`;
+    try{const note=ln.note?JSON.parse(ln.note):null;if(note?.formula)tip+=' — '+note.formula;}catch(e){}
+    annotations.push({x:1,y:ln.price,xref:'paper',yref:'y',text:ln.price.toFixed(2),
+      showarrow:false,xanchor:'right',font:{size:8,color},hovertext:tip});
+  }
+
+  Plotly.newPlot('sv-chart',[{
+    type:'candlestick',
+    x:bars.map(b=>b.t),open:bars.map(b=>b.open),high:bars.map(b=>b.high),
+    low:bars.map(b=>b.low),close:bars.map(b=>b.close),
+    name:sym,showlegend:false,
+    increasing:{line:{color:'#26a69a'}},decreasing:{line:{color:'#ef5350'}}
+  }],{
+    paper_bgcolor:'#1a1a2e',plot_bgcolor:'#1a1a2e',font:{color:'#ccc'},
+    margin:{l:55,r:55,t:8,b:45},dragmode:'zoom',showlegend:false,
+    xaxis:{gridcolor:'#252535',rangeslider:{visible:false}},
+    yaxis:{gridcolor:'#252535'},
+    shapes,annotations
+  },{responsive:true,displayModeBar:false});
+}
+
+function _svToggleSource(src){
+  if(_svHidden.has(src))_svHidden.delete(src);else _svHidden.add(src);
+  loadSrViz();
+}
+
+document.getElementById('btn-srviz-tab').addEventListener('click',function(){
+  if(!document.getElementById('sv-date').value)document.getElementById('sv-date').value=_svLastWeekday();
+  loadSrViz();
+});
+
+// ── Algo Lab ──────────────────────────────────────────────────────────────────
+function alSelectedSymbols(){
+  return [...document.querySelectorAll('.al-sym-chk:checked')].map(el=>el.value);
+}
+
+async function algoLabLoadConfig(){
+  try{
+    const c=await (await fetch('/api/algo-lab/config')).json();
+    document.getElementById('al-grid-badge').textContent=
+      `grid: ${c.combo_count} of ${c.full_grid_size} combos/symbol (config-capped)`;
+  }catch(e){}
+}
+
+function _renderComboMap(tbodyId,perSymbol,estKey){
+  const tbody=document.getElementById(tbodyId);
+  tbody.innerHTML='';
+  for(const [sym,combos] of Object.entries(perSymbol)){
+    if(combos.error){
+      tbody.innerHTML+=`<tr><td>${sym}</td><td colspan="2" class="text-warning">${combos.error}</td></tr>`;
+      continue;
+    }
+    const entries=Object.entries(combos);
+    const withCandidates=entries.filter(([,n])=>n>0).length;
+    const total=entries.reduce((a,[,n])=>a+n,0);
+    tbody.innerHTML+=`<tr><td>${sym}</td><td>${withCandidates} / ${entries.length}</td><td>${total}</td></tr>`;
+  }
+}
+
+async function algoLabPreview(){
+  const syms=alSelectedSymbols();
+  if(!syms.length){document.getElementById('al-msg').textContent='Select at least one symbol.';return;}
+  document.getElementById('al-msg').textContent='Previewing…';
+  try{
+    const r=await fetch('/api/algo-lab/preview',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({symbols:syms})});
+    const d=await r.json();
+    document.getElementById('al-preview-wrap').style.display='';
+    _renderComboMap('al-preview-tbody',d.per_symbol);
+    document.getElementById('al-msg').textContent=
+      `Estimated ${d.total_estimate} commands across ${d.combos_used} combos (dry-run, nothing submitted).`;
+  }catch(e){
+    document.getElementById('al-msg').textContent='Preview failed: '+e;
+  }
+}
+
+async function algoLabSubmit(){
+  const syms=alSelectedSymbols();
+  if(!syms.length){document.getElementById('al-msg').textContent='Select at least one symbol.';return;}
+  if(!confirm(`Submit paper trades for ${syms.join(', ')} across the configured param grid? `+
+              'This inserts real PENDING orders that trader/broker.py will submit to the IB paper gateway.'))return;
+  document.getElementById('al-msg').textContent='Submitting…';
+  try{
+    const r=await fetch('/api/algo-lab/submit',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({symbols:syms})});
+    const d=await r.json();
+    document.getElementById('al-preview-wrap').style.display='';
+    _renderComboMap('al-preview-tbody',d.per_symbol);
+    document.getElementById('al-msg').textContent=
+      `Submitted ${d.total_submitted} commands${d.capped?' (capped by max_commands_per_submit)':''}.`;
+    loadAlgoPnl();
+  }catch(e){
+    document.getElementById('al-msg').textContent='Submit failed: '+e;
+  }
+}
+
+function _fmtPct(x){return (x*100).toFixed(1)+'%';}
+function _fmtMoney(x){
+  if(x===Infinity)return '∞';
+  return (x<0?'-$':'$')+Math.abs(x).toFixed(2);
+}
+
+async function loadAlgoPnl(){
+  const from=document.getElementById('al-pnl-from').value;
+  const to=document.getElementById('al-pnl-to').value;
+  const qs=new URLSearchParams();
+  if(from)qs.set('date_from',from);
+  if(to)qs.set('date_to',to);
+  try{
+    const d=await (await fetch('/api/algo-lab/pnl?'+qs.toString())).json();
+    const sTbody=document.getElementById('al-summary-tbody');
+    sTbody.innerHTML=d.summary.map(s=>`<tr>
+      <td>${s.symbol}</td><td>${s.source}</td><td>${s.n_trades}</td>
+      <td>${_fmtPct(s.win_rate)}</td><td>${s.total_pnl_points.toFixed(2)}</td>
+      <td class="${s.total_pnl_dollars>=0?'text-success':'text-danger'}">${_fmtMoney(s.total_pnl_dollars)}</td>
+    </tr>`).join('')||'<tr><td colspan="6" class="text-muted">No completed trades yet.</td></tr>';
+
+    const bTbody=document.getElementById('al-breakdown-tbody');
+    bTbody.innerHTML=d.breakdown.map(g=>`<tr>
+      <td>${g.symbol}</td><td>${g.source}</td><td>${g.algo_type||'—'}</td>
+      <td><code style="font-size:.7rem">${g.params?JSON.stringify(g.params):'—'}</code></td>
+      <td>${g.line_detect_algo||'—'}</td>
+      <td>${g.n_trades}</td><td>${_fmtPct(g.win_rate)}</td>
+      <td>${g.total_pnl_points.toFixed(2)}</td>
+      <td class="${g.total_pnl_dollars>=0?'text-success':'text-danger'}">${_fmtMoney(g.total_pnl_dollars)}</td>
+      <td>${g.profit_factor===Infinity?'∞':g.profit_factor.toFixed(2)}</td>
+    </tr>`).join('')||'<tr><td colspan="10" class="text-muted">No completed trades yet.</td></tr>';
+  }catch(e){}
+}
+
+document.getElementById('btn-algolab-tab').addEventListener('click',function(){
+  algoLabLoadConfig();
+  loadAlgoPnl();
+});
+
+// ── Correlation ───────────────────────────────────────────────────────────────
+async function loadCorrMatrix(){
+  const window_=document.getElementById('corr-window').value;
+  try{
+    const d=await (await fetch('/api/correlation/matrix?window='+window_)).json();
+    const missEl=document.getElementById('corr-missing');
+    if(d.missing.length){
+      missEl.style.display='';
+      missEl.textContent='No bars.db data for: '+d.missing.join(', ');
+    }else{
+      missEl.style.display='none';
+    }
+    const syms=d.symbols;
+    const z=syms.map(a=>syms.map(b=>d.matrix[a][b]));
+    Plotly.newPlot('corr-heatmap',[{
+      z:z,x:syms,y:syms,type:'heatmap',zmin:-1,zmax:1,
+      colorscale:[[0,'#d62728'],[0.5,'#1a1a2e'],[1,'#2ca02c']],
+      text:z.map(row=>row.map(v=>v==null?'':v.toFixed(2))),texttemplate:'%{text}',
+      hovertemplate:'%{x} vs %{y}: %{z:.3f}<extra></extra>'
+    }],{
+      paper_bgcolor:'#1a1a2e',plot_bgcolor:'#1a1a2e',font:{color:'#ccc'},
+      margin:{l:50,r:20,t:20,b:40}
+    },{displayModeBar:false,responsive:true});
+  }catch(e){}
+}
+
+async function loadCorrSeries(){
+  const a=document.getElementById('corr-sym-a').value;
+  const b=document.getElementById('corr-sym-b').value;
+  const window_=document.getElementById('corr-window').value;
+  try{
+    const d=await (await fetch(`/api/correlation/timeseries?a=${a}&b=${b}&window=${window_}`)).json();
+    if(!d.series.length){
+      document.getElementById('corr-series-chart').innerHTML=
+        '<div class="text-muted small p-3">Not enough overlapping bars.db history for this pair/window.</div>';
+      return;
+    }
+    Plotly.newPlot('corr-series-chart',[{
+      x:d.series.map(p=>p.ts),y:d.series.map(p=>p.corr),
+      type:'scatter',mode:'lines',line:{color:'#4e79a7'},name:`${a} vs ${b}`
+    }],{
+      paper_bgcolor:'#1a1a2e',plot_bgcolor:'#1a1a2e',font:{color:'#ccc'},
+      yaxis:{range:[-1,1],title:'correlation'},margin:{l:45,r:20,t:20,b:40}
+    },{displayModeBar:false,responsive:true});
+  }catch(e){}
+}
+
+document.getElementById('btn-correlation-tab').addEventListener('click',function(){
+  loadCorrMatrix();
+  loadCorrSeries();
+});
+
 // ── Init ──────────────────────────────────────────────────────────────────────
 (function(){
   const lw=_lastWeekday();
@@ -3866,6 +4428,38 @@ document.getElementById('btn-test-tab').addEventListener('click',function(){
 # ── Release notes ─────────────────────────────────────────────────────────────
 
 _RELEASE_NOTES = [
+    ("v4.27", "Algo Lab, Sup/Res Viz, and Correlation tabs — parameterized paper-trade algo "
+              "framework with P&L-by-params attribution",
+              "New 'Claude-designed algo' layer on top of the existing critical-line strategies "
+              "(lib/algo_engine.py: BOUNCE/BREAKOUT/DIRECTIONAL/FADE/BOTH, asymmetric TP/SL -- "
+              "already built in a prior session but never wired to anything live). lib/algo_lab.py "
+              "submits many (strategy x tp_ticks x sl_ticks x direction_filter x strength_max) "
+              "param combos as paper trades in one batch, tagged source='algo_lab' with the exact "
+              "combo stored in the new commands.algo_type/commands.params_json columns. "
+              "lib/algo_pnl.py breaks P&L down by symbol/source/algo/params/originating "
+              "line-detection-method (joins the existing verified_trades view + critical_lines) -- "
+              "this already surfaces real findings against the live DB's 929 verified trades, e.g. "
+              "random_mkt is -$109,468.75/486 trades and critical_line is -$797.50/14 trades with a "
+              "0% win rate. lib/correlation_lab.py is a new read-only rolling-correlation module "
+              "over bars.db (log-returns, Pearson, configurable window) -- there was no "
+              "correlation-analysis code anywhere in this repo before this. Algo Lab tab: symbol "
+              "picker, dry-run preview, grid submit (paper only, dedup-guarded same pattern as "
+              "decider.py's 425-stale-order fix), and the P&L breakdown tables. Sup/Res Viz tab: "
+              "candlestick + all critical_lines for a symbol/date overlaid and color-coded by "
+              "detection method (existing SOURCE_COLORS, previously defined but never plotted "
+              "anywhere), toggleable per source, hover shows the line's formula/inputs -- lets "
+              "'theoretical, half-baked' S/R lines be judged against real price action. "
+              "Correlation tab: 4x4 heatmap + rolling correlation-over-time chart for any pair; "
+              "MNQ is flagged 'missing' since bars.db was never backfilled for it (MES/MYM/M2K "
+              "only, 11,814 bars each). Fixed two pre-existing bugs found while building this: "
+              "lib/algo_engine.py hardcoded tick_size=0.25 (silently wrong for MYM/M2K), and "
+              "critical_lines.source/algo_type/note/confidence were only added by this dashboard's "
+              "own _ensure_columns() rather than lib/db.py's canonical schema -- folded into "
+              "lib/db.py so any module can rely on them. All new lib/ modules have --self-test "
+              "per repo convention; new Flask routes verified via app.test_client() against the "
+              "live galao.db before this deploy. Config: new algo_lab:/correlation: sections + "
+              "paths.bars in trader/config.yaml, all parameters exposed there per 'everything "
+              "configurable' -- decider/broker's existing single-symbol MES flow is untouched."),
     ("v4.26", "All tab: Symbols checkboxes on the overlay chart, mirroring Pairs on the diff chart",
               "The overlay+diff panel (both short-range and Long View) only had toggle checkboxes "
               "on the lower diff chart (MES-MYM/MES-M2K/MYM-M2K). Added a matching 'Symbols:' "
