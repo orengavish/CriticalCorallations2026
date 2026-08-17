@@ -1,6 +1,63 @@
 # Claude State — CriticalCorallations2026
 > **Living doc. Update every time scope changes, a task completes, or context shifts.**
-> Last updated: 2026-07-20
+> Last updated: 2026-08-17 ~18:45 UTC
+
+---
+
+## 2026-08-17 — full cross-project operations check + fixes; merge-planning docs for Galgo2027 started
+
+**Context**: user asked to (1) verify every moving part across all 3 sibling projects plus
+IB Gateway is actually running, and (2) separately, assemble 3 self-contained briefing docs
+(one per project) as the seed input for a new consolidation project, **Galgo2027**
+(`C:\Projects\Galgo2027`) — see that folder for `CRITICALCORALLATIONS2026.md`,
+`FETCHER2026.md`, and `GEVAEXTRACT.md` (as of this update, the first two are written;
+GevaExtract's is still pending — this session's work was interrupted by the ops-check ask).
+
+**Operations manuals now exist and are the authoritative runbooks** — don't re-derive
+this from scratch next time, read these first:
+- `C:\Projects\Fetcher2026\OPERATIONS.md` — Fetcher2026's own two pipelines (TRADES/BID_ASK
+  tick CSVs + the newer 1s/5s/30s OHLCV bars pipeline), how to check/start each piece, and
+  the known SYSTEM-context Gateway auto-restart bug (still unfixed, needs elevated access).
+- `C:\Projects\GevaExtract\OPERATIONS.md` — covers the whole trading pipeline including
+  this repo (CC2026) and IB Gateway itself: system map, health-check commands, incident log.
+  Read this one first for anything Gateway-related.
+- `C:\Projects\Fetcher2026\BARS1S_STATUS.md` — long-form incident history for the bars
+  pipeline specifically (very detailed, many dated update blocks).
+
+**Full health check performed 2026-08-17 ~18:30-18:45 UTC** — confirmed live:
+
+| Component | Port | Status |
+|---|---|---|
+| IB Gateway (paper, via IBC) | 4002 | up, 5 established connections |
+| CC2026 dashboard | 5003 | up, v4.26 |
+| CC2026 session (broker+decider) | — | both `running` |
+| Fetcher2026 dashboard | 5050 | up |
+| Fetcher2026 bars-status server | 5004 | up, all 3 bar stages healthy (see fix below) |
+| GevaExtract server | 5005 | up |
+| `GevaAutoTrade` scheduled task | — | last result 0 (success), next run on schedule |
+| `GevaExtract\DailyExtract` scheduled task | — | last result 0 (success), next run on schedule |
+
+**Not installed as scheduled tasks** (rely on manual/session start instead, both currently
+up anyway): no `GalgoFetcher2026`/`GalgoDashboard2026` tasks for Fetcher2026's own pipeline
+despite `scripts/install_scheduler.ps1` existing; no CC2026 auto-start-on-boot task either.
+
+**Fixed**: Fetcher2026's `5s` bars-fetch stage had been silently idle for ~19 days (a stale
+scheduler-weight debt left over from a prior 19-day outage, unrelated to today) — reset and
+verified recovered. Full detail: `Fetcher2026\BARS1S_STATUS.md` §0n.
+
+**Found but deliberately NOT fixed (needs your sign-off — changes live trading-decision
+logic)**: GevaExtract's daily auto-trade pipeline has been building 0 trade candidates since
+2026-08-15 because its "do we already have today's lines" check doesn't verify the line's
+date is actually today — it's been running off a 2026-08-13 post for 3+ days straight, task
+"succeeds" every time so nothing alerted. No bad orders went out (0 candidates passed either
+way), but the daily fetch/trade purpose is defeated. Proposed fix already written up in
+`GevaExtract\OPERATIONS.md`'s incident log — just needs a decision.
+
+**Also found, not fixed (low priority, cosmetic)**: this repo's own `PostToolUse` self-test
+hook (`.claude/settings.local.json`) points at
+`C:/Projects/galgo2026/.claude/hooks/selftest_on_edit.py`, which doesn't exist — fires a
+(harmless) error on every Write/Edit in this session. Likely a leftover from the pre-split
+monolith. Fix by pointing it at a real script or removing the hook entry.
 
 ---
 
@@ -22,12 +79,21 @@ I am the Claude instance for **CriticalCorallations2026** — the algo analysis 
 |-----|------|---------|
 | `back-trading/trading_dashboard.py` | **5003** | `python back-trading/trading_dashboard.py` |
 
-Tabs: **Lines \| Graph \| Create Trades \| Submitted**
+Tabs: **Lines \| Graph \| All \| Sandbox \| Create Trades \| Submitted**
 
-DB: `trader/data/galao.db`
-History data (tick CSVs): read from `C:\Projects\Fetcher2026\data\history\` (owned by brother)
+DB: `trader/data/galao.db` (shared with GevaExtract — see below) + `trader/data/bars.db`
+(1yr of 30-min bars, MES/MYM/M2K, now with sanity-checked normalized/diff tables — see
+v4.25/v4.26 below)
+History data (tick CSVs): documented as read from `C:\Projects\Fetcher2026\data\history\`,
+but per Fetcher2026's own `OPERATIONS.md`, the actually-live path is
+`C:\Projects\Galgo2026\june\trader\data\history\` — unconfirmed whether this dashboard's own
+code still points at the older path or was updated; check before assuming Graph/All tabs are
+reading current data if they ever look stale.
 
-Current version: **v4.20** — All tab: unified Day/Week/Month/2mo/6mo/Year range presets
+Current version: **v4.26** — All tab overlay chart gets Symbols checkboxes (matching Pairs
+on the diff chart); v4.25 wired the Long View diff panel to read precomputed
+`bars_30m_diffs_normalized` at native 30m res instead of recomputing on every request. Full
+list in `_RELEASE_NOTES` in `trading_dashboard.py` or `git log --oneline`.
 
 **Session manager is live and proven.** `trader/session.py` supervises broker.py + decider.py as
 managed subprocesses (stdout to `trader/logs/{broker,decider}_stdout.log`, crash-restart with
