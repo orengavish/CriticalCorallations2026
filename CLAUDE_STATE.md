@@ -1,6 +1,78 @@
 # Claude State — CriticalCorallations2026
 > **Living doc. Update every time scope changes, a task completes, or context shifts.**
-> Last updated: 2026-08-17 ~18:45 UTC
+> Last updated: 2026-08-18
+
+---
+
+## 2026-08-18 — full project rescan: dashboard had drifted to v5.03 without this doc noticing; new RESTART_PROJECT.md and ORCHESTRATOR.md added
+
+**Why this matters**: the previous update below (2026-08-17) described the dashboard at
+v4.26 with an All-tab overlay+diff panel, Long View/bars.db Month+ presets, etc. Between
+that update and this one, **eight more versions shipped (v4.27 → v5.03)** — a large nav
+rebuild and several new tabs — landing on `master` without this file being touched. Net
+effect: this doc was actively wrong, not just stale, for part of that window. Lesson: don't
+trust a "current version" claim in here without cross-checking `git log --oneline -5`
+first; this file only reflects whichever session last remembered to update it.
+
+**What actually changed, v4.27 → v5.03** (see `_RELEASE_NOTES` in `trading_dashboard.py`
+for full detail on each):
+- **v5.00 — full navigation rebuild.** Replaced 12 flat top-level tabs with a left rail of
+  groups + a contextual top tab strip showing only the active group's tabs, a slim busy
+  strip instead of the old full-screen hourglass overlay, and a new Overview landing tab.
+- **v4.27 — Algo Lab, Sup/Res Viz, Correlation tabs.** A new parameterized paper-trading
+  algo framework (`lib/algo_engine.py`, `lib/algo_lab.py`, `lib/algo_pnl.py`): submits
+  batches of (strategy × tp × sl × direction × strength) combos as paper trades tagged
+  `source='algo_lab'`, with P&L-by-params breakdown against the live `verified_trades` view.
+  Sup/Res Viz: candlestick + all `critical_lines` overlaid, color-coded by detection
+  source. Correlation: new `lib/correlation_lab.py`, rolling Pearson correlation over
+  `bars.db` log-returns.
+- **v5.01 — Correlation now runs on 7 years, not 1.** Merged Databento CSV history
+  (`data/bars_7years_30m_*.csv`, 2019-05-05 onward) into `bars_30m` via
+  `scripts/import_7year_bars.py` (INSERT OR IGNORE, never clobbers the live-IB-backfilled
+  recent rows). `bars_30m` went from ~11.8k to ~85k rows/symbol.
+- **v5.02 — real price feed fixed; nav simplified.** Header price chips and
+  `/api/trades/create`'s live-price filter had been silently dead the whole time —
+  `_TRADER_URL` pointed at the forbidden legacy port 5001. Wired `price_cache`
+  read/write for real (broker.py now populates it on every fill). Removed the "Explore"
+  rail group (folded into Charts/Correlation); Create Trades moved into the Levels group.
+  **Data-quality finding, not fixed**: 412 MNQ + 400 MES `commands` rows tagged
+  `source='geva_extract'` are shaped like an `algo_lab`-style parameter grid, not a single
+  scraped Facebook call — distorting P&L-by-source views. galao.db deliberately left
+  untouched (shared with GevaExtract) — flagged for later cleanup only.
+- **v5.03 — All tab overlay/Long View removed entirely; Geva Extract into rail menu.**
+  **This deleted essentially all of the All-tab overlay+diff-panel work described in this
+  file's 2026-08-17 section below and in `Galgo2027\CRITICALCORALLATIONS2026.md`** —
+  `_loadOverlayAll`/`_plotAllOverlay`/`_plotAllDiff`/`_wireAllZoomMirror`/`_pairKey`, the
+  `chart-all-overlay`/`chart-all-diff` divs, the Month/2mo/6mo/Year presets, and the whole
+  Long View/`bars.db` code path (`_loadLongOverlay`, `setLVRes`, `/api/bars-long`) are all
+  gone. All tab is now capped at Day/Week/2 Week (tick-CSV only) and always shows the
+  3-column per-symbol candlestick grid with critical-line overlays — that grid already had
+  the tooltip/overlay functionality the removed panel was for, so the panel was dead
+  weight. **`bars.db` and its normalized/diff tables still exist and are still used by
+  Correlation** — only the All-tab UI that consumed `bars_30m_diffs_normalized` is gone,
+  not the tables themselves.
+
+**Current navigation** (v5.03): left rail groups — **Overview | Levels | Charts |
+Correlation | Algo Lab | Trading** — plus a standalone Geva Extract link (opens :5005).
+- Overview: session status + P&L-by-source rollup, quick links.
+- Levels: Lines (S/R levels + algo checkboxes with formula tooltips) | Sandbox | Create
+  Trades.
+- Charts: Graph (default tab) | All (3-col grid, Day/Week/2Week only) | Test | Sup/Res Viz.
+- Correlation: 4×4 heatmap + rolling correlation chart, 7yr history.
+- Algo Lab: Grid & Submit | P&L Breakdown.
+- Trading: Submitted (just the one tab now — Create Trades moved to Levels in v5.02).
+
+**Consequence for the Galgo2027 merge-briefing docs** (`C:\Projects\Galgo2027\`): the
+`CRITICALCORALLATIONS2026.md` written 2026-07-21/22 is now significantly stale — it
+describes the removed overlay panel as current functionality and doesn't mention Algo Lab,
+Correlation, Sup/Res Viz, or the nav rebuild at all. **Needs a rewrite before Galgo2027
+work resumes**, not just a patch. `GEVAEXTRACT.md` for that same folder was never finished
+in the first place.
+
+**Added this session**: `RESTART_PROJECT.md` (fresh-PC bootstrap for the whole 3-project
+system, supersedes the badly-outdated `NEW_PC_SETUP.md`) and `ORCHESTRATOR.md` (briefing
+for a higher-level Claude Code session coordinating this project alongside its siblings and
+other algo projects in parallel).
 
 ---
 
@@ -79,21 +151,24 @@ I am the Claude instance for **CriticalCorallations2026** — the algo analysis 
 |-----|------|---------|
 | `back-trading/trading_dashboard.py` | **5003** | `python back-trading/trading_dashboard.py` |
 
-Tabs: **Lines \| Graph \| All \| Sandbox \| Create Trades \| Submitted**
+Navigation (v5.03, left rail + contextual top tabs — see the 2026-08-18 section above for
+detail): **Overview | Levels (Lines/Sandbox/Create Trades) | Charts (Graph/All/Test/Sup-Res
+Viz) | Correlation | Algo Lab (Grid & Submit/P&L Breakdown) | Trading (Submitted)**, plus a
+standalone Geva Extract link.
 
 DB: `trader/data/galao.db` (shared with GevaExtract — see below) + `trader/data/bars.db`
-(1yr of 30-min bars, MES/MYM/M2K, now with sanity-checked normalized/diff tables — see
-v4.25/v4.26 below)
+(`bars_30m` now ~85k rows/symbol, 7yr history via Databento import as of v5.01; still used
+by Correlation, no longer by the All tab, which dropped its bars.db-backed Long View
+entirely in v5.03).
 History data (tick CSVs): documented as read from `C:\Projects\Fetcher2026\data\history\`,
 but per Fetcher2026's own `OPERATIONS.md`, the actually-live path is
 `C:\Projects\Galgo2026\june\trader\data\history\` — unconfirmed whether this dashboard's own
 code still points at the older path or was updated; check before assuming Graph/All tabs are
 reading current data if they ever look stale.
 
-Current version: **v4.26** — All tab overlay chart gets Symbols checkboxes (matching Pairs
-on the diff chart); v4.25 wired the Long View diff panel to read precomputed
-`bars_30m_diffs_normalized` at native 30m res instead of recomputing on every request. Full
-list in `_RELEASE_NOTES` in `trading_dashboard.py` or `git log --oneline`.
+Current version: **v5.03**. Full list in `_RELEASE_NOTES` in `trading_dashboard.py` or
+`git log --oneline` — don't trust this file's own version claim without checking that
+directly first (see the 2026-08-18 section above for why).
 
 **Session manager is live and proven.** `trader/session.py` supervises broker.py + decider.py as
 managed subprocesses (stdout to `trader/logs/{broker,decider}_stdout.log`, crash-restart with

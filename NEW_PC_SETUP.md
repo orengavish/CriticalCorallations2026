@@ -1,5 +1,11 @@
 # New PC Setup — Galgo June 2026
 
+> **SUPERSEDED as of 2026-08-18 — see `RESTART_PROJECT.md` instead.** This doc predates the
+> split into CriticalCorallations2026/Fetcher2026/GevaExtract, references the abandoned
+> `galgo2026.git` monolith and `june/` folder layout, and its raw-`ibapi`/TWS-API install
+> path (§5) was replaced by `ib-insync` long ago. Kept only for historical reference —
+> following it on a fresh machine will not produce a working system.
+
 Follow these steps in order. Everything after "git clone" is self-contained.
 
 ---

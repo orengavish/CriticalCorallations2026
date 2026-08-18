@@ -1,6 +1,17 @@
 # CriticalCorallations2026 (CC2026) — Galgo2027 Handoff Document
 > Complete briefing for a fresh Claude instance. No prior context needed.
 > Written: 2026-07-21 | Version at time of writing: v4.26
+> **CORRECTIONS ADDED 2026-08-18 — READ THIS FIRST.** The dashboard shipped 8 more versions
+> (v4.27 → v5.03) after this doc was written, without anyone updating it. The most
+> significant drift: **§6 (Dashboard GUI) below describes the All tab's overlay+diff panel
+> and Long View bars.db integration as current — both were fully deleted in v5.03.** The
+> nav structure also changed completely (flat tabs → left rail + contextual top tabs). New
+> functionality this doc doesn't mention at all: Algo Lab, Sup/Res Viz, and Correlation
+> tabs (v4.27+), a real price feed (v5.02), and 7 years of bars.db history (v5.01). See
+> `CLAUDE_STATE.md`'s 2026-08-18 section for the full accurate rundown, and treat §6 below
+> as historical/wrong rather than current. The rest of this doc (DB schema, config, rules,
+> git, permissions) is still substantially accurate as of 2026-08-18 — only the GUI/nav
+> section and the version number are known-stale.
 
 ---
 
