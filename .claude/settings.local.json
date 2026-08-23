@@ -1,12 +1,27 @@
 {
   "permissions": {
-    "defaultMode": "bypassPermissions",
     "allow": [
       "Bash(*)",
       "PowerShell(*)",
       "Write(*)",
       "Edit(*)",
-      "mcp__galao_db__*"
+      "mcp__galao_db__*",
+      "Skill(update-config)",
+      "Skill(update-config:*)",
+      "Bash(python -c ' *)",
+      "Bash(mkdir -p \"C:\\\\Users\\\\galsh\\\\.claude\\\\plans\" 2>/dev/null; echo ok)",
+      "Bash(cat /tmp/dash_server.log)",
+      "Read(//tmp/**)",
+      "Bash(curl -s -X POST http://127.0.0.1:5003/api/trades/create -H \"Content-Type: application/json\" -d '{\"symbols\":[\"MES\",\"MNQ\",\"MYM\",\"M2K\"],\"brackets\":[2,4,10],\"min_strength\":1}')",
+      "Bash(curl -s http://127.0.0.1:5003/api/build_db/status)",
+      "Bash(curl -s http://127.0.0.1:5003/)",
+      "Read(//c/Projects/Fetcher2026/trader//**)",
+      "Read(//c/Projects/Fetcher2026/trader/**)",
+      "Read(//c/Projects/Fetcher2026/logs//**)"
+    ],
+    "defaultMode": "bypassPermissions",
+    "additionalDirectories": [
+      "C:\\Users\\galsh\\.claude"
     ]
   },
   "enableAllProjectMcpServers": true,

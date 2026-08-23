@@ -2720,6 +2720,115 @@ def _get_current_price():
         return None, None
 
 
+# ── Bars (30-min history) ─────────────────────────────────────────────────────
+
+_BARS_DB = Path(__file__).resolve().parent.parent / "data" / "bars.db"
+
+_RESAMPLE_MAP = {
+    "30m": "30min", "1h": "1h", "4h": "4h", "1d": "1d",
+}
+
+def _get_bars_con():
+    if not _BARS_DB.exists():
+        return None
+    return sqlite3.connect(f"file:{_BARS_DB}?mode=ro", uri=True,
+                           detect_types=sqlite3.PARSE_DECLTYPES)
+
+
+@app.route("/api/bars")
+def api_bars():
+    """
+    GET /api/bars?symbol=MES&days=30&resolution=30m
+    GET /api/bars?pair=MES-MYM&days=90&resolution=1h
+    Returns JSON {ts[], open[], high[], low[], close[], volume[]} for single symbol
+    or {ts[], spread[]} for a pair (normalized close_a - close_b).
+    """
+    import pandas as pd
+
+    days       = min(int(request.args.get("days", 30)), 365)
+    resolution = request.args.get("resolution", "30m")
+    pair       = request.args.get("pair", "")
+    symbol     = request.args.get("symbol", "")
+    freq       = _RESAMPLE_MAP.get(resolution, "30min")
+
+    con = _get_bars_con()
+    if con is None:
+        return jsonify({"error": "bars.db not found — run backfill_bars.py first"}), 404
+
+    try:
+        cutoff = pd.Timestamp.utcnow() - pd.Timedelta(days=days)
+        cutoff_str = cutoff.isoformat()
+
+        if pair:
+            parts = pair.upper().split("-")
+            if len(parts) != 2:
+                return jsonify({"error": "pair must be SYM_A-SYM_B"}), 400
+            sym_a, sym_b = parts
+
+            def load(sym):
+                df = pd.read_sql(
+                    "SELECT ts, close FROM bars_30m WHERE symbol=? AND ts>=? ORDER BY ts",
+                    con, params=(sym, cutoff_str), parse_dates=["ts"]
+                )
+                df = df.set_index("ts").rename(columns={"close": sym})
+                return df
+
+            da, db_ = load(sym_a), load(sym_b)
+            merged = da.join(db_, how="inner")
+            if merged.empty:
+                return jsonify({"error": f"No overlapping data for {sym_a}/{sym_b}"}), 404
+
+            if freq != "30min":
+                merged = merged.resample(freq).agg("last").dropna()
+
+            # Normalise to first value → spread centred near 0
+            merged[sym_a] = merged[sym_a] / merged[sym_a].iloc[0]
+            merged[sym_b] = merged[sym_b] / merged[sym_b].iloc[0]
+            spread = (merged[sym_a] - merged[sym_b]).round(6)
+
+            return jsonify({
+                "pair":   pair,
+                "ts":     merged.index.strftime("%Y-%m-%dT%H:%M:%SZ").tolist(),
+                "spread": spread.tolist(),
+                "sym_a":  merged[sym_a].round(6).tolist(),
+                "sym_b":  merged[sym_b].round(6).tolist(),
+            })
+
+        else:
+            sym = symbol.upper() or "MES"
+            df = pd.read_sql(
+                "SELECT ts, open, high, low, close, volume FROM bars_30m "
+                "WHERE symbol=? AND ts>=? ORDER BY ts",
+                con, params=(sym, cutoff_str), parse_dates=["ts"]
+            )
+            if df.empty:
+                return jsonify({"error": f"No data for {sym}"}), 404
+            df = df.set_index("ts")
+            if freq != "30min":
+                df = df.resample(freq).agg(
+                    {"open": "first", "high": "max", "low": "min",
+                     "close": "last", "volume": "sum"}
+                ).dropna()
+
+            return jsonify({
+                "symbol": sym,
+                "ts":     df.index.strftime("%Y-%m-%dT%H:%M:%SZ").tolist(),
+                "open":   df["open"].round(4).tolist(),
+                "high":   df["high"].round(4).tolist(),
+                "low":    df["low"].round(4).tolist(),
+                "close":  df["close"].round(4).tolist(),
+                "volume": df["volume"].round(0).tolist(),
+            })
+    finally:
+        con.close()
+
+
+@app.route("/all")
+def all_page():
+    bars_ready = _BARS_DB.exists()
+    return render_template("all.html", active="all", bars_ready=bars_ready)
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Galao visualizer")
     parser.add_argument("--self-test", action="store_true")

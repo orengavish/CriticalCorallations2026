@@ -1,0 +1,259 @@
+{% extends "base.html" %}
+{% block title %}All — Galao{% endblock %}
+
+{% block content %}
+<style>
+  .all-controls{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:16px}
+  .all-controls select,.all-controls button{background:#161b22;border:1px solid #30363d;color:#e6edf3;
+    border-radius:6px;padding:5px 12px;font-size:.83rem;cursor:pointer}
+  .all-controls button:hover{background:#21262d}
+  .all-controls label{font-size:.82rem;color:#8b949e}
+  .all-section{margin-bottom:28px}
+  .all-section-title{font-size:.78rem;font-weight:600;color:#8b949e;text-transform:uppercase;
+    letter-spacing:.06em;margin-bottom:8px;padding-bottom:5px;border-bottom:1px solid #21262d}
+  .chart-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px}
+  .chart-grid.cols2{grid-template-columns:1fr 1fr 1fr}
+  .chart-wrap{background:#0d1117;border:1px solid #21262d;border-radius:8px;padding:12px}
+  .chart-lbl{font-size:.74rem;color:#8b949e;margin-bottom:6px;font-weight:600}
+  .chart-wrap canvas{display:block;width:100%!important}
+  .no-data{color:#6e7681;font-size:.84rem;padding:18px;text-align:center}
+  .stat-row{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:6px}
+  .sbar{background:#161b22;border:1px solid #30363d;border-radius:4px;padding:3px 9px;
+    font-size:.76rem;color:#8b949e}
+  .sbar b{color:#e6edf3}
+  @media(max-width:900px){.chart-grid{grid-template-columns:1fr}}
+</style>
+
+{% if not bars_ready %}
+<div style="padding:32px;text-align:center">
+  <div style="font-size:1.1rem;color:#f0883e;margin-bottom:10px">bars.db not found</div>
+  <div style="color:#8b949e;font-size:.88rem">Run the backfill script first:</div>
+  <pre style="background:#161b22;border:1px solid #30363d;border-radius:6px;padding:12px;
+    display:inline-block;margin-top:10px;font-size:.82rem;color:#79c0ff">
+cd C:\Projects\CriticalCorallations2026\trader
+python ..\scripts\backfill_bars.py --port 4001</pre>
+</div>
+{% else %}
+
+<div class="all-controls">
+  <label>Days
+    <select id="ctl-days">
+      <option value="7">7d</option>
+      <option value="30" selected>30d</option>
+      <option value="90">90d</option>
+      <option value="180">180d</option>
+      <option value="365">1 yr</option>
+    </select>
+  </label>
+  <label>Resolution
+    <select id="ctl-res">
+      <option value="30m" selected>30 min</option>
+      <option value="1h">1 hour</option>
+      <option value="4h">4 hour</option>
+      <option value="1d">Daily</option>
+    </select>
+  </label>
+  <button onclick="loadAll()">&#x21BA; Refresh</button>
+  <span id="all-status" style="font-size:.78rem;color:#8b949e"></span>
+</div>
+
+<!-- ── Upper: individual symbols ─────────────────────────────────────────── -->
+<div class="all-section">
+  <div class="all-section-title">Individual — Price &amp; Volume</div>
+  <div class="stat-row" id="sym-stats"></div>
+  <div class="chart-grid" id="sym-charts">
+    <div class="chart-wrap"><div class="chart-lbl">MES</div><canvas id="ch-MES" height="160"></canvas></div>
+    <div class="chart-wrap"><div class="chart-lbl">MYM</div><canvas id="ch-MYM" height="160"></canvas></div>
+    <div class="chart-wrap"><div class="chart-lbl">M2K</div><canvas id="ch-M2K" height="160"></canvas></div>
+  </div>
+</div>
+
+<!-- ── Lower: pairs ───────────────────────────────────────────────────────── -->
+<div class="all-section">
+  <div class="all-section-title">Pairs — Normalized Spread (A − B, straight line = correlated)</div>
+  <div class="chart-grid" id="pair-charts">
+    <div class="chart-wrap"><div class="chart-lbl">MES − MYM</div><canvas id="ch-MES-MYM" height="160"></canvas></div>
+    <div class="chart-wrap"><div class="chart-lbl">MES − M2K</div><canvas id="ch-MES-M2K" height="160"></canvas></div>
+    <div class="chart-wrap"><div class="chart-lbl">MYM − M2K</div><canvas id="ch-MYM-M2K" height="160"></canvas></div>
+  </div>
+</div>
+
+{% endif %}
+{% endblock %}
+
+{% block scripts %}
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.2/dist/chart.umd.min.js"></script>
+<script>
+{% if bars_ready %}
+const SYMS  = ['MES','MYM','M2K'];
+const PAIRS = ['MES-MYM','MES-M2K','MYM-M2K'];
+const SYM_COLOR  = {MES:'#58a6ff', MYM:'#3fb950', M2K:'#f78166'};
+const PAIR_COLOR = {'MES-MYM':'#d2a8ff','MES-M2K':'#79c0ff','MYM-M2K':'#56d364'};
+const _charts = {};
+
+Chart.defaults.color = '#8b949e';
+Chart.defaults.borderColor = '#21262d';
+
+function destroyChart(id) {
+  if (_charts[id]) { _charts[id].destroy(); delete _charts[id]; }
+}
+
+function buildSymChart(id, sym, data) {
+  destroyChart(id);
+  const ctx = document.getElementById(id);
+  if (!ctx) return;
+  const color = SYM_COLOR[sym] || '#58a6ff';
+  _charts[id] = new Chart(ctx, {
+    data: {
+      labels: data.ts.map(t => t.slice(5,16)),
+      datasets: [
+        {
+          type: 'bar',
+          label: 'Volume',
+          data: data.volume,
+          backgroundColor: 'rgba(88,166,255,0.18)',
+          yAxisID: 'yv',
+          order: 2,
+        },
+        {
+          type: 'line',
+          label: sym,
+          data: data.close,
+          borderColor: color,
+          borderWidth: 1.5,
+          pointRadius: 0,
+          tension: 0,
+          yAxisID: 'yp',
+          order: 1,
+        }
+      ]
+    },
+    options: {
+      responsive: true,
+      interaction: { mode: 'index', intersect: false },
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          callbacks: {
+            label: ctx => ctx.dataset.label === sym
+              ? sym + ': ' + ctx.parsed.y.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2})
+              : 'Vol: ' + Math.round(ctx.parsed.y).toLocaleString()
+          }
+        }
+      },
+      scales: {
+        x: { ticks: { maxTicksLimit: 8, maxRotation: 0 }, grid: { display: false } },
+        yp: { position: 'left',  ticks: { maxTicksLimit: 5 } },
+        yv: { position: 'right', ticks: { maxTicksLimit: 4 }, grid: { drawOnChartArea: false } },
+      }
+    }
+  });
+}
+
+function buildPairChart(id, pair, data) {
+  destroyChart(id);
+  const ctx = document.getElementById(id);
+  if (!ctx) return;
+  const color = PAIR_COLOR[pair] || '#d2a8ff';
+  const [sa, sb] = pair.split('-');
+  _charts[id] = new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels: data.ts.map(t => t.slice(5,16)),
+      datasets: [
+        {
+          label: sa + ' (norm)',
+          data: data.sym_a,
+          borderColor: SYM_COLOR[sa] || color,
+          borderWidth: 1,
+          pointRadius: 0,
+          tension: 0,
+          yAxisID: 'y',
+        },
+        {
+          label: sb + ' (norm)',
+          data: data.sym_b,
+          borderColor: SYM_COLOR[sb] || '#aaa',
+          borderWidth: 1,
+          pointRadius: 0,
+          tension: 0,
+          borderDash: [4,3],
+          yAxisID: 'y',
+        },
+        {
+          label: 'Spread A−B',
+          data: data.spread,
+          borderColor: color,
+          borderWidth: 2,
+          pointRadius: 0,
+          tension: 0,
+          yAxisID: 'ys',
+        }
+      ]
+    },
+    options: {
+      responsive: true,
+      interaction: { mode: 'index', intersect: false },
+      plugins: { legend: { labels: { boxWidth: 10, font: { size: 10 } } } },
+      scales: {
+        x:  { ticks: { maxTicksLimit: 8, maxRotation: 0 }, grid: { display: false } },
+        y:  { position: 'left',  ticks: { maxTicksLimit: 5 }, title: { display: true, text: 'Norm price', font:{size:9} } },
+        ys: { position: 'right', ticks: { maxTicksLimit: 5 }, grid: { drawOnChartArea: false },
+              title: { display: true, text: 'Spread', font:{size:9} } },
+      }
+    }
+  });
+}
+
+async function loadAll() {
+  const days = document.getElementById('ctl-days').value;
+  const res  = document.getElementById('ctl-res').value;
+  const st   = document.getElementById('all-status');
+  st.textContent = 'Loading...';
+
+  const symFetches  = SYMS.map(s  => fetch(`/api/bars?symbol=${s}&days=${days}&resolution=${res}`).then(r=>r.json()));
+  const pairFetches = PAIRS.map(p => fetch(`/api/bars?pair=${p}&days=${days}&resolution=${res}`).then(r=>r.json()));
+
+  const [symResults, pairResults] = await Promise.all([
+    Promise.all(symFetches),
+    Promise.all(pairFetches),
+  ]);
+
+  // Symbol charts
+  const statHtml = symResults.map((d, i) => {
+    if (d.error) return `<span class="sbar" style="color:#f0883e">${SYMS[i]}: ${d.error}</span>`;
+    const last = d.close?.at(-1);
+    const first = d.close?.[0];
+    const chg = last && first ? ((last-first)/first*100).toFixed(2) : null;
+    const col = chg >= 0 ? '#3fb950' : '#f85149';
+    return `<span class="sbar">${SYMS[i]} <b>${last?.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2}) ?? '--'}</b>`
+      + (chg !== null ? ` <span style="color:${col}">${chg>=0?'+':''}${chg}%</span>` : '') + `</span>`;
+  }).join('');
+  document.getElementById('sym-stats').innerHTML = statHtml;
+
+  SYMS.forEach((sym, i) => {
+    const d = symResults[i];
+    if (!d.error) buildSymChart('ch-' + sym, sym, d);
+    else document.getElementById('ch-' + sym).parentElement.innerHTML =
+      `<div class="chart-lbl">${sym}</div><div class="no-data">${d.error}</div>`;
+  });
+
+  // Pair charts
+  PAIRS.forEach((pair, i) => {
+    const d = pairResults[i];
+    const cid = 'ch-' + pair;
+    if (!d.error) buildPairChart(cid, pair, d);
+    else document.getElementById(cid).parentElement.innerHTML =
+      `<div class="chart-lbl">${pair}</div><div class="no-data">${d.error}</div>`;
+  });
+
+  st.textContent = `Loaded ${days}d @ ${res} — ${new Date().toLocaleTimeString()}`;
+}
+
+// Initial load
+loadAll();
+document.getElementById('ctl-days').addEventListener('change', loadAll);
+document.getElementById('ctl-res').addEventListener('change', loadAll);
+{% endif %}
+</script>
+{% endblock %}
