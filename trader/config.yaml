@@ -70,6 +70,7 @@ paths:
   bars: data/bars.db          # 30m bars, read-only for algo_lab/correlation_lab
   critical_lines: data/critical_lines
   history: data/history
+  cl_algo_history: C:\Projects\CriticalCorallations2026\june\trader\data\history  # real tick CSVs live here (bug 6) -- NOT trader/data/history
   logs: logs
   versions: versions
 

@@ -244,4 +244,25 @@ Following ChatGPT review. All decisions confirmed by user.
 - `rules_book.md` → v0.6.0 (section 16: Back-Trading Rules R-BT-01 to R-BT-23)
 - `running_book.md` → v0.6.0 (section 13: back-trading commands)
 
+## v0.7.0 — 2026-08-23
+
+### Bug fixes: CL Algo path resolution, strength-scale inversion, look-ahead bias, RECONCILE_REQUIRED dead end
+
+**Bug 6 — CL Algo `history_dir` resolved to nothing:** `run_cl_algo_pipeline.py` derived `hist_dir` from `db_path.parent / "history"`, which never existed (the real tick CSVs live at a separate path outside this repo). Now reads `cfg.paths.cl_algo_history` directly. Added the same key to `back-trading/config.yaml` (not just `trader/config.yaml`) since scripts run as `python back-trading/*.py` load the nearer config file, not `trader/config.yaml`. **All CL Algo pipeline results produced before this fix are invalid** (the pipeline was silently finding zero ready days).
+
+**Bug 7 — strength-scale inversion:** `trading_dashboard.py`'s auto-line generator (`_generate_lines`) emitted strength 10=strongest..3=weakest, while `algo_engine.py`'s `strength_max` filter and the manual critical-lines loader use 1=strongest..3=weakest. Every auto-detected line scored ≥5 and was silently dropped by the engine. Fixed by tiering the emitter's legacy 1-10 priority score into the 1-3 convention at its single point of emission (the shared `add()` helper), plus fixing two merge/dedup sort directions in the same file that depended on the old "higher=stronger" convention. **All prior Algo Lab auto-detected-line results are invalid** (the engine was filtering out essentially every auto-detected line).
+
+**Bug 8 — look-ahead bias in batch backtest:** `/api/analyze_all` (and `/api/build_db` with `force=True`) computed PDH/PDL/PDC/PDO for date D from D's own full-session ticks, then simulated D's morning against levels only knowable at end-of-day. `_generate_lines` now accepts an optional `ohlc_ticks` parameter; the batch/force=True path in `_build_lines_for` sources it from the nearest prior session (never D's own ticks) for PDH/PDL/PDC/PDO specifically. Every other line type (pivot/ORB/VWAP/volume/round) is unaffected — those are legitimately intraday. The interactive (non-batch) path already sourced levels from a walked-back prior session and is unchanged. **All prior batch-backtest (`/api/analyze_all`) results are invalid.**
+
+**Bug 4 — RECONCILE_REQUIRED had no repair path:** Added `reconcile_stuck_commands()` to `trader/broker.py`, called every poll cycle. Sweeps `RECONCILE_REQUIRED` rows with `fill_price IS NULL` (never-filled entries) against IB's current `trades()`: found+filled → FILLED, found+cancelled → CANCELLED, genuinely absent → CANCELLED. The ~1,400-row backlog is swept automatically on the first poll after deploy — no separate migration needed.
+
+**Bug 5 — 57 FILLED commands with no staleness detector:** `poll_tp_sl_fills()` now builds `known_oids` from every poll's `trades()` call (before its early-return, since most cycles have zero new TP/SL fills) and flags a FILLED command `RECONCILE_REQUIRED` once both its TP and SL order ids have aged out of IB's cache for over `_STALE_FILLED_MINUTES` (90min). `reconcile_stuck_commands()` extended with a second branch for `fill_price IS NOT NULL` rows: flat position → closes with an approximated exit price from `price_cache`, position still open → left alone with a logged warning (the one genuinely ambiguous case). `reconcile_naked_positions()` promoted from startup-only to running every poll cycle alongside the others.
+
+**Bug 10 (schema) — geva_extract grid attribution:** Added nullable `strategy_variant TEXT` column to `commands` (schema + migration in `lib/db.py`). Additive-only, no backfill, no retagging of existing `source='geva_extract'` rows. Lets a bracket-grid fan-out (32 commands from one scraped line) share a group id, distinguishing grid volume from a single signal in P&L-by-source views.
+
+**Bugs 3 & 11 (cross-repo) — read-only `get_priority_dates()`:** Added to `lib/db.py` as a drop-in for Fetcher2026's `fetch_priority.py`, which was opening `galao.db` via a stale path. Documented calling convention in its docstring (Fetcher2026 must import it under a distinct alias to avoid a `lib.db` module-name collision).
+
+### Files changed
+`back-trading/run_cl_algo_pipeline.py`, `back-trading/config.yaml`, `back-trading/trading_dashboard.py`, `trader/broker.py`, `lib/db.py`
+
 <!-- New releases go above this line, most recent first -->

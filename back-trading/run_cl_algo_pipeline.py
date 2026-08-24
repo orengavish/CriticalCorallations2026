@@ -232,7 +232,21 @@ def _self_test() -> bool:
             results2 = run_pipeline(db_path, hist_dir, symbols=["MES"], dry_run=False)
             assert results2["MES"]["bt"]["written"] == 0, "Re-run must not add rows"
 
-        print("PASS -- pipeline: all 4 stages complete, idempotent re-run verified")
+        # bug 6: cfg.paths.cl_algo_history must resolve to a real dir with tick CSVs
+        # (this is what __main__ actually reads -- the synthetic run above uses its
+        # own tmp hist_dir and never exercises the config path).
+        from lib.config_loader import get_config
+        cfg = get_config()
+        real_hist_dir = Path(cfg.paths.cl_algo_history)
+        assert real_hist_dir.exists(), (
+            f"cfg.paths.cl_algo_history does not exist: {real_hist_dir}"
+        )
+        assert any(real_hist_dir.glob("*.csv")), (
+            f"cfg.paths.cl_algo_history has no *.csv files: {real_hist_dir}"
+        )
+
+        print("PASS -- pipeline: all 4 stages complete, idempotent re-run verified, "
+              "cfg.paths.cl_algo_history resolves to real tick data")
         return True
 
     except Exception as e:
@@ -256,7 +270,9 @@ if __name__ == "__main__":
     from lib.config_loader import get_config
     cfg      = get_config()
     db_path  = Path(cfg.paths.db)
-    hist_dir = db_path.parent / "history"
+    # bug 6: real tick CSVs live at cfg.paths.cl_algo_history, NOT db_path.parent/"history"
+    # (which doesn't exist -- that path silently resolved to zero ready days).
+    hist_dir = Path(cfg.paths.cl_algo_history)
 
     results = run_pipeline(
         db_path    = db_path,

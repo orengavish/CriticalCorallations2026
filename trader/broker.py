@@ -31,7 +31,7 @@ import sys; sys.path.insert(0, str(_ROOT)) if str(_ROOT) not in sys.path else No
 
 from lib.config_loader import get_config
 from lib.logger import get_logger
-from lib.db import get_db, init_db, get_pending_commands, update_command_status, get_system_state, record_completed_trade, spawn_replenishment, update_price_cache
+from lib.db import get_db, init_db, get_pending_commands, update_command_status, get_system_state, record_completed_trade, spawn_replenishment, update_price_cache, get_cached_price
 from lib.ib_client import IBClient
 from lib.order_builder import build_bracket, place_bracket, round_tick
 
@@ -47,6 +47,12 @@ _TICK_BY_SYMBOL = {"MES": 0.25, "MNQ": 0.25, "MYM": 1.0, "M2K": 0.10}
 # commands stuck with no visibility, some from 18 days earlier. Past this
 # age with no match, flag for reconciliation instead of ignoring silently.
 _STALE_SUBMITTED_MINUTES = 10
+
+# 2026-07-xx incident (bug 5): same failure mode as above, one hop later -- a FILLED
+# command's TP/SL order id can age out of ibc.paper.trades() entirely, so
+# poll_tp_sl_fills() never sees the exit. 90min stays inside the 120-min daily
+# session window so this catches a vanished order id before force_close_all masks it.
+_STALE_FILLED_MINUTES = 90
 
 # Thread-safe queue: (cmd_id, fill_price) items pending TP/SL rebase
 _rebase_queue: list = []
@@ -376,7 +382,15 @@ def poll_tp_sl_fills(ibc: IBClient, db_path) -> int:
     """
     For each FILLED command, check whether IB has filled the TP or SL child order.
     When detected: write CLOSED + pnl_points + record to completed_trades.
-    Returns number of exits recorded.
+
+    Also (bug 5): flags a FILLED command RECONCILE_REQUIRED once BOTH its TP and SL
+    order ids have aged out of IB's trades() cache entirely (genuinely gone, not
+    merely unfilled) and _STALE_FILLED_MINUTES has passed since fill_time. This
+    staleness pass runs every call regardless of whether any TP/SL filled this
+    cycle -- it must NOT sit behind an "any new fills?" early return, since most
+    poll cycles have zero new TP/SL fills.
+
+    Returns number of exits recorded (not counting bug-5 RECONCILE_REQUIRED flips).
     """
     if not ibc.is_paper_connected():
         return 0
@@ -393,8 +407,10 @@ def poll_tp_sl_fills(ibc: IBClient, db_path) -> int:
         if trade.orderStatus.status == "Filled":
             ib_filled[trade.order.orderId] = trade.orderStatus.avgFillPrice
 
-    if not ib_filled:
-        return 0
+    # Every order id IB currently knows about, filled or not -- built from the SAME
+    # trades() call, BEFORE any early return, so the bug-5 staleness pass below
+    # always runs (most cycles have ib_filled == {} and would otherwise bail out here).
+    known_oids = {t.order.orderId for t in trades}
 
     with get_db(db_path) as con:
         filled_cmds = con.execute("SELECT * FROM commands WHERE status='FILLED'").fetchall()
@@ -403,6 +419,7 @@ def poll_tp_sl_fills(ibc: IBClient, db_path) -> int:
         return 0
 
     closed = 0
+    closed_ids: set = set()
     now = _now_utc()
     for cmd in filled_cmds:
         tp_oid = cmd["ib_tp_order_id"]
@@ -449,6 +466,28 @@ def poll_tp_sl_fills(ibc: IBClient, db_path) -> int:
             record_completed_trade(con, cmd["id"])
             update_price_cache(con, cmd["symbol"], exit_price, now, source="fill")
         closed += 1
+        closed_ids.add(cmd["id"])
+
+    # bug 5: flag FILLED commands whose TP/SL bracket has genuinely vanished from
+    # IB's cache (not merely unfilled) once they've sat past _STALE_FILLED_MINUTES.
+    # reconcile_stuck_commands() picks these up on a later poll via fill_price NOT NULL.
+    for cmd in filled_cmds:
+        if cmd["id"] in closed_ids:
+            continue
+        fill_time = cmd["fill_time"]
+        if not fill_time:
+            continue
+        tp_oid = cmd["ib_tp_order_id"]
+        sl_oid = cmd["ib_sl_order_id"]
+        if tp_oid not in known_oids and sl_oid not in known_oids \
+                and _minutes_since(fill_time) > _STALE_FILLED_MINUTES:
+            log.error(
+                f"Command {cmd['id']} FILLED {_minutes_since(fill_time):.0f}min ago, "
+                f"TP/SL order ids ({tp_oid}, {sl_oid}) both missing from IB trades — "
+                "flagging RECONCILE_REQUIRED"
+            )
+            with get_db(db_path) as con:
+                update_command_status(con, cmd["id"], "RECONCILE_REQUIRED")
 
     return closed
 
@@ -622,6 +661,100 @@ def replenish_if_enabled(ibc: IBClient, db_path, cfg) -> int:
     return spawned
 
 
+def reconcile_stuck_commands(ibc: IBClient, db_path) -> int:
+    """
+    Sweep RECONCILE_REQUIRED rows and resolve them automatically (bugs 4 & 5).
+    Two disjoint cases, disambiguated by fill_price:
+      - fill_price IS NULL:     never-filled entry stuck past _STALE_SUBMITTED_MINUTES
+                                 (bug 4) -- resolved against IB's current trades().
+      - fill_price IS NOT NULL: FILLED command whose TP/SL bracket order id vanished
+                                 from IB's cache before poll_tp_sl_fills could catch
+                                 the exit (bug 5) -- the bracket orders themselves are
+                                 gone from trades(), so this resolves against current
+                                 IB positions instead.
+    Every case here has an unambiguous IB answer on a paper account: found+filled,
+    found+cancelled, or genuinely gone (safe to presume cancelled/expired) -- except
+    the flat-vs-open branch below, which is the one genuinely ambiguous case (unknown
+    true exit fill) and is left as a logged warning, not auto-closed.
+    """
+    if not ibc.is_paper_connected():
+        return 0
+    try:
+        trades = ibc.paper.trades()
+    except Exception as e:
+        log.error(f"reconcile_stuck_commands: error fetching trades: {e}")
+        return 0
+    ib_status_by_oid = {t.order.orderId: (t.orderStatus.status, t.orderStatus.avgFillPrice)
+                         for t in trades}
+
+    resolved = 0
+
+    # -- case 1 (bug 4): never-filled entries --
+    with get_db(db_path) as con:
+        stuck = con.execute(
+            "SELECT * FROM commands WHERE status='RECONCILE_REQUIRED' AND fill_price IS NULL"
+        ).fetchall()
+
+    for cmd in stuck:
+        info = ib_status_by_oid.get(cmd["ib_order_id"])
+        with get_db(db_path) as con:
+            if info is None:
+                update_command_status(con, cmd["id"], "CANCELLED",
+                                       error_message="auto-reconciled: not found in IB trades")
+            else:
+                status, fill_price = info
+                if status in ("Filled", "PartiallyFilled"):
+                    update_command_status(con, cmd["id"], "FILLED",
+                                           fill_price=fill_price, fill_time=_now_utc())
+                elif status in ("Cancelled", "Inactive", "ApiCancelled"):
+                    update_command_status(con, cmd["id"], "CANCELLED")
+                else:
+                    continue
+        resolved += 1
+
+    # -- case 2 (bug 5): FILLED commands whose bracket vanished --
+    with get_db(db_path) as con:
+        stuck_filled = con.execute(
+            "SELECT * FROM commands WHERE status='RECONCILE_REQUIRED' AND fill_price IS NOT NULL"
+        ).fetchall()
+
+    if stuck_filled:
+        try:
+            positions = {p.contract.symbol: p.position for p in ibc.get_positions()}
+        except Exception as e:
+            log.error(f"reconcile_stuck_commands: error fetching positions: {e}")
+            positions = {}
+
+        for cmd in stuck_filled:
+            if positions.get(cmd["symbol"], 0) == 0:
+                with get_db(db_path) as con:
+                    # ponytail: exit_price approximated from the last cached price_cache
+                    # row, not a true IB fill -- upgrade path is querying
+                    # ibc.paper.fills()/executions() for the real exit if this proves
+                    # inaccurate in practice.
+                    last_px = get_cached_price(con, cmd["symbol"])
+                    if last_px is None:
+                        log.warning(
+                            f"Command {cmd['id']} FILLED, bracket vanished, position flat, "
+                            "but no cached price to close against -- needs human review"
+                        )
+                        continue
+                    pnl = (last_px - cmd["fill_price"]) if cmd["direction"] == "BUY" \
+                        else (cmd["fill_price"] - last_px)
+                    update_command_status(con, cmd["id"], "CLOSED",
+                                          exit_price=last_px, exit_time=_now_utc(),
+                                          exit_reason="RECONCILED", pnl_points=round(pnl, 4))
+                    record_completed_trade(con, cmd["id"])
+                resolved += 1
+            else:
+                log.warning(
+                    f"Command {cmd['id']} FILLED, bracket vanished, position still open — "
+                    "protected by reconcile_naked_positions, needs human review"
+                )
+
+    return resolved
+
+
 def reconcile_naked_positions(ibc: IBClient, cfg) -> None:
     """
     Startup-only safety check (2026-07-20 incident): if broker was offline
@@ -789,6 +922,16 @@ def run_broker(db_path=None, dry_run: bool = False):
                         log.info(f"Replenished {r} trade(s)")
                 except Exception as e:
                     log.error(f"Error in replenish_if_enabled: {e}")
+                try:
+                    rc = reconcile_stuck_commands(ibc, db_path)
+                    if rc:
+                        log.info(f"Auto-reconciled {rc} stuck command(s)")
+                except Exception as e:
+                    log.error(f"Error in reconcile_stuck_commands: {e}")
+                try:
+                    reconcile_naked_positions(ibc, cfg)
+                except Exception as e:
+                    log.error(f"Error in reconcile_naked_positions: {e}")
                 last_ib_poll = now
 
             time.sleep(poll_seconds)
@@ -846,15 +989,58 @@ def _run_broker_dry(db_path, cfg):
 
 # ── Self-test ─────────────────────────────────────────────────────────────────
 
+# ── Self-test fixtures (bugs 4 & 5 -- no real IB connection needed) ─────────────
+
+class _FakeOrder:
+    def __init__(self, order_id): self.orderId = order_id
+
+class _FakeOrderStatus:
+    def __init__(self, status, avg_fill_price=0.0):
+        self.status = status
+        self.avgFillPrice = avg_fill_price
+
+class _FakeTrade:
+    def __init__(self, order_id, status, avg_fill_price=0.0):
+        self.order = _FakeOrder(order_id)
+        self.orderStatus = _FakeOrderStatus(status, avg_fill_price)
+
+class _FakeContract:
+    def __init__(self, symbol): self.symbol = symbol
+
+class _FakePosition:
+    def __init__(self, symbol, position):
+        self.contract = _FakeContract(symbol)
+        self.position = position
+
+class _FakePaper:
+    def __init__(self, trades): self._trades = trades
+    def trades(self): return self._trades
+
+class _FakeIBClient:
+    """Minimal stand-in for IBClient's paper-account surface -- no real IB needed."""
+    def __init__(self, trades=None, positions=None):
+        self.paper = _FakePaper(trades or [])
+        self._positions = positions or []
+    def is_paper_connected(self): return True
+    def get_positions(self): return self._positions
+
+
 def self_test() -> bool:
     """
     Self-test:
     - Config loads
     - DB init + PENDING→SUBMITTING claim lock (no IB needed)
+    - reconcile_stuck_commands: missing/Filled/Cancelled RECONCILE_REQUIRED rows
+      resolve correctly against a fake IB trades() response (bug 4)
+    - poll_tp_sl_fills: a FILLED row whose TP/SL oids are absent from a fake
+      known_oids set past _STALE_FILLED_MINUTES flips to RECONCILE_REQUIRED (bug 5)
+    - reconcile_stuck_commands: a stuck FILLED (bracket-vanished) row closes when
+      flat, is left alone with a warning when the position is still open (bug 5)
     - IB connection attempt (SKIP if not available)
     - Broker loop runs for 2 poll cycles (no real orders)
     """
     import tempfile
+    from datetime import timedelta
     try:
         from lib.logger import reset_loggers
         from lib.db import set_system_state
@@ -897,7 +1083,68 @@ def self_test() -> bool:
                 set_system_state(con, "SESSION", "RUNNING")
             assert not _is_shutdown(db_path), "Running misdetected as SHUTDOWN"
 
-            # 5. IB connection attempt
+            # 5. reconcile_stuck_commands (bug 4): missing / Filled / Cancelled
+            def _insert_cmd(**overrides):
+                base = dict(symbol='MES', line_price=6500.0, line_type='SUPPORT',
+                            line_strength=2, direction='BUY', entry_type='LMT',
+                            entry_price=6500.0, tp_price=6502.0, sl_price=6498.0,
+                            bracket_size=2.0, status='RECONCILE_REQUIRED')
+                base.update(overrides)
+                cols = ", ".join(base.keys())
+                qs   = ", ".join("?" for _ in base)
+                with get_db(db_path) as con:
+                    cur = con.execute(f"INSERT INTO commands ({cols}) VALUES ({qs})",
+                                      list(base.values()))
+                    return cur.lastrowid
+
+            id_missing   = _insert_cmd(ib_order_id=9001)
+            id_filled    = _insert_cmd(ib_order_id=9002)
+            id_cancelled = _insert_cmd(ib_order_id=9003)
+
+            fake_ibc_1 = _FakeIBClient(trades=[
+                _FakeTrade(9002, "Filled", 6501.0),
+                _FakeTrade(9003, "Cancelled"),
+            ])
+            n = reconcile_stuck_commands(fake_ibc_1, db_path)
+            assert n == 3, f"expected 3 resolved, got {n}"
+            with get_db(db_path) as con:
+                s_missing   = con.execute("SELECT status FROM commands WHERE id=?", (id_missing,)).fetchone()["status"]
+                s_filled    = con.execute("SELECT status, fill_price FROM commands WHERE id=?", (id_filled,)).fetchone()
+                s_cancelled = con.execute("SELECT status FROM commands WHERE id=?", (id_cancelled,)).fetchone()["status"]
+            assert s_missing == "CANCELLED", f"missing-order case: {s_missing}"
+            assert s_filled["status"] == "FILLED" and s_filled["fill_price"] == 6501.0, \
+                f"filled case: {dict(s_filled)}"
+            assert s_cancelled == "CANCELLED", f"cancelled case: {s_cancelled}"
+
+            # 6. poll_tp_sl_fills staleness pass (bug 5): FILLED cmd, tp/sl oids
+            #    absent from a fake known_oids set, old fill_time -> RECONCILE_REQUIRED
+            old_fill_time = (datetime.now(timezone.utc) - timedelta(minutes=100)) \
+                .strftime("%Y-%m-%dT%H:%M:%SZ")
+            id_stale = _insert_cmd(status='FILLED', fill_price=6500.5, fill_time=old_fill_time,
+                                   ib_order_id=9010, ib_tp_order_id=9011, ib_sl_order_id=9012)
+            fake_ibc_2 = _FakeIBClient(trades=[_FakeTrade(9099, "Filled", 1.0)])  # unrelated oid only
+            poll_tp_sl_fills(fake_ibc_2, db_path)
+            with get_db(db_path) as con:
+                s_stale = con.execute("SELECT status FROM commands WHERE id=?", (id_stale,)).fetchone()["status"]
+            assert s_stale == "RECONCILE_REQUIRED", f"stale FILLED case: {s_stale}"
+
+            # 7. reconcile_stuck_commands case 2 (bug 5): flat position -> CLOSED,
+            #    open position -> left alone with warning
+            with get_db(db_path) as con:
+                update_price_cache(con, "MES", 6510.0, _now_utc(), source="test")
+            id_flat = _insert_cmd(symbol='MES', fill_price=6500.0, fill_time=old_fill_time,
+                                  ib_order_id=9020, ib_tp_order_id=9021, ib_sl_order_id=9022)
+            id_open = _insert_cmd(symbol='MNQ', fill_price=18000.0, fill_time=old_fill_time,
+                                  ib_order_id=9030, ib_tp_order_id=9031, ib_sl_order_id=9032)
+            fake_ibc_3 = _FakeIBClient(positions=[_FakePosition("MNQ", 1)])  # MES absent -> flat
+            reconcile_stuck_commands(fake_ibc_3, db_path)
+            with get_db(db_path) as con:
+                s_flat = con.execute("SELECT status FROM commands WHERE id=?", (id_flat,)).fetchone()["status"]
+                s_open = con.execute("SELECT status FROM commands WHERE id=?", (id_open,)).fetchone()["status"]
+            assert s_flat == "CLOSED", f"flat-position case: {s_flat}"
+            assert s_open == "RECONCILE_REQUIRED", f"open-position case should stay untouched: {s_open}"
+
+            # 8. IB connection attempt
             ibc = IBClient(cfg)
             try:
                 ibc.connect(live=True, paper=True)

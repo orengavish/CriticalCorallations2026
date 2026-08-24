@@ -3,6 +3,12 @@
 **Status:** Design complete, implementation pending  
 **Last updated:** 2026-04-26
 
+> **2026-08-23 — bug 6 & bug 7 resolved** (see `docs/release_notes.md` v0.7.0). CL Algo's
+> `history_dir` path resolution and the auto-detected-line strength scale (which the
+> engine's `strength_max` filter was silently dropping) are both fixed. **All Algo Lab
+> auto-detected-line results and all CL Algo pipeline results produced before this date
+> are invalid** and should be re-run.
+
 ---
 
 ## Table of Contents

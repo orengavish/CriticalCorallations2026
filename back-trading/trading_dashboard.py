@@ -26,7 +26,7 @@ if str(_ROOT) not in sys.path:
 
 from flask import Flask, jsonify, request, render_template_string
 
-from lib.db import get_db, get_cached_price
+from lib.db import get_db, get_cached_price, init_db
 from lib.price_profile import ensure_profile as _ensure_price_profile, get_price_profile
 from trader.session import get_session_manager
 from lib import algo_lab, algo_pnl, correlation_lab
@@ -292,7 +292,17 @@ def _ohlcv_bars(ticks: list, interval_min: float = 5) -> list:
 
 # ── Line generation ────────────────────────────────────────────────────────────
 
-def _generate_lines(symbol: str, ticks: list, filter_types: set | None = None) -> list[dict]:
+def _generate_lines(symbol: str, ticks: list, filter_types: set | None = None,
+                    ohlc_ticks: list | None = None) -> list[dict]:
+    """
+    ohlc_ticks: optional prior-session ticks (bug 8 fix). When given, PDH/PDL/PDC/PDO
+    are computed from THIS instead of `ticks` -- so a batch caller can source those
+    four "prior day" levels from the actual prior session instead of the same day
+    it's building lines for (look-ahead bias). Every other line type (pivot/orb/vwap/
+    volume/round) still uses `ticks` (today's own session) same as always. Defaults
+    to None, which reproduces the exact previous behaviour (PDH/PDL/PDC/PDO from
+    `ticks` itself) for every existing caller.
+    """
     tick   = TICKS.get(symbol, 0.25)
     rt     = lambda p: round(round(p / tick) * tick, 10)
 
@@ -315,36 +325,59 @@ def _generate_lines(symbol: str, ticks: list, filter_types: set | None = None) -
     glob_h    = max(glob_p) if glob_p else None
     glob_l    = min(glob_p) if glob_p else None
 
+    # PDH/PDL/PDC/PDO source (bug 8): prior session if supplied, else same as today
+    # -- identical to the pre-fix values when ohlc_ticks is None.
+    if ohlc_ticks:
+        ohlc_all_p = [p for (_, p, _) in ohlc_ticks]
+        ohlc_rth_p = [p for (t, p, _) in ohlc_ticks if RTH_START <= t < RTH_END]
+    else:
+        ohlc_all_p, ohlc_rth_p = all_p, rth_p
+    ohlc_H, ohlc_L   = (max(ohlc_all_p), min(ohlc_all_p)) if ohlc_all_p else (H, L)
+    ohlc_mid         = (ohlc_H + ohlc_L) / 2.0
+    ohlc_rth_open    = ohlc_rth_p[0]  if ohlc_rth_p else None
+    ohlc_rth_close   = ohlc_rth_p[-1] if ohlc_rth_p else None
+
     lines = []
+
+    def _tier(old_priority: int) -> int:
+        """Map the legacy 1-10 'higher=stronger' priority score used below into the
+        engine/manual-loader convention (1=strongest..3=weakest) that algo_engine's
+        strength_max filter and critical_lines.py's manual loader expect (bug 7 fix).
+        """
+        if old_priority >= 9:
+            return 1
+        if old_priority >= 7:
+            return 2
+        return 3
 
     def add(price, line_type, source, algo_type, strength, formula="", inputs=""):
         if filter_types is not None and algo_type not in filter_types:
             return
         lines.append({"price": rt(price), "line_type": line_type,
-                      "source": source, "algo_type": algo_type, "strength": strength,
+                      "source": source, "algo_type": algo_type, "strength": _tier(strength),
                       "_tip": {"formula": formula, "inputs": inputs}})
 
-    ohlc_inp = (f"H={H:.2f}  L={L:.2f}"
-                + (f"  O={rth_open:.2f}"  if rth_open  is not None else "")
-                + (f"  C={rth_close:.2f}" if rth_close is not None else ""))
+    ohlc_inp = (f"H={ohlc_H:.2f}  L={ohlc_L:.2f}"
+                + (f"  O={ohlc_rth_open:.2f}"  if ohlc_rth_open  is not None else "")
+                + (f"  C={ohlc_rth_close:.2f}" if ohlc_rth_close is not None else ""))
 
-    # Full-session H / L
-    add(H, "RESISTANCE", "ohlc", "PDH", 10,
+    # Full-session H / L (prior session when ohlc_ticks given -- bug 8)
+    add(ohlc_H, "RESISTANCE", "ohlc", "PDH", 10,
         "max(all session prices)", ohlc_inp)
-    add(L, "SUPPORT",    "ohlc", "PDL", 10,
+    add(ohlc_L, "SUPPORT",    "ohlc", "PDL", 10,
         "min(all session prices)", ohlc_inp)
 
-    # RTH close / open — classify by side of midpoint
-    if rth_close is not None:
-        add(rth_close,
-            "RESISTANCE" if rth_close >= mid else "SUPPORT",
+    # RTH close / open — classify by side of midpoint (prior session when ohlc_ticks given)
+    if ohlc_rth_close is not None:
+        add(ohlc_rth_close,
+            "RESISTANCE" if ohlc_rth_close >= ohlc_mid else "SUPPORT",
             "ohlc", "PDC", 9,
-            f"last RTH price = {rth_close:.2f}", ohlc_inp)
-    if rth_open is not None:
-        add(rth_open,
-            "RESISTANCE" if rth_open >= mid else "SUPPORT",
+            f"last RTH price = {ohlc_rth_close:.2f}", ohlc_inp)
+    if ohlc_rth_open is not None:
+        add(ohlc_rth_open,
+            "RESISTANCE" if ohlc_rth_open >= ohlc_mid else "SUPPORT",
             "ohlc", "PDO", 8,
-            f"first RTH price = {rth_open:.2f}", ohlc_inp)
+            f"first RTH price = {ohlc_rth_open:.2f}", ohlc_inp)
 
     # Pivot points (use RTH H/L/C when available)
     ph = max(rth_p) if rth_p else H
@@ -456,10 +489,10 @@ def _generate_lines(symbol: str, ticks: list, filter_types: set | None = None) -
                     f"range {L:.2f}–{H:.2f}")
             n += interval
 
-    # Deduplicate by tick bucket (keep highest-strength per bucket)
+    # Deduplicate by tick bucket (keep strongest, i.e. lowest strength number, per bucket)
     seen: set = set()
     unique = []
-    for ln in sorted(lines, key=lambda x: -x["strength"]):
+    for ln in sorted(lines, key=lambda x: x["strength"]):
         key = round(ln["price"] / tick)
         if key not in seen:
             seen.add(key)
@@ -548,9 +581,9 @@ def api_lines_create():
 
         raw_lines = _generate_lines(sym, ticks, filter_types=algo_types)
 
-        # Apply merge threshold: sort by strength DESC; suppress lines within threshold of a stronger one
+        # Apply merge threshold: sort by strength ASC (1=strongest); suppress lines within threshold of a stronger one
         kept = []
-        for ln in sorted(raw_lines, key=lambda x: -x["strength"]):
+        for ln in sorted(raw_lines, key=lambda x: x["strength"]):
             dominated = False
             for k in kept:
                 if abs(k["price"] - ln["price"]) <= merge_threshold:
@@ -750,6 +783,23 @@ def api_sandbox_line_patch(line_id: int):
     return jsonify({"ok": True})
 
 
+def _find_prior_session_ticks(symbol: str, before: date, max_lookback: int = 20) -> list | None:
+    """Walk back from the trading day strictly before `before` to find the nearest
+    prior session with RTH data (bug 8: PDH/PDL/PDC/PDO must never see `before`'s
+    own ticks). Returns None if nothing is found within max_lookback calendar days."""
+    search = before
+    for _ in range(max_lookback):
+        search -= timedelta(days=1)
+        if search.weekday() >= 5:
+            continue
+        if not _csv_has_rth(symbol, search):
+            continue
+        t = _load_ticks(symbol, search)
+        if t:
+            return t
+    return None
+
+
 def _build_lines_for(sym: str, target: date, algo_types: set,
                      merge_threshold: float, db_path: Path, force: bool) -> dict:
     """Generate and store lines for one (symbol, date).
@@ -776,9 +826,15 @@ def _build_lines_for(sym: str, target: date, algo_types: set,
     if not any(_RTH_START_MIN <= t < _RTH_END_MIN for (t, _, _) in ticks):
         return {"action": "no_rth", "count": 0}
 
-    raw_lines = _generate_lines(sym, ticks, filter_types=algo_types)
+    # Bug 8: only the force=True batch path is look-ahead biased (it always loads
+    # `target`'s own full-session ticks for PDH/PDL/PDC/PDO). Source those four from
+    # the prior session instead. The non-batch/interactive caller (force=False)
+    # already sources its ticks from a walked-back prior day itself, so leave it be.
+    ohlc_ticks = _find_prior_session_ticks(sym, target) if force else None
+
+    raw_lines = _generate_lines(sym, ticks, filter_types=algo_types, ohlc_ticks=ohlc_ticks)
     kept: list = []
-    for ln in sorted(raw_lines, key=lambda x: -x["strength"]):
+    for ln in sorted(raw_lines, key=lambda x: x["strength"]):  # ASC: 1=strongest wins merges
         dominated = False
         for k in kept:
             if abs(k["price"] - ln["price"]) <= merge_threshold:
@@ -4579,6 +4635,69 @@ def _write_release_notes():
                 )
 
 
+# ── Self-test ─────────────────────────────────────────────────────────────────
+
+def self_test() -> bool:
+    """
+    Self-test:
+    - bug 7: _generate_lines emits strength=1 for PDH (engine/manual-loader
+      convention, 1=strongest), not the old inverted 10.
+    - bug 8: _build_lines_for's force=True batch path sources PDH/PDL only from
+      the PRIOR session, never from the target day's own ticks (look-ahead bias).
+    """
+    import tempfile
+    global _HIST_DIR
+    orig_hist_dir = _HIST_DIR
+    try:
+        # -- bug 7: strength scale --
+        ticks = [(600, 100.0, "2026-06-30T10:00:00"), (601, 90.0, "2026-06-30T10:01:00")]
+        lines = _generate_lines("TESTSYM", ticks, filter_types={"PDH"})
+        assert lines, "no PDH line generated"
+        assert lines[0]["strength"] == 1, f"PDH strength should be 1, got {lines[0]['strength']}"
+
+        # -- bug 8: look-ahead bias --
+        with tempfile.TemporaryDirectory() as tmp:
+            _HIST_DIR = Path(tmp)
+            db_path = Path(tmp) / "test.db"
+            init_db(db_path)
+
+            d_prev  = date(2026, 6, 29)   # Monday
+            d_today = date(2026, 6, 30)   # Tuesday
+
+            def _write_csv(d, rows):
+                p = _HIST_DIR / f"TESTSYM_trades_{d.strftime('%Y%m%d')}.csv"
+                with open(p, "w", newline="") as f:
+                    w = csv.writer(f)
+                    w.writerow(["time_ct", "price"])
+                    for t, px in rows:
+                        w.writerow([f"{d.isoformat()}T{t}", px])
+
+            _write_csv(d_prev,  [("09:35:00", 90.0), ("10:00:00", 100.0), ("15:59:00", 95.0)])
+            _write_csv(d_today, [("09:35:00", 190.0), ("10:00:00", 200.0), ("15:59:00", 195.0)])
+
+            result = _build_lines_for("TESTSYM", d_today, {"PDH", "PDL"}, 0.0, db_path, force=True)
+            assert result["action"] == "done", f"unexpected action: {result}"
+
+            with get_db(db_path) as con:
+                rows = con.execute(
+                    "SELECT algo_type, price FROM critical_lines WHERE symbol='TESTSYM' AND date=?",
+                    (d_today.isoformat(),)
+                ).fetchall()
+            by_algo = {r["algo_type"]: r["price"] for r in rows}
+            assert by_algo.get("PDH") == 100.0, f"PDH should be prior day's H=100, got {by_algo.get('PDH')}"
+            assert by_algo.get("PDL") == 90.0,  f"PDL should be prior day's L=90, got {by_algo.get('PDL')}"
+
+        print("PASS -- trading_dashboard: strength scale (bug 7) + PDH/PDL look-ahead fix (bug 8)")
+        return True
+    except Exception as e:
+        import traceback
+        print(f"FAIL -- trading_dashboard self_test: {e}")
+        traceback.print_exc()
+        return False
+    finally:
+        _HIST_DIR = orig_hist_dir
+
+
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 def main():
@@ -4586,7 +4705,10 @@ def main():
     parser.add_argument("--port",  type=int, default=5003)
     parser.add_argument("--host",  default="0.0.0.0")
     parser.add_argument("--debug", action="store_true")
+    parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
+    if args.self_test:
+        sys.exit(0 if self_test() else 1)
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as _s:
         if _s.connect_ex(("127.0.0.1", args.port)) == 0:
             print(f"[trading_dashboard] port {args.port} already in use -- exiting"); sys.exit(0)

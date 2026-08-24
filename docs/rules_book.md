@@ -140,6 +140,7 @@ Version: 0.6.0 | Date: 2026-04-12
 | R-ORD-12 | Broker must write status=`SUBMITTING` to DB before calling IB — this is the claim lock. Prevents duplicate orders on restart. |
 | R-ORD-13 | Partial fills are ignored in V1 — all fills treated as complete and atomic |
 | R-ORD-14 | The system tracks virtual strategy legs, not broker net positions. IB showing net zero while 4 brackets are active is intentional. |
+| R-ORD-15 | `RECONCILE_REQUIRED` is not a terminal/dead-end status — `broker.py`'s `reconcile_stuck_commands()` sweeps it every poll cycle (bugs 4 & 5, 2026-08-23). Two branches, disambiguated by `fill_price`: never-filled entries (`fill_price IS NULL`) resolve against IB's current `trades()` — found+filled → `FILLED`, found+cancelled → `CANCELLED`, genuinely absent → `CANCELLED`. FILLED commands whose TP/SL bracket order id vanished from IB's cache (`fill_price NOT NULL`, flagged by `poll_tp_sl_fills()`'s staleness check past `_STALE_FILLED_MINUTES`) resolve against current IB positions — flat → `CLOSED` (exit price approximated from `price_cache`), still open → left alone with a logged warning pending human review (protected in the meantime by `reconcile_naked_positions()`, which also now runs every poll cycle instead of startup-only). |
 
 ---
 

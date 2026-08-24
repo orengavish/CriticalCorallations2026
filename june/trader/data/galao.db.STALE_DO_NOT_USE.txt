@@ -1,0 +1,1 @@
+Stale copy. Live authoritative DB is C:\Projects\CriticalCorallations2026\trader\data\galao.db -- see C:\Projects\All\plan.md bugs 3/11.

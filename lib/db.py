@@ -75,6 +75,11 @@ CREATE TABLE IF NOT EXISTS commands (
     bracket_size        REAL    NOT NULL,
     source              TEXT,               -- critical_line | random_mkt | random_lmt | random_stp | test
                                               -- | algo_lab | geva_extract | trading_dashboard | cl_algo
+    strategy_variant    TEXT,               -- optional grouping id (bug 10): lets a single source
+                                              -- (e.g. geva_extract's bracket-grid fan-out, 32 commands
+                                              -- from one scraped line) share one identifier so P&L-by-
+                                              -- source views can distinguish a grid from a single signal.
+                                              -- Nullable, additive-only -- NULL for every other source.
     parent_command_id   INTEGER,            -- set when this command was auto-replenished from another
     critical_line_id    INTEGER REFERENCES critical_lines(id),  -- origin line when source=critical_line
     algo_type           TEXT,               -- trade strategy when source=algo_lab: BOUNCE|BREAKOUT|DIRECTIONAL|FADE|BOTH
@@ -485,6 +490,10 @@ def _migrate(path: Path = None):
         "ALTER TABLE commands ADD COLUMN critical_line_id INTEGER REFERENCES critical_lines(id)",
         "ALTER TABLE commands ADD COLUMN algo_type TEXT",
         "ALTER TABLE commands ADD COLUMN params_json TEXT",
+        # bug 10: additive-only grouping id for geva_extract's bracket-grid fan-out
+        # (32 commands per scraped line) -- nullable, no backfill, every other
+        # source's rows stay NULL.
+        "ALTER TABLE commands ADD COLUMN strategy_variant TEXT",
         # critical_lines.source/algo_type/note/confidence: originally added ad-hoc
         # by back-trading/trading_dashboard.py's own _ensure_columns() helper, not
         # part of this canonical schema -- folded in here too so any module
@@ -827,6 +836,45 @@ def get_cached_price(con, symbol: str) -> float | None:
     return row["last_price"] if row else None
 
 
+def get_priority_dates(con) -> list[str]:
+    """
+    Read-only helper for Fetcher2026's trader/fetch_priority.py (bugs 3 & 11): that
+    script currently opens galao.db directly via a stale/wrong path to read
+    verified_trades for fetch-prioritization. This is a drop-in replacement for its
+    own inline query (see C:\\Projects\\Fetcher2026\\trader\\fetch_priority.py, the
+    `SELECT ... FROM verified_trades GROUP BY d, symbol ORDER BY n DESC, d DESC,
+    symbol` query around lines 49-59) -- same SELECT/GROUP BY/ORDER BY, just exposed
+    as an importable function against the CORRECT live galao.db instead of an inline
+    query against whatever DB path that script resolves.
+
+    Calling convention for the other repo (both repos use `lib.db` as a module path
+    -- the caller must import this under a distinct alias, e.g. via
+    importlib.util.spec_from_file_location, to avoid colliding with its own lib.db;
+    that's the caller's responsibility, not this function's):
+
+        from lib.db import get_db, get_priority_dates
+        with get_db(Path(cfg.paths.db)) as con:   # trader/data/galao.db
+            dates = get_priority_dates(con)
+
+    Returns dates (YYYY-MM-DD) that have verified trades, ordered by priority --
+    the date/symbol pairs with the most trades first (same ORDER BY fetch_priority.py
+    itself already uses), deduplicated to one entry per date preserving that order.
+    """
+    rows = con.execute("""
+        SELECT DATE(fill_time) AS d, symbol, COUNT(*) AS n
+        FROM verified_trades
+        GROUP BY d, symbol
+        ORDER BY n DESC, d DESC, symbol
+    """).fetchall()
+    seen: set = set()
+    dates: list = []
+    for r in rows:
+        if r["d"] not in seen:
+            seen.add(r["d"])
+            dates.append(r["d"])
+    return dates
+
+
 # ── Self-test ─────────────────────────────────────────────────────────────────
 
 def self_test() -> bool:
@@ -953,7 +1001,62 @@ def self_test() -> bool:
             with get_db(db_path) as con:
                 assert get_cached_price(con, "MES") == 6501.0
 
-            # 10. Rollback on error — no partial writes
+            # 10. strategy_variant column (bug 10): NULL for existing sources,
+            #     populated grid-grouping id for geva_extract, both round-trip fine
+            with get_db(db_path) as con:
+                con.execute("""
+                    INSERT INTO commands
+                        (symbol, line_price, line_type, line_strength,
+                         direction, entry_type, entry_price, tp_price, sl_price,
+                         bracket_size, source)
+                    VALUES ('MES', 6500.0, 'SUPPORT', 2, 'BUY', 'LMT',
+                            6500.0, 6502.0, 6498.0, 2.0, 'critical_line')
+                """)
+                no_variant_id = con.execute("SELECT last_insert_rowid()").fetchone()[0]
+                con.execute("""
+                    INSERT INTO commands
+                        (symbol, line_price, line_type, line_strength,
+                         direction, entry_type, entry_price, tp_price, sl_price,
+                         bracket_size, source, strategy_variant)
+                    VALUES ('MES', 6500.0, 'SUPPORT', 2, 'BUY', 'LMT',
+                            6500.0, 6502.0, 6498.0, 2.0, 'geva_extract', 'grid-2026-04-07-001')
+                """)
+                grid_id = con.execute("SELECT last_insert_rowid()").fetchone()[0]
+                update_command_status(con, no_variant_id, "PENDING")  # must not choke on NULL
+            with get_db(db_path) as con:
+                r1 = con.execute("SELECT strategy_variant FROM commands WHERE id=?",
+                                 (no_variant_id,)).fetchone()
+                r2 = con.execute("SELECT strategy_variant FROM commands WHERE id=?",
+                                 (grid_id,)).fetchone()
+            assert r1["strategy_variant"] is None, f"expected NULL, got {r1['strategy_variant']}"
+            assert r2["strategy_variant"] == "grid-2026-04-07-001", \
+                f"strategy_variant not stored: {r2['strategy_variant']}"
+
+            # 11. get_priority_dates -- drop-in for Fetcher2026's fetch_priority.py query.
+            #     Needs its own verified_trades-qualifying row (step 8's row has
+            #     source=NULL, which the view's `source IS NOT NULL` filter excludes).
+            with get_db(db_path) as con:
+                con.execute("""
+                    INSERT INTO commands
+                        (symbol, line_price, line_type, line_strength,
+                         direction, entry_type, entry_price, tp_price, sl_price,
+                         bracket_size, source)
+                    VALUES ('MES', 6600.0, 'SUPPORT', 2, 'BUY', 'LMT',
+                            6600.0, 6602.0, 6598.0, 2.0, 'critical_line')
+                """)
+                pv_cmd_id = con.execute("SELECT last_insert_rowid()").fetchone()[0]
+                update_command_status(
+                    con, pv_cmd_id, "CLOSED",
+                    fill_price=6600.0, fill_time="2026-04-08T10:00:05Z",
+                    exit_price=6602.0, exit_time="2026-04-08T10:05:00Z",
+                    exit_reason="TP", pnl_points=2.0,
+                )
+                record_completed_trade(con, pv_cmd_id)
+            with get_db(db_path) as con:
+                dates = get_priority_dates(con)
+            assert dates == ["2026-04-08"], f"get_priority_dates: {dates}"
+
+            # 12. Rollback on error — no partial writes
             try:
                 with get_db(db_path) as con:
                     con.execute("INSERT INTO system_state(key,value) VALUES('ROLLBACK_TEST','yes')")

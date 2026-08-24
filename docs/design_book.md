@@ -267,6 +267,7 @@ Lines are parsed by `app.py → _parse_lines_text()` and stored in the `critical
 | order_ref | TEXT | Standardized ref (from V1 pattern) — stored in IB orderRef field |
 | claimed_at | DATETIME | When Broker set status=SUBMITTING (claim lock) |
 | notes | TEXT | |
+| strategy_variant | TEXT | **Added 2026-08-23 (bug 10).** Nullable, additive-only grouping id — NULL for every source except `geva_extract`, which sets one shared id per scraped line across its 32-command bracket-grid fan-out. **P&L-by-source views must group by `(source, strategy_variant)` for `source='geva_extract'`, not raw `source` alone** — otherwise one scraped line's grid volume dwarfs every genuine single-signal source in the comparison. Every other source is unaffected (`strategy_variant` stays NULL, groups exactly as before). |
 
 ### Table: `positions`
 | Column | Type | Description |

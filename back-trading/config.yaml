@@ -69,6 +69,9 @@ paths:
   test_db: data/test_backtest.db
   live_db: ../trader/data/galao.db   # live paper trading DB (read-only for calibration)
   history: ../trader/data/history    # shared tick CSVs
+  cl_algo_history: C:\Projects\CriticalCorallations2026\june\trader\data\history  # real tick CSVs live here (bug 6) -- NOT ../trader/data/history.
+                                      # Scripts run as `python back-trading/*.py` load THIS file, not trader/config.yaml
+                                      # (config_loader._find_config() picks the nearest config.yaml to the running script).
   results: data/results
   logs: logs
   versions: ../versions              # shared with trader

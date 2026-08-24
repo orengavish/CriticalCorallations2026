@@ -2,6 +2,14 @@
 **Date:** 2026-07-04  
 **Status:** Approved for implementation (autonomous session)
 
+> **2026-08-23 — bug 8 resolved** (see `docs/release_notes.md` v0.7.0). The batch line
+> generator (`/api/analyze_all`, and `/api/build_db` with `force=True`) computed
+> PDH/PDL/PDC/PDO for date D from D's own full-session ticks, then the backtester
+> simulated D's morning against levels only knowable at end-of-day (look-ahead bias).
+> Fixed by sourcing those four levels from the prior session instead. **All batch
+> backtest results (`/api/analyze_all`) produced before this date are invalid** and
+> should be re-run.
+
 ---
 
 ## 1. Purpose
