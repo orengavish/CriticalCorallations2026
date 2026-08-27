@@ -152,20 +152,27 @@ GevaExtract uses `sql.js` (pure-JS SQLite) for its own `geva.db`, and Playwright
 
 ---
 
-## 7. Windows Task Scheduler — what should exist, what actually does (as of 2026-08-18)
+## 7. Windows Task Scheduler — what should exist, what actually does (re-verified 2026-08-27)
+
+**As of 2026-08-27, `Get-ScheduledTask` shows only two project tasks on this machine —
+`GevaAutoTrade` and `GevaExtract\DailyExtract` (both GevaExtract). Nothing auto-starts
+IB Gateway, the Fetcher2026 pipelines, or CC2026.** After a reboot the whole stack must
+be brought up by hand — follow §9. There is also no Startup-folder shortcut or `...\Run`
+registry entry for any of the three projects (checked HKCU/HKLM `Run` and both Startup
+folders).
 
 | Task | Project | Status on current machine | Notes |
 |---|---|---|---|
-| `GalgoFetcher2026` | Fetcher2026 (old TRADES/BID_ASK pipeline watchdog) | Installed, but **misconfigured** — registered with `-UserId "SYSTEM" -LogonType ServiceAccount`, which resolves `%USERPROFILE%` to the SYSTEM profile, so IBC can't find `config.ini` (§5) and Gateway auto-restart never succeeds. Root cause of a real 19-day outage (2026-07-29 to 2026-08-17). **Fix before relying on it**: either change the task principal to the interactive user in `Fetcher2026\scripts\install_scheduler.ps1` before installing, or make IBC's config path explicit in `StartGateway.bat` instead of `%USERPROFILE%`-relative. Full detail: `Fetcher2026\OPERATIONS.md` §4. |
-| `GalgoDashboard2026` | Fetcher2026 | Same installer, same fix needed before trusting it | |
-| CC2026 auto-start | CC2026 | **Not installed** as of this writing | `scripts\install_scheduler.ps1` exists; run elevated: `Start-Process powershell -Verb RunAs -ArgumentList '-File C:\Projects\CriticalCorallations2026\scripts\install_scheduler.ps1'` |
-| `GevaExtract\DailyExtract` | GevaExtract | Installed and working, daily Facebook scrape | `schtasks /Create /TN "GevaExtract\DailyExtract" /TR "C:\Projects\GevaExtract\run-daily.bat" /SC DAILY /ST 09:00 /RU "%USERNAME%" /RL HIGHEST /F` |
-| `GevaAutoTrade` | GevaExtract | Installed and working, runs `auto-geva-scheduled.ps1` 3×/day (10:00/12:30/15:00 CT) | Ensures CC2026 + GevaExtract + session are all up, fetches lines if stale, builds/submits trades |
+| `GalgoFetcher2026` | Fetcher2026 (old TRADES/BID_ASK pipeline watchdog) | **Not registered** (2026-08-27). Previously installed but misconfigured with `-UserId "SYSTEM" -LogonType ServiceAccount` — `%USERPROFILE%` resolved to the SYSTEM profile, IBC couldn't find `config.ini` (§5), Gateway auto-restart never succeeded; root cause of a real 19-day outage (2026-07-29 to 2026-08-17). If you re-add it: fix the principal to the interactive user in `Fetcher2026\scripts\install_scheduler.ps1` first, or make IBC's config path explicit in `StartGateway.bat` instead of `%USERPROFILE%`-relative. Full detail: `Fetcher2026\OPERATIONS.md` §4. |
+| `GalgoDashboard2026` | Fetcher2026 | **Not registered** (2026-08-27). Same installer, same principal fix needed before re-adding. |
+| CC2026 auto-start | CC2026 | **Not registered.** `scripts\install_scheduler.ps1` exists; run elevated: `Start-Process powershell -Verb RunAs -ArgumentList '-File C:\Projects\CriticalCorallations2026\scripts\install_scheduler.ps1'` |
+| `\MarketProjects\Watchdog-Main` / `Watchdog-Summary` | shared, `C:\Projects\logs\` | **Not registered, never run** (no `C:\Projects\logs\watchdog.log`). `watchdog.ps1` + `register_watchdog_tasks.ps1` exist and would auto-restart Fetcher/Geva/CC2026 on failure + email alerts; register elevated via `register_watchdog_tasks.ps1`. Until then there is **no auto-restart safety net** for any service. |
+| `GevaExtract\DailyExtract` | GevaExtract | Registered, working — daily Facebook scrape, 09:00 | `schtasks /Create /TN "GevaExtract\DailyExtract" /TR "C:\Projects\GevaExtract\run-daily.bat" /SC DAILY /ST 09:00 /RU "%USERNAME%" /RL HIGHEST /F` |
+| `GevaAutoTrade` | GevaExtract | Registered, working — runs `auto-geva-scheduled.ps1` 3×/day (triggers 18:00/20:30/23:00 Israel = 10:00/12:30/15:00 CT) | Ensures CC2026 + GevaExtract + session are all up, fetches lines if stale, builds/submits trades |
 
-**Recommendation for a fresh machine**: install all of these fresh rather than assuming
-the SYSTEM-context bug is fixed — apply the principal fix from the table above *before*
-running `install_scheduler.ps1` for Fetcher2026, or you'll reproduce the exact 19-day
-outage on the new machine too.
+**Recommendation for a fresh machine**: register these deliberately, not blindly — for
+`GalgoFetcher2026`/`GalgoDashboard2026`/`install_scheduler.ps1` apply the interactive-user
+principal fix *before* running the installer, or you'll reproduce the exact 19-day outage.
 
 ---
 
