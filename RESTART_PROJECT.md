@@ -154,17 +154,21 @@ GevaExtract uses `sql.js` (pure-JS SQLite) for its own `geva.db`, and Playwright
 
 ## 7. Windows Task Scheduler — what should exist, what actually does (re-verified 2026-08-27)
 
-**As of 2026-08-27, `Get-ScheduledTask` shows only two project tasks on this machine —
-`GevaAutoTrade` and `GevaExtract\DailyExtract` (both GevaExtract). Nothing auto-starts
-IB Gateway, the Fetcher2026 pipelines, or CC2026.** After a reboot the whole stack must
-be brought up by hand — follow §9. There is also no Startup-folder shortcut or `...\Run`
-registry entry for any of the three projects (checked HKCU/HKLM `Run` and both Startup
-folders).
+**Correction (2026-08-27, second pass).** An earlier edit today claimed `GalgoFetcher2026`
+/ `GalgoDashboard2026` were "not registered" — that was **wrong**. They ARE registered,
+but under the **SYSTEM** principal (from `Fetcher2026\scripts\reg_tasks.ps1`), so a
+non-elevated `Get-ScheduledTask` silently omits them and `schtasks /query /tn
+GalgoFetcher2026` returns `ERROR: Access is denied`. Query from an **elevated** shell to
+see them. What *is* genuinely absent: any CC2026 auto-start, and the `\MarketProjects\`
+watchdog. IB Gateway + IBC do come up on login (IBC's own autostart), and these two
+SYSTEM tasks drive the Fetcher2026 watchdog/dashboard — so after a reboot only CC2026 and
+the bars pipeline actually need a hand (§9). No Startup-folder / `...\Run` entry for any
+of the three projects.
 
 | Task | Project | Status on current machine | Notes |
 |---|---|---|---|
-| `GalgoFetcher2026` | Fetcher2026 (old TRADES/BID_ASK pipeline watchdog) | **Not registered** (2026-08-27). Previously installed but misconfigured with `-UserId "SYSTEM" -LogonType ServiceAccount` — `%USERPROFILE%` resolved to the SYSTEM profile, IBC couldn't find `config.ini` (§5), Gateway auto-restart never succeeded; root cause of a real 19-day outage (2026-07-29 to 2026-08-17). If you re-add it: fix the principal to the interactive user in `Fetcher2026\scripts\install_scheduler.ps1` first, or make IBC's config path explicit in `StartGateway.bat` instead of `%USERPROFILE%`-relative. Full detail: `Fetcher2026\OPERATIONS.md` §4. |
-| `GalgoDashboard2026` | Fetcher2026 | **Not registered** (2026-08-27). Same installer, same principal fix needed before re-adding. |
+| `GalgoFetcher2026` | Fetcher2026 (TRADES/BID_ASK pipeline watchdog) | **Registered, SYSTEM principal, running** (2026-08-27; visible only elevated). `-Once -At now -RepetitionInterval 5min -MultipleInstances IgnoreNew` re-launches `trader\fetch_watchdog.py` if it's dead. **Config bug**: `-ExecutionTimeLimit 4min` force-kills the watchdog — which is written to run forever and self-check hourly (`CHECK_INTERVAL=3600`) — after 4 min, so Task Scheduler spawns a *fresh* one every 5 min (each opens a console window, runs one check, gets killed). Harmless but noisy; the intended "one persistent process, hourly check" never happens. SYSTEM principal is still the `%USERPROFILE%`→`config.ini` hazard behind the 19-day outage (2026-07-29→08-17) — only bites when Gateway is actually down and the watchdog tries to relaunch IBC. **Fix**: re-register elevated with `scripts\install_scheduler.ps1` (interactive-user principal, `-RunLevel Limited`) *and* raise/remove `-ExecutionTimeLimit`. Full detail: `Fetcher2026\OPERATIONS.md` §4. |
+| `GalgoDashboard2026` | Fetcher2026 | **Registered, SYSTEM principal, running** (visible only elevated). Same 5-min re-fire; runs `dashboard.py --real`, which exits fast if port 5050 is already bound. Same `-ExecutionTimeLimit 4min` / SYSTEM-principal issues and same fix as `GalgoFetcher2026`. |
 | CC2026 auto-start | CC2026 | **Not registered.** `scripts\install_scheduler.ps1` exists; run elevated: `Start-Process powershell -Verb RunAs -ArgumentList '-File C:\Projects\CriticalCorallations2026\scripts\install_scheduler.ps1'` |
 | `\MarketProjects\Watchdog-Main` / `Watchdog-Summary` | shared, `C:\Projects\logs\` | **Not registered, never run** (no `C:\Projects\logs\watchdog.log`). `watchdog.ps1` + `register_watchdog_tasks.ps1` exist and would auto-restart Fetcher/Geva/CC2026 on failure + email alerts; register elevated via `register_watchdog_tasks.ps1`. Until then there is **no auto-restart safety net** for any service. |
 | `GevaExtract\DailyExtract` | GevaExtract | Registered, working — daily Facebook scrape, 09:00 | `schtasks /Create /TN "GevaExtract\DailyExtract" /TR "C:\Projects\GevaExtract\run-daily.bat" /SC DAILY /ST 09:00 /RU "%USERNAME%" /RL HIGHEST /F` |
