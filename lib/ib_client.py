@@ -29,6 +29,8 @@ from lib.logger import get_logger
 log = get_logger("ib_client")
 
 _EXCHANGE = "CME"
+_SYMBOL_EXCHANGE = {"MYM": "CBOT"}  # Micro Dow is listed under CBOT, not CME -- confirmed
+                                    # via reqContractDetails (2026-08-29); MES/MNQ/M2K are CME.
 _CURRENCY = "USD"
 
 
@@ -194,7 +196,8 @@ class IBClient:
 
     def _make_contract(self, symbol: str) -> Future:
         """Build a generic continuous futures contract (resolved later by get_contract)."""
-        return Future(symbol=symbol, exchange=_EXCHANGE, currency=_CURRENCY)
+        exchange = _SYMBOL_EXCHANGE.get(symbol, _EXCHANGE)
+        return Future(symbol=symbol, exchange=exchange, currency=_CURRENCY)
 
     def get_contract(self, symbol: str) -> Future:
         """
@@ -208,7 +211,8 @@ class IBClient:
 
         if not self.live or not self.live.isConnected():
             raise ConnectionError("LIVE connection is not active")
-        con = Future(symbol=symbol, exchange=_EXCHANGE, currency=_CURRENCY)
+        exchange = _SYMBOL_EXCHANGE.get(symbol, _EXCHANGE)
+        con = Future(symbol=symbol, exchange=exchange, currency=_CURRENCY)
         details = self.live.reqContractDetails(con)
         if not details:
             raise ValueError(f"No contract details found for {symbol}")
