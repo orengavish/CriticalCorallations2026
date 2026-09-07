@@ -20,16 +20,13 @@ symbols:
   # trader/scripts/prep_research_lines*.py and RESEARCH_RUNBOOK_2026-09-07.md).
   # Was [MES] only originally -- backup at config.yaml.bak_20260906.
   #
-  # 2026-09-07: added the full 100-stock research universe on top of the 4 futures
-  # (104 total). get_current_price() blocks ~1.5s per symbol (reqMktData snapshot +
-  # sleep), so a full pass over all 104 costs ~2.5 minutes -- fine for the once-at-
-  # session-start generate_commands() pass, but decider.replenishment_poll_seconds
-  # below was raised from 10s to 300s to match (a 10s interval would have the loop
-  # perpetually behind itself). Trade-off: up to ~5 min to notice a fill and
-  # replenish, instead of ~10s -- acceptable for this bracket size/timeframe, not
-  # for anything wanting fast reaction time. A real fix (batched price fetch, or a
-  # separate faster loop for just the 4 futures) is still the better long-term
-  # answer if 5-minute replenishment latency turns out to matter in practice.
+  # 2026-09-07: briefly expanded to the full 104-symbol universe (4 futures + all
+  # 100 stocks), then scaled back down to 10 (the 4 futures + the 6 largest/most
+  # liquid stocks) at the user's own request ("cold feet" the night before first
+  # live run of the expanded scope) -- smaller, well-understood blast radius for
+  # this first real session. The other 94 stocks' critical_lines rows are still in
+  # the DB (armed=1) but simply never touched by a symbol not in this list --
+  # nothing to clean up to re-expand later, just add symbols back here.
   - MES
   - MNQ
   - MYM
@@ -38,102 +35,8 @@ symbols:
   - MSFT
   - NVDA
   - GOOGL
-  - GOOG
   - AMZN
-  - META
-  - BRK.B
-  - AVGO
-  - TSLA
-  - LLY
-  - JPM
-  - V
-  - XOM
-  - UNH
-  - MA
-  - COST
-  - HD
-  - PG
-  - JNJ
-  - NFLX
-  - ABBV
-  - BAC
-  - CRM
-  - WMT
-  - KO
-  - CVX
-  - MRK
-  - ADBE
-  - PEP
-  - AMD
-  - TMO
-  - LIN
-  - CSCO
-  - ACN
-  - MCD
-  - ABT
-  - WFC
-  - DHR
-  - IBM
-  - GE
-  - CAT
-  - VZ
-  - PM
-  - TXN
-  - DIS
-  - INTU
-  - NOW
-  - AMGN
-  - QCOM
-  - CMCSA
-  - SPGI
-  - NEE
-  - UNP
-  - LOW
-  - AXP
-  - HON
-  - BA
-  - RTX
-  - UPS
-  - GS
-  - BKNG
-  - ISRG
-  - BLK
-  - ELV
-  - PLD
-  - SBUX
-  - DE
-  - LMT
-  - MDT
-  - SYK
-  - GILD
-  - MDLZ
-  - ADI
-  - TJX
-  - CVS
-  - CI
-  - VRTX
-  - REGN
-  - SCHW
-  - MMC
-  - ADP
-  - CB
-  - SO
-  - MO
-  - BMY
-  - DUK
-  - ZTS
-  - BSX
-  - SLB
-  - NOC
-  - ETN
-  - CME
-  - PGR
-  - COP
-  - MU
-  - FISV
-  - FI
-  - USB
-  - PNC              # trading symbols only — used by decider, broker, position_manager
+  - META              # trading symbols only — used by decider, broker, position_manager
 
 fetcher:
   auto_fetch_enabled: true
@@ -172,7 +75,11 @@ shutdown:
   panic_threshold_minutes: 10
 
 decider:
-  replenishment_poll_seconds: 300  # raised 2026-09-07 from 10 for the 104-symbol universe -- see symbols: comment above
+  # 2026-09-07: was raised to 300 for the (since scaled back) 104-symbol universe,
+  # then lowered to 20 for the 10-symbol scope -- 10 symbols x ~1.5s/price-fetch
+  # is ~15s/pass, so 20s comfortably fits (the original 10s default was tuned for
+  # a single symbol and would already be tight even at 10).
+  replenishment_poll_seconds: 20
 
 broker:
   command_poll_seconds: 5
