@@ -127,9 +127,11 @@ def _has_stable_neighbor(combo: dict, all_combos: list[dict],
 # ── Main scorer ───────────────────────────────────────────────────────────────
 
 def score(db_path: Path, symbol: str, top_n: int = 20,
-          verbose: bool = False) -> dict:
+          verbose: bool = False, split: str = "train") -> dict:
     """
     Score all combos for a symbol from cl_algo_sim_results.
+    Only considers rows tagged split=<split> -- scoring/tuning must never see
+    validation or out_of_sample rows (migration roadmap item 7).
     Writes to cl_algo_combo_scores + cl_algo_score_history.
     Returns dict with top combo and summary.
     """
@@ -148,9 +150,9 @@ def score(db_path: Path, symbol: str, top_n: int = 20,
                 SUM(CASE WHEN exit_reason='EXPIRED' AND entry_fill_price IS NOT NULL
                          THEN 1 ELSE 0 END) as n_expired_exit
             FROM cl_algo_sim_results
-            WHERE symbol=?
+            WHERE symbol=? AND split=?
             GROUP BY algo_type, tp_ticks, sl_ticks, direction_filter, strength_max
-        """, (symbol,)).fetchall()
+        """, (symbol, split)).fetchall()
 
     if not rows:
         return {"symbol": symbol, "n_combos": 0, "top": None}
@@ -161,8 +163,8 @@ def score(db_path: Path, symbol: str, top_n: int = 20,
             SELECT algo_type, tp_ticks, sl_ticks, direction_filter, strength_max,
                    pnl_ticks
             FROM cl_algo_sim_results
-            WHERE symbol=? AND exit_reason IN ('TP','SL') AND pnl_ticks IS NOT NULL
-        """, (symbol,)).fetchall()
+            WHERE symbol=? AND split=? AND exit_reason IN ('TP','SL') AND pnl_ticks IS NOT NULL
+        """, (symbol, split)).fetchall()
 
     pnl_map: dict[tuple, list[float]] = {}
     for r in pnl_rows:
@@ -270,12 +272,12 @@ def score(db_path: Path, symbol: str, top_n: int = 20,
     if verbose and top:
         print(f"\n[{symbol}] Top combo:")
         print(f"  algo={top['algo_type']}  tp={top['tp_ticks']}t  sl={top['sl_ticks']}t"
-              f"  dir={top['direction_filter']}  str≤{top['strength_max']}")
+              f"  dir={top['direction_filter']}  str<={top['strength_max']}")
         print(f"  score={top['composite_score']:.4f}  pf={top.get('profit_factor'):.2f}"
               f"  exp={top.get('expectancy'):.2f}  wr={top.get('win_rate'):.1%}"
               f"  N={top['n_fills']}")
         if not stable:
-            print(f"  ⚠ STABILITY: no positive-PF neighbor in tp/sl grid")
+            print(f"  WARNING: STABILITY: no positive-PF neighbor in tp/sl grid")
 
     return {
         "symbol":          symbol,
@@ -288,10 +290,10 @@ def score(db_path: Path, symbol: str, top_n: int = 20,
 
 
 def score_all(db_path: Path, symbols: list[str] | None = None,
-              top_n: int = 10, verbose: bool = False) -> dict:
+              top_n: int = 10, verbose: bool = False, split: str = "train") -> dict:
     """Score all symbols. Returns {symbol: result} dict."""
     syms = symbols or ["MES", "MNQ", "MYM", "M2K"]
-    return {s: score(db_path, s, top_n=top_n, verbose=verbose) for s in syms}
+    return {s: score(db_path, s, top_n=top_n, verbose=verbose, split=split) for s in syms}
 
 
 # ── Self-test ─────────────────────────────────────────────────────────────────
@@ -326,8 +328,16 @@ def _self_test() -> bool:
                         5500.0, "2026-06-30T14:00:00Z",
                         "TP" if is_tp else "SL",
                         5501.0 if is_tp else 5499.0,
-                        pnl, 10
+                        pnl, 10, "train"
                     ))
+                # One extra out_of_sample row for combo A -- must NOT affect train scoring
+                rows.append((
+                    "2026-07-15", "MES", "BOUNCE", 4, 4, "ALL", 3,
+                    5500.0, "SUPPORT", 1, "BUY", "LMT",
+                    5500.0, 5501.0, 5499.0,
+                    5500.0, "2026-07-15T14:00:00Z",
+                    "SL", 5499.0, -4, 10, "out_of_sample"
+                ))
 
             with get_db(db_path) as con:
                 con.executemany("""
@@ -338,11 +348,12 @@ def _self_test() -> bool:
                          direction, entry_type,
                          entry_price, tp_price, sl_price,
                          entry_fill_price, entry_fill_time,
-                         exit_reason, exit_fill_price, pnl_ticks, ticks_to_exit)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                         exit_reason, exit_fill_price, pnl_ticks, ticks_to_exit,
+                         split)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """, rows)
 
-            result = score(db_path, "MES", verbose=False)
+            result = score(db_path, "MES", verbose=False, split="train")
             assert result["n_combos"] >= 3,   f"Expected ≥3 combos, got {result['n_combos']}"
             assert result["n_ranked"] >= 1,   f"Expected ≥1 ranked"
             top = result["top"]
@@ -350,6 +361,22 @@ def _self_test() -> bool:
             assert top["algo_type"] == "BOUNCE", \
                 f"Expected BOUNCE (best PF) as top, got {top['algo_type']}"
             assert top["profit_factor"] > 1.0, f"Top PF should be >1: {top['profit_factor']}"
+
+            # split filter: the out_of_sample row for combo A must be invisible to a
+            # split='train' score. (Combo A's 30 inserts collapse to 20 unique rows --
+            # dates cycle 06-01..06-20 every 20 iterations, and the UNIQUE constraint on
+            # cl_algo_sim_results INSERT-OR-IGNOREs the i=20..29 date repeats -- so 20,
+            # not 30, is the correct train count; the assertion here is that adding the
+            # 1 out_of_sample row does NOT bump it to 21.)
+            bounce_44 = next(c for c in [top] if c["algo_type"] == "BOUNCE"
+                              and c["tp_ticks"] == 4 and c["sl_ticks"] == 4)
+            assert bounce_44["n_sims"] == 20, \
+                f"out_of_sample row leaked into train score: n_sims={bounce_44['n_sims']}"
+
+            # scoring against split='out_of_sample' only sees that 1 row, not the 30 train rows
+            oos_result = score(db_path, "MES", verbose=False, split="out_of_sample")
+            assert oos_result["n_combos"] == 1, \
+                f"Expected exactly 1 out_of_sample combo, got {oos_result['n_combos']}"
 
             # Re-run with same scored_at won't double-write (INSERT OR IGNORE)
             with get_db(db_path) as con:
@@ -380,6 +407,8 @@ if __name__ == "__main__":
     parser.add_argument("--symbol", nargs="*")
     parser.add_argument("--top",    type=int, default=10)
     parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--split", default="train",
+                         help="train|validation|out_of_sample (default: train)")
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
 
@@ -389,7 +418,8 @@ if __name__ == "__main__":
     from lib.config_loader import get_config
     cfg = get_config()
     db_path = Path(cfg.paths.db)
-    results = score_all(db_path, symbols=args.symbol, top_n=args.top, verbose=True)
+    results = score_all(db_path, symbols=args.symbol, top_n=args.top, verbose=True,
+                         split=args.split)
     for sym, r in results.items():
         if r["n_combos"] == 0:
             print(f"{sym}: no simulation results yet")

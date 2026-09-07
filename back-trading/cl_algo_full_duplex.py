@@ -195,15 +195,22 @@ def _find_sl_line(line_price: float, direction: str, lines: list[dict]) -> dict 
 def run(db_path: Path, history_dir: Path,
         symbols: list[str] | None = None,
         dry_run: bool = False,
-        verbose: bool = False) -> dict:
+        verbose: bool = False,
+        min_date: str | None = None,
+        max_date: str | None = None,
+        split: str = "train") -> dict:
     """
     Simulate full-duplex commands for all ready (symbol, day) pairs.
+    min_date/max_date scope the run to one train/validation/out_of_sample date
+    range (see lib.data_availability.split_boundaries). split tags every row
+    written with which split produced it.
     Returns {"written": N, "skipped": N, "errors": N, "elapsed_s": N}.
     """
     sim = _load_simulator()
     syms = symbols or ["MES", "MNQ", "MYM", "M2K"]
 
-    ready_days = get_ready_days(db_path, history_dir, symbols=syms)
+    ready_days = get_ready_days(db_path, history_dir, symbols=syms,
+                                 min_date=min_date, max_date=max_date)
     if not ready_days:
         return {"written": 0, "skipped": 0, "errors": 0, "elapsed_s": 0.0}
 
@@ -318,7 +325,7 @@ def run(db_path: Path, history_dir: Path,
                                   tp_line_p, tp_price, tp_source,
                                   sl_line_p, sl_price, sl_source,
                                   avg_move, tick_buffer,
-                                  None, None, "EXPIRED", None, None, None))
+                                  None, None, "EXPIRED", None, None, None, split))
                     continue
 
                 # TP/SL are anchored to line prices, not fill price — intentional for FD.
@@ -357,7 +364,7 @@ def run(db_path: Path, history_dir: Path,
                                   sl_line_p, sl_price, sl_source,
                                   avg_move, tick_buffer,
                                   fill_p, fill_t.isoformat(),
-                                  exit_r, exit_fp, pnl, ticks_ex))
+                                  exit_r, exit_fp, pnl, ticks_ex, split))
                 except Exception:
                     errors += 1
                     batch.append((date_str, sym,
@@ -367,7 +374,7 @@ def run(db_path: Path, history_dir: Path,
                                   sl_line_p, sl_price, sl_source,
                                   avg_move, tick_buffer,
                                   fill_p, fill_t.isoformat(),
-                                  "ERROR", None, None, None))
+                                  "ERROR", None, None, None, split))
 
         if batch and not dry_run:
             with get_db(db_path) as con:
@@ -380,8 +387,9 @@ def run(db_path: Path, history_dir: Path,
                          sl_line_price, sl_price, sl_source,
                          two_hour_avg_move, tick_buffer,
                          entry_fill_price, entry_fill_time,
-                         exit_reason, exit_fill_price, pnl_ticks, ticks_to_exit)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                         exit_reason, exit_fill_price, pnl_ticks, ticks_to_exit,
+                         split)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """, batch)
             written += len(batch)
             if verbose:

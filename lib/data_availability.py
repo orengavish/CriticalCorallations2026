@@ -107,7 +107,8 @@ def get_ready_days(db_path: Path, history_dir: Path,
                 if name.startswith(f"{sym}_trades_"):
                     key = (sym, date_str)
                     file_index.setdefault(key, {})["trades"] = f
-                elif name.startswith(f"{sym}_bid_ask_"):
+                # Real fetcher output uses "bidask" (no underscore); accept both spellings.
+                elif name.startswith(f"{sym}_bid_ask_") or name.startswith(f"{sym}_bidask_"):
                     key = (sym, date_str)
                     file_index.setdefault(key, {})["bid_ask"] = f
 
@@ -133,6 +134,37 @@ def get_ready_days(db_path: Path, history_dir: Path,
         })
 
     return sorted(ready, key=lambda x: (x["date"], x["symbol"]))
+
+
+def split_boundaries(ready_days: list[dict], symbol: str,
+                     train_frac: float = 0.6, val_frac: float = 0.2) -> dict:
+    """
+    Chronological (never random -- this is time-series data, a random split would
+    leak future information into training) train/validation/out_of_sample date
+    boundaries for one symbol, given get_ready_days()'s full output.
+    Returns {"train": (min_date, max_date), "validation": (min_date, max_date),
+             "out_of_sample": (min_date, max_date)} -- any split with 0 days gets
+    (None, None).
+    """
+    assert train_frac + val_frac < 1.0, "train_frac + val_frac must be < 1.0 (remainder is OOS)"
+
+    dates = sorted(d["date"] for d in ready_days if d["symbol"] == symbol)
+    n       = len(dates)
+    n_train = int(n * train_frac)
+    n_val   = int(n * val_frac)
+
+    train_days = dates[:n_train]
+    val_days   = dates[n_train:n_train + n_val]
+    oos_days   = dates[n_train + n_val:]
+
+    def _bounds(days: list[str]) -> tuple:
+        return (days[0], days[-1]) if days else (None, None)
+
+    return {
+        "train":         _bounds(train_days),
+        "validation":    _bounds(val_days),
+        "out_of_sample": _bounds(oos_days),
+    }
 
 
 def summarise(ready_days: list[dict]) -> str:
@@ -219,7 +251,31 @@ def _self_test() -> bool:
             s = summarise(ready)
             assert "MES" in s
 
-        print(f"PASS -- data_availability: {len(ready)} ready day(s) found correctly")
+            # split_boundaries: 10 synthetic ready days, chronological (not random) assignment
+            synth = [{"symbol": "MES", "date": f"2026-08-{d:02d}"} for d in range(1, 11)]
+            bounds = split_boundaries(synth, "MES", train_frac=0.6, val_frac=0.2)
+            assert bounds["train"]         == ("2026-08-01", "2026-08-06"), bounds["train"]
+            assert bounds["validation"]    == ("2026-08-07", "2026-08-08"), bounds["validation"]
+            assert bounds["out_of_sample"] == ("2026-08-09", "2026-08-10"), bounds["out_of_sample"]
+
+            # degenerate case: too few days -> some buckets get (None, None), never crash
+            tiny = [{"symbol": "MES", "date": f"2026-08-{d:02d}"} for d in range(1, 4)]  # 3 days
+            tiny_bounds = split_boundaries(tiny, "MES", train_frac=0.6, val_frac=0.2)
+            assert tiny_bounds["validation"] == (None, None), \
+                f"3 days * 0.2 frac should round to 0 days: {tiny_bounds}"
+            assert tiny_bounds["train"] != (None, None)
+            assert tiny_bounds["out_of_sample"] != (None, None)
+
+            # symbol filtering: a different symbol's days must not leak into MNQ's split.
+            # MNQ has only 1 ready day -> int(1*0.6)==0 train, int(1*0.2)==0 val, so
+            # that lone day correctly falls through to out_of_sample, not train.
+            mixed = synth + [{"symbol": "MNQ", "date": "2026-09-01"}]
+            mnq_bounds = split_boundaries(mixed, "MNQ", train_frac=0.6, val_frac=0.2)
+            assert mnq_bounds["out_of_sample"] == ("2026-09-01", "2026-09-01"), mnq_bounds
+            assert mnq_bounds["train"] == (None, None), mnq_bounds
+
+        print(f"PASS -- data_availability: {len(ready)} ready day(s) found correctly,"
+              f" split_boundaries verified")
         return True
 
     except Exception as e:

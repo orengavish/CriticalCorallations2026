@@ -176,10 +176,16 @@ def _simulate_lifecycle(db_path, cmd_id: int, trade: dict, tick: float):
 def run_gen(db_path, cfg, rate_per_min: float = _DEFAULT_RATE,
             dry_run: bool = False, symbol: str = None,
             bracket_override: float = None,
-            max_offset_ticks: int = _DEFAULT_MAX_OFFSET_TICKS):
+            max_offset_ticks: int = _DEFAULT_MAX_OFFSET_TICKS,
+            count: int | None = None):
     """
     Main generator loop.
     dry_run: simulate fill+close in-process (no IB needed).
+    count: if set, generate exactly this many commands then exit instead of
+        running forever -- lets this be triggered as a scheduled burst (e.g.
+        matching GevaExtract's 3x/day cadence on a comparison symbol) rather
+        than only as an always-on background process. None (default) = unchanged
+        continuous behavior.
     """
     symbol      = symbol or cfg.symbols[0]
     tick        = cfg.orders.tick_size
@@ -203,8 +209,12 @@ def run_gen(db_path, cfg, rate_per_min: float = _DEFAULT_RATE,
     # Random-walk price for dry-run
     sim_price = 5500.0
 
+    generated = 0
     try:
         while True:
+            if count is not None and generated >= count:
+                log.info(f"random_gen: generated {generated}/{count} — burst complete, exiting")
+                break
             if _is_shutdown(db_path):
                 log.info("SESSION=SHUTDOWN — random_gen exiting")
                 break
@@ -239,6 +249,11 @@ def run_gen(db_path, cfg, rate_per_min: float = _DEFAULT_RATE,
             if dry_run:
                 _simulate_lifecycle(db_path, cmd_id, trade, tick)
                 log.debug(f"  Simulated lifecycle for #{cmd_id}")
+
+            generated += 1
+            if count is not None and generated >= count:
+                log.info(f"random_gen: generated {generated}/{count} — burst complete, exiting")
+                break
 
             time.sleep(sleep_secs)
 
@@ -326,6 +341,9 @@ if __name__ == "__main__":
     parser.add_argument("--max-offset", type=int, default=_DEFAULT_MAX_OFFSET_TICKS,
                         metavar="T", help="Max entry offset from live price in ticks (default 8; use 1-2 for near-market fills)")
     parser.add_argument("--symbol", default=None, help="Override symbol from config")
+    parser.add_argument("--count", type=int, default=None, metavar="N",
+                        help="Generate exactly N commands then exit (burst mode, for "
+                             "scheduled runs) instead of running forever")
     args = parser.parse_args()
 
     if args.self_test:
@@ -340,4 +358,5 @@ if __name__ == "__main__":
             dry_run=args.dry_run,
             symbol=args.symbol,
             bracket_override=args.bracket,
-            max_offset_ticks=args.max_offset)
+            max_offset_ticks=args.max_offset,
+            count=args.count)

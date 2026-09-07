@@ -106,7 +106,7 @@ def _check_convergence(history: list[dict]) -> tuple[str, str | None]:
             return "converged", None
         return "narrowing", (
             f"Top combo fingerprint stable across {_CONVERGENCE_RUNS} runs but only "
-            f"N={min_n_fills} fills (need ≥{_MIN_N_FILLS_FOR_CONVERGENCE}) — "
+            f"N={min_n_fills} fills (need >={_MIN_N_FILLS_FOR_CONVERGENCE}) -- "
             f"holding at 'narrowing' pending more data (Monte Carlo guard)."
         )
     # More than 1 scoring run but not yet converged
@@ -290,7 +290,7 @@ def _write_learner_state(db_path: Path, symbol: str, rec: dict):
         lines += [
             f"- Algo: **{top['algo_type']}**",
             f"- TP: **{top['tp_ticks']}t** | SL: **{top['sl_ticks']}t**",
-            f"- Dir filter: {top['direction_filter']} | Strength ≤ {top['strength_max']}",
+            f"- Dir filter: {top['direction_filter']} | Strength <= {top['strength_max']}",
             f"- PF: {top.get('profit_factor', 'N/A'):.3f} | "
             f"Expectancy: {top.get('expectancy', 'N/A'):.2f}t | "
             f"WR: {(top.get('win_rate') or 0):.1%}",

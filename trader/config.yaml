@@ -4,7 +4,7 @@
 ib:
   gateway_log_dir: ""   # optional: IB Gateway log dir, e.g. C:\Jts\username
   live_host: 127.0.0.1
-  live_port: 4002  # single paper gateway — handles both data and orders
+  live_port: 4001  # separate live gateway — data reads only, never used for order placement (see broker.py/decider.py: all orders route through ibc.paper)
   live_client_ids: [101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120]
   paper_host: 127.0.0.1
   paper_port: 4002
@@ -16,7 +16,13 @@ ib:
   ibc_mode: paper
 
 symbols:
-  - MES              # trading symbols only — used by decider, broker, position_manager
+  # Expanded 2026-09-06 overnight for the two-winning-reasons research experiment
+  # (see trader/scripts/prep_research_lines.py and RESEARCH_RUNBOOK_2026-09-07.md).
+  # Was [MES] only before this change -- backup at config.yaml.bak_20260906.
+  - MES
+  - MNQ
+  - MYM
+  - M2K              # trading symbols only — used by decider, broker, position_manager
 
 fetcher:
   auto_fetch_enabled: true
@@ -39,7 +45,9 @@ session:
   stop_grace_seconds: 20           # session.py: how long to wait for clean SESSION=SHUTDOWN exit before kill()
 
 orders:
-  active_brackets: [2, 4]
+  # Changed 2026-09-06 from [2, 4] for the two-winning-reasons research experiment --
+  # backtesting found no reason to trade brackets 1-2 (see summarize_sweep.py sweep).
+  active_brackets: [4, 8, 16, 32]
   quantity: 1
   tick_size: 0.25
 

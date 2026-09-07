@@ -1,0 +1,128 @@
+# Galao System Configuration
+# All tunables live here. Never hardcode values in Python files.
+
+ib:
+  gateway_log_dir: ""   # optional: IB Gateway log dir, e.g. C:\Jts\username
+  live_host: 127.0.0.1
+  live_port: 4001  # separate live gateway — data reads only, never used for order placement (see broker.py/decider.py: all orders route through ibc.paper)
+  live_client_ids: [101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120]
+  paper_host: 127.0.0.1
+  paper_port: 4002
+  paper_client_ids: [201, 202, 203, 204, 205, 206, 207, 208, 209, 210]
+  reconnect_interval_seconds: 30
+  connection_timeout: 5
+  fetcher_client_ids: [801, 802, 803]
+  ibc_startgateway_bat: "C:\\IBC\\StartGateway.bat"
+  ibc_mode: paper
+
+symbols:
+  - MES              # trading symbols only — used by decider, broker, position_manager
+
+fetcher:
+  auto_fetch_enabled: true
+  fetch_bid_ask: true
+  fetch_on_startup: true        # fetch prev day if missing when runner starts
+  symbols_override:             # data symbols — independent of trading symbols
+    - MES
+    - MNQ
+    - MYM
+  trigger_time_ct: "17:30"      # HH:MM CT — trigger after market close
+
+session:
+  open_offset_minutes: 30
+  shutdown_offset_minutes: 60
+  timezone: America/Chicago
+  monitor_poll_seconds: 5          # session.py: how often to check broker/decider liveness
+  max_restarts: 5                  # session.py: give up restarting a component after this many crashes
+  restart_backoff_base_seconds: 5  # session.py: delay before first restart attempt
+  restart_backoff_cap_seconds: 60  # session.py: backoff doubles per crash, capped here
+  stop_grace_seconds: 20           # session.py: how long to wait for clean SESSION=SHUTDOWN exit before kill()
+
+orders:
+  active_brackets: [2, 4]
+  quantity: 1
+  tick_size: 0.25
+
+position:
+  stagnation_seconds: 300
+  stagnation_min_move_points: 0.5
+  sl_cooldown_seconds: 30
+
+shutdown:
+  exit_patience_seconds: 30
+  panic_threshold_minutes: 10
+
+decider:
+  replenishment_poll_seconds: 10
+
+broker:
+  command_poll_seconds: 5
+  ib_poll_seconds: 30
+
+visualizer:
+  host: 0.0.0.0      # listen on all interfaces — allows access from other devices on LAN
+  port: 5001
+
+paths:
+  db: data/galao.db
+  test_db: data/test_galao.db
+  backtest_db: data/backtest.db
+  bars: data/bars.db          # 30m bars, read-only for algo_lab/correlation_lab
+  critical_lines: data/critical_lines
+  history: data/history
+  cl_algo_history: C:\Projects\CriticalCorallations2026\june\trader\data\history  # real tick CSVs live here (bug 6) -- NOT trader/data/history
+  logs: logs
+  versions: versions
+
+generator:
+  n_timestamps: 10
+  bracket_sizes: [2, 4, 8, 16]
+  entry_offset_min: 0.5
+  entry_offset_max: 2.0
+
+grader:
+  match_ticks: 1
+
+backtest:
+  symbol: MES
+
+# ── Algo Lab ─────────────────────────────────────────────────────────────────
+# "Claude-designed algo for sup/res": submits many (strategy x tp/sl x
+# direction_filter x strength_max) paper trades in one batch over whatever
+# critical_lines already exist (any detection method — manual/ohlc/pivot/
+# overnight/orb/vwap/volume/round), tagged source='algo_lab' so P&L can be
+# broken down per exact combo later (lib/algo_pnl.py). Paper only — writes
+# PENDING rows into `commands`, same DB/broker as everything else, no separate
+# IB connection. Scoped to its own `symbols` list, independent of the
+# top-level `symbols:` (decider/broker's single-symbol MES flow, unchanged).
+algo_lab:
+  enabled: true
+  symbols: [MES, MNQ, MYM, M2K]
+  quantity: 1
+  # Trade strategy (lib/algo_engine.AlgoType) — which side(s) of each line to trade
+  strategies: [BOUNCE, BREAKOUT, DIRECTIONAL, FADE, BOTH]
+  tp_ticks: [4, 8, 16]
+  sl_ticks: [4, 8, 16]
+  direction_filters: [ALL, BUY_ONLY, SELL_ONLY]
+  strength_max: [1, 2, 3]           # 1=strong lines only, 2=+medium, 3=all
+  # Full grid above = 5x3x3x3x3 = 405 combos/symbol — way too many resting
+  # orders even in paper. Deterministically downsampled to this many per
+  # symbol per submit (same subset every time so P&L-by-params stays
+  # meaningful across repeated runs, see lib/algo_lab.build_param_grid).
+  max_param_combos: 24
+  # Hard safety valve on total commands inserted in one submit_grid() call,
+  # across all symbols/combos combined.
+  max_commands_per_submit: 500
+
+# ── Correlation Lab ────────────────────────────────────────────────────────────
+# Read-only exploration module (lib/correlation_lab.py) — rolling pairwise
+# correlation across the 4 symbols from trader/data/bars.db. Does not trade;
+# purely a visualization aid for the Correlation dashboard tab, meant to
+# surface ideas for a future correlation-based algo type. MNQ is not yet
+# backfilled into bars.db as of this writing — the module reports it as
+# "missing" rather than erroring; see scripts/backfill_bars.py.
+correlation:
+  symbols: [MES, MNQ, MYM, M2K]
+  windows: [20, 50, 100]           # rolling window choices offered in the UI, in 30m bars
+  default_window: 50
+  max_series_points: 500           # cap on rolling-correlation-over-time chart points

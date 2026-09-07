@@ -33,14 +33,11 @@ from lib.config_loader import get_config
 from lib.logger import get_logger
 from lib.db import get_db, init_db, get_pending_commands, update_command_status, get_system_state, record_completed_trade, spawn_replenishment, update_price_cache, get_cached_price
 from lib.ib_client import IBClient
-from lib.order_builder import build_bracket, place_bracket, round_tick
+from lib.order_builder import build_bracket, place_bracket, round_tick, TICK_BY_SYMBOL as _TICK_BY_SYMBOL
 
 log = get_logger("broker")
 
 _MAX_RECONNECT_ATTEMPTS = 5
-
-# Per-symbol minimum tick for TP/SL rebase rounding
-_TICK_BY_SYMBOL = {"MES": 0.25, "MNQ": 0.25, "MYM": 1.0, "M2K": 0.10}
 
 # 2026-07-20 incident: SUBMITTED commands whose ib_order_id had aged out of
 # ibc.paper.trades() were silently skipped by poll_fills() forever -- 96

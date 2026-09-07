@@ -80,6 +80,12 @@ CREATE TABLE IF NOT EXISTS commands (
                                               -- from one scraped line) share one identifier so P&L-by-
                                               -- source views can distinguish a grid from a single signal.
                                               -- Nullable, additive-only -- NULL for every other source.
+    logical_trade_id    TEXT,               -- explicit trade-lineage id: generated once when a trade
+                                              -- originates (generate_commands) and propagated unchanged
+                                              -- onto every replenishment of it (replenish/spawn_replenishment),
+                                              -- regardless of which replenishment path is used. Nullable,
+                                              -- additive-only -- NULL for historical rows written before
+                                              -- this field existed.
     parent_command_id   INTEGER,            -- set when this command was auto-replenished from another
     critical_line_id    INTEGER REFERENCES critical_lines(id),  -- origin line when source=critical_line
     algo_type           TEXT,               -- trade strategy when source=algo_lab: BOUNCE|BREAKOUT|DIRECTIONAL|FADE|BOTH
@@ -235,6 +241,8 @@ CREATE TABLE IF NOT EXISTS cl_algo_sim_results (
     exit_fill_price     REAL,
     pnl_ticks           REAL,
     ticks_to_exit       INTEGER,
+    split               TEXT,               -- train|validation|out_of_sample (nullable: rows
+                                              -- written before this column existed have NULL)
     created_at          TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
     UNIQUE(date, symbol, algo_type, tp_ticks, sl_ticks,
            direction_filter, strength_max, line_price, direction)
@@ -342,6 +350,8 @@ CREATE TABLE IF NOT EXISTS cl_algo_fd_results (
     exit_fill_price     REAL,
     pnl_ticks           REAL,
     ticks_to_exit       INTEGER,
+    split               TEXT,               -- train|validation|out_of_sample (nullable: rows
+                                              -- written before this column existed have NULL)
     created_at          TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
     UNIQUE(date, symbol, entry_line_price, direction, entry_type)
 );
@@ -450,6 +460,9 @@ SELECT
     -- Direct lineage
     c.parent_command_id,
     c.critical_line_id,
+    -- Explicit propagated trade-lineage id (migration roadmap item 3) -- plain
+    -- passthrough, NULL for historical rows written before this field existed.
+    c.logical_trade_id,
     -- Full chain ancestry (walk to root)
     anc.root_cmd_id,
     anc.root_critical_line_id,
@@ -494,6 +507,9 @@ def _migrate(path: Path = None):
         # (32 commands per scraped line) -- nullable, no backfill, every other
         # source's rows stay NULL.
         "ALTER TABLE commands ADD COLUMN strategy_variant TEXT",
+        # explicit propagated trade-lineage id (migration roadmap item 3) -- nullable,
+        # additive-only, NULL for historical rows written before this field existed.
+        "ALTER TABLE commands ADD COLUMN logical_trade_id TEXT",
         # critical_lines.source/algo_type/note/confidence: originally added ad-hoc
         # by back-trading/trading_dashboard.py's own _ensure_columns() helper, not
         # part of this canonical schema -- folded in here too so any module
@@ -504,6 +520,11 @@ def _migrate(path: Path = None):
         "ALTER TABLE critical_lines ADD COLUMN note TEXT",
         "ALTER TABLE critical_lines ADD COLUMN confidence TEXT DEFAULT ''",
         "ALTER TABLE cl_algo_score_history ADD COLUMN top_n_fills INTEGER",
+        # migration roadmap item 7: explicit train|validation|out_of_sample split tag --
+        # nullable, additive-only, NULL for rows written before this split existed
+        # (those pre-date bug 6/7/8 fixes anyway and are already known-invalid).
+        "ALTER TABLE cl_algo_sim_results ADD COLUMN split TEXT",
+        "ALTER TABLE cl_algo_fd_results ADD COLUMN split TEXT",
         # Idempotent CREATE IF NOT EXISTS for tables added after initial schema
         """CREATE TABLE IF NOT EXISTS price_cache (
             symbol       TEXT PRIMARY KEY,
@@ -537,6 +558,7 @@ def _migrate(path: Path = None):
             entry_price REAL NOT NULL, tp_price REAL NOT NULL, sl_price REAL NOT NULL,
             entry_fill_price REAL, entry_fill_time TEXT,
             exit_reason TEXT, exit_fill_price REAL, pnl_ticks REAL, ticks_to_exit INTEGER,
+            split TEXT,
             created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
             UNIQUE(date,symbol,algo_type,tp_ticks,sl_ticks,direction_filter,strength_max,line_price,direction)
         )""",
@@ -595,6 +617,7 @@ def _migrate(path: Path = None):
             two_hour_avg_move REAL NOT NULL, tick_buffer INTEGER NOT NULL DEFAULT 1,
             entry_fill_price REAL, entry_fill_time TEXT,
             exit_reason TEXT, exit_fill_price REAL, pnl_ticks REAL, ticks_to_exit INTEGER,
+            split TEXT,
             created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
             UNIQUE(date, symbol, entry_line_price, direction, entry_type)
         )""",
@@ -760,13 +783,15 @@ def spawn_replenishment(con, parent_cmd, price: float, tick: float) -> int:
         INSERT INTO commands
             (symbol, line_price, line_type, line_strength,
              direction, entry_type, entry_price, tp_price, sl_price,
-             bracket_size, source, parent_command_id, critical_line_id, quantity, status)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')
+             bracket_size, source, parent_command_id, critical_line_id, quantity,
+             logical_trade_id, status)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')
     """, (
         parent_cmd["symbol"], entry_price,
         "SUPPORT" if direction == "BUY" else "RESISTANCE", 1,
         direction, entry_type, entry_price, tp_price, sl_price,
         bracket, source, parent_cmd["id"], inherited_line_id, qty,
+        parent_cmd["logical_trade_id"],
     ))
     return con.execute("SELECT last_insert_rowid()").fetchone()[0]
 
@@ -1055,6 +1080,48 @@ def self_test() -> bool:
             with get_db(db_path) as con:
                 dates = get_priority_dates(con)
             assert dates == ["2026-04-08"], f"get_priority_dates: {dates}"
+
+            # 12b. logical_trade_id: propagated explicitly (migration roadmap item 3),
+            #      not re-derived via the recursive CTE. Passthrough in verified_trades,
+            #      and spawn_replenishment() copies the parent's value unchanged.
+            with get_db(db_path) as con:
+                con.execute("""
+                    INSERT INTO commands
+                        (symbol, line_price, line_type, line_strength,
+                         direction, entry_type, entry_price, tp_price, sl_price,
+                         bracket_size, source, quantity, logical_trade_id)
+                    VALUES ('MES', 6700.0, 'SUPPORT', 2, 'BUY', 'LMT',
+                            6700.0, 6702.0, 6698.0, 2.0, 'critical_line', 1, 'ltid-test-001')
+                """)
+                ltid_cmd_id = con.execute("SELECT last_insert_rowid()").fetchone()[0]
+                update_command_status(
+                    con, ltid_cmd_id, "CLOSED",
+                    fill_price=6700.0, fill_time="2026-04-09T10:00:05Z",
+                    exit_price=6702.0, exit_time="2026-04-09T10:05:00Z",
+                    exit_reason="TP", pnl_points=2.0,
+                )
+                record_completed_trade(con, ltid_cmd_id)
+                # spawn_replenishment() needs a FILLED-status parent row per its own
+                # query pattern elsewhere -- here we just need the full row (SELECT *)
+                # so it can read parent_cmd["logical_trade_id"].
+                parent_row = con.execute(
+                    "SELECT * FROM commands WHERE id=?", (ltid_cmd_id,)
+                ).fetchone()
+                child_id = spawn_replenishment(con, parent_row, 6700.0, tick=0.25)
+            with get_db(db_path) as con:
+                vt_row = con.execute(
+                    "SELECT logical_trade_id FROM verified_trades WHERE command_id=?",
+                    (ltid_cmd_id,)
+                ).fetchone()
+                child_row = con.execute(
+                    "SELECT logical_trade_id, parent_command_id FROM commands WHERE id=?",
+                    (child_id,)
+                ).fetchone()
+            assert vt_row["logical_trade_id"] == "ltid-test-001", \
+                f"verified_trades logical_trade_id passthrough: {vt_row['logical_trade_id']}"
+            assert child_row["parent_command_id"] == ltid_cmd_id
+            assert child_row["logical_trade_id"] == "ltid-test-001", \
+                f"spawn_replenishment did not propagate logical_trade_id: {child_row['logical_trade_id']}"
 
             # 12. Rollback on error — no partial writes
             try:

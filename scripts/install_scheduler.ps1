@@ -29,7 +29,12 @@ $SettingsArgs = @{
 }
 $Settings = New-ScheduledTaskSettingsSet @SettingsArgs
 
-$Principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+# Principal must be the interactive user, not SYSTEM: SYSTEM can't resolve
+# %USERPROFILE%-relative IBC\config.ini, the same bug that caused Fetcher2026's
+# 19-day silent outage (see Fetcher2026\OPERATIONS.md and plan.md bug 1). This
+# task never hit the same failure in practice only because the dashboard process
+# happened to already be running from a manual launch, not via this task.
+$Principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Limited
 
 try {
     Register-ScheduledTask -TaskName "CC2026Dashboard" `
@@ -41,6 +46,40 @@ try {
     }
 } catch {
     Write-Host "FAILED: CC2026Dashboard - $_" -ForegroundColor Red
+}
+
+# --- Task: Random-baseline control on MYM (mimics GevaExtract's 3x/day cadence
+#     at 18:00/20:30/23:00, but on a symbol GevaExtract doesn't trade -- MES/MNQ --
+#     so the two are a genuine apples-to-apples signal-vs-null-hypothesis comparison,
+#     not competing for the same slots). --count 20 is a placeholder volume, not a
+#     precise match to GevaExtract's per-run count (which varies with how many
+#     scraped lines pass filtering) -- adjust if a closer volume match matters later. ---
+$RandomAction = New-ScheduledTaskAction -Execute $Python `
+    -Argument "`"$ProjectRoot\trader\random_gen.py`" --symbol MYM --count 20" `
+    -WorkingDirectory $ProjectRoot
+
+$RandomTriggers = @(
+    (New-ScheduledTaskTrigger -Daily -At "18:00"),
+    (New-ScheduledTaskTrigger -Daily -At "20:30"),
+    (New-ScheduledTaskTrigger -Daily -At "23:00")
+)
+
+$RandomSettings = New-ScheduledTaskSettingsSet `
+    -MultipleInstances IgnoreNew `
+    -ExecutionTimeLimit (New-TimeSpan -Minutes 10) `
+    -StartWhenAvailable
+
+try {
+    Register-ScheduledTask -TaskName "CC2026RandomBaseline" `
+        -Action $RandomAction -Trigger $RandomTriggers -Settings $RandomSettings `
+        -Principal $Principal -Force -ErrorAction Stop | Out-Null
+    if (Get-ScheduledTask -TaskName "CC2026RandomBaseline" -ErrorAction SilentlyContinue) {
+        Write-Host "OK: CC2026RandomBaseline (random control on MYM, 18:00/20:30/23:00)"
+    } else {
+        Write-Host "FAILED: CC2026RandomBaseline registration did not stick." -ForegroundColor Red
+    }
+} catch {
+    Write-Host "FAILED: CC2026RandomBaseline - $_" -ForegroundColor Red
 }
 
 # --- Firewall rule for port 5003 ---

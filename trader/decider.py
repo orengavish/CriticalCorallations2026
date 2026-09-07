@@ -23,6 +23,7 @@ Self-test:
 
 import sys
 import time
+import uuid
 import argparse
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -33,7 +34,7 @@ import sys; sys.path.insert(0, str(_ROOT)) if str(_ROOT) not in sys.path else No
 from lib.config_loader import get_config
 from lib.logger import get_logger
 from lib.db import get_db, init_db, get_filled_commands, get_system_state, set_system_state
-from lib.order_builder import determine_entry_type, calc_bracket_prices, round_tick
+from lib.order_builder import determine_entry_type, calc_bracket_prices, round_tick, get_tick_size
 from lib.critical_lines import get_armed_lines
 
 log = get_logger("decider")
@@ -72,7 +73,7 @@ def generate_commands(symbol: str, date_str: str, current_price: float,
     for each active bracket size.
     Returns number of commands inserted.
     """
-    tick   = cfg.orders.tick_size
+    tick   = get_tick_size(symbol, default=cfg.orders.tick_size)
     qty    = cfg.orders.quantity
     brackets = cfg.orders.active_brackets
 
@@ -116,18 +117,20 @@ def generate_commands(symbol: str, date_str: str, current_price: float,
                 prices = calc_bracket_prices(
                     direction, entry_type, line_price, bracket_size, tick
                 )
+                logical_trade_id = str(uuid.uuid4())
                 with get_db(db_path) as con:
                     con.execute("""
                         INSERT INTO commands
                             (symbol, line_price, line_type, line_strength,
                              direction, entry_type, entry_price, tp_price, sl_price,
-                             bracket_size, source, critical_line_id, quantity, status)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'critical_line', ?, ?, 'PENDING')
+                             bracket_size, source, critical_line_id, quantity,
+                             logical_trade_id, status)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'critical_line', ?, ?, ?, 'PENDING')
                     """, (
                         symbol, line_price, line_type, strength,
                         direction, entry_type,
                         prices["entry_price"], prices["tp_price"], prices["sl_price"],
-                        bracket_size, line["id"], qty
+                        bracket_size, line["id"], qty, logical_trade_id
                     ))
                 count += 1
                 log.debug(
@@ -155,7 +158,7 @@ def replenish(symbol: str, date_str: str, current_price: float,
         log.debug("Replenishment disabled — SESSION=SHUTDOWN")
         return 0
 
-    tick = cfg.orders.tick_size
+    tick = get_tick_size(symbol, default=cfg.orders.tick_size)
     qty  = cfg.orders.quantity
 
     with get_db(db_path) as con:
@@ -204,13 +207,13 @@ def replenish(symbol: str, date_str: str, current_price: float,
                 INSERT INTO commands
                     (symbol, line_price, line_type, line_strength,
                      direction, entry_type, entry_price, tp_price, sl_price,
-                     bracket_size, source, quantity, status)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'critical_line', ?, 'PENDING')
+                     bracket_size, source, quantity, logical_trade_id, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'critical_line', ?, ?, 'PENDING')
             """, (
                 cmd["symbol"], cmd["line_price"], cmd["line_type"], cmd["line_strength"],
                 cmd["direction"], entry_type,
                 prices["entry_price"], prices["tp_price"], prices["sl_price"],
-                cmd["bracket_size"], qty
+                cmd["bracket_size"], qty, cmd["logical_trade_id"]
             ))
 
         log.info(
@@ -337,6 +340,13 @@ def self_test() -> bool:
                 rows = con.execute("SELECT * FROM commands WHERE status='PENDING'").fetchall()
             assert len(rows) == expected
 
+            # 1c. logical_trade_id: each (line, bracket, direction) combo gets its
+            # own distinct, non-null id -- they're independent slots, not siblings.
+            ltids = [r["logical_trade_id"] for r in rows]
+            assert all(ltids), "generate_commands left a NULL logical_trade_id"
+            assert len(set(ltids)) == len(ltids), \
+                f"generate_commands produced duplicate logical_trade_id values: {ltids}"
+
             # Verify toggle: price=6500 ABOVE line 6490 → BUY=LMT, SELL=STP
             buy_rows  = [r for r in rows if r["direction"] == "BUY"  and r["line_price"] == 6490.0]
             sell_rows = [r for r in rows if r["direction"] == "SELL" and r["line_price"] == 6490.0]
@@ -372,6 +382,20 @@ def self_test() -> bool:
 
             n_replenished = replenish("MES", today, current_price, cfg, db_path)
             assert n_replenished == 1, f"Expected 1 replenishment, got {n_replenished}"
+
+            # 2b. logical_trade_id propagated unchanged onto the replenishment row --
+            # same logical trade, not a new one. The replenishment row is the most
+            # recently inserted command (autoincrement id).
+            with get_db(db_path) as con:
+                orig_ltid = con.execute(
+                    "SELECT logical_trade_id FROM commands WHERE id=?", (cmd_id,)
+                ).fetchone()["logical_trade_id"]
+                repl_ltid = con.execute(
+                    "SELECT logical_trade_id FROM commands ORDER BY id DESC LIMIT 1"
+                ).fetchone()["logical_trade_id"]
+            assert orig_ltid, "original command has no logical_trade_id"
+            assert repl_ltid == orig_ltid, \
+                f"replenish() did not propagate logical_trade_id: {orig_ltid!r} -> {repl_ltid!r}"
 
             # No double-replenishment
             n_replenished2 = replenish("MES", today, current_price, cfg, db_path)

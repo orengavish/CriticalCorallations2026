@@ -201,9 +201,15 @@ def run(db_path: Path, history_dir: Path,
         symbols: list[str] | None = None,
         combos: list[dict] | None = None,
         dry_run: bool = False,
-        verbose: bool = False) -> dict:
+        verbose: bool = False,
+        min_date: str | None = None,
+        max_date: str | None = None,
+        split: str = "train") -> dict:
     """
     Run the CL algo backtest for all ready (day, symbol) pairs.
+    min_date/max_date scope the run to one train/validation/out_of_sample date
+    range (see lib.data_availability.split_boundaries). split tags every row
+    written with which split produced it.
     Returns summary dict.
     """
     sim = _load_simulator()
@@ -211,7 +217,8 @@ def run(db_path: Path, history_dir: Path,
 
     syms = symbols or ["MES", "MNQ", "MYM", "M2K"]
     all_combos = combos or build_combos()
-    ready_days = get_ready_days(db_path, history_dir, symbols=syms)
+    ready_days = get_ready_days(db_path, history_dir, symbols=syms,
+                                 min_date=min_date, max_date=max_date)
 
     if not ready_days:
         return {"ready_days": 0, "combos": len(all_combos), "written": 0,
@@ -339,7 +346,7 @@ def run(db_path: Path, history_dir: Path,
                                           line["price"], line["line_type"], line["strength"],
                                           cmd["direction"], cmd["entry_type"],
                                           cmd["entry_price"], cmd["tp_price"], cmd["sl_price"],
-                                          None, None, "EXPIRED", None, None, None))
+                                          None, None, "EXPIRED", None, None, None, split))
                         continue
 
                     # TP/SL relative to actual fill price (matters for STP where fill includes slippage)
@@ -375,7 +382,7 @@ def run(db_path: Path, history_dir: Path,
                                           cmd["direction"], cmd["entry_type"],
                                           cmd["entry_price"], cmd["tp_price"], cmd["sl_price"],
                                           fill_p, fill_t.isoformat(),
-                                          exit_r, exit_fp, pnl, ticks_ex))
+                                          exit_r, exit_fp, pnl, ticks_ex, split))
                     except Exception:
                         errors += 1
                         batch_all.append((date_str, sym, at, tp, sl_t, df_filt, sm,
@@ -383,7 +390,7 @@ def run(db_path: Path, history_dir: Path,
                                           cmd["direction"], cmd["entry_type"],
                                           cmd["entry_price"], cmd["tp_price"], cmd["sl_price"],
                                           fill_p, fill_t.isoformat(),
-                                          "ERROR", None, None, None))
+                                          "ERROR", None, None, None, split))
 
         # Flush entire day's batch at once (one DB write per day)
         if batch_all:
@@ -396,8 +403,9 @@ def run(db_path: Path, history_dir: Path,
                          direction, entry_type,
                          entry_price, tp_price, sl_price,
                          entry_fill_price, entry_fill_time,
-                         exit_reason, exit_fill_price, pnl_ticks, ticks_to_exit)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                         exit_reason, exit_fill_price, pnl_ticks, ticks_to_exit,
+                         split)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """, batch_all)
             written += len(batch_all)
             if verbose:

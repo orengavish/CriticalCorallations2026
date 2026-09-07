@@ -29,6 +29,20 @@ from lib.logger import get_logger
 
 log = get_logger("order_builder")
 
+# Canonical per-symbol tick sizes. Single source of truth for anything that rounds a
+# price for order placement -- decider.py's calc_bracket_prices() and broker.py's fill
+# reconciliation must use the SAME table, or the same command can be computed with two
+# different tick sizes depending which module touched it last. Added 2026-09-06: found
+# decider.py was rounding EVERY symbol at the flat cfg.orders.tick_size (0.25, MES's
+# tick) while broker.py already had its own private per-symbol dict -- harmless while
+# symbols:[MES] only, but MYM (tick=1.0) and M2K (tick=0.10) would get silently
+# mis-rounded entry/TP/SL prices the moment either was added to the live symbols list.
+TICK_BY_SYMBOL = {"MES": 0.25, "MNQ": 0.25, "MYM": 1.0, "M2K": 0.10}
+
+
+def get_tick_size(symbol: str, default: float = 0.25) -> float:
+    return TICK_BY_SYMBOL.get(symbol, default)
+
 
 def round_tick(price: float, tick_size: float = 0.25) -> float:
     """Round price to nearest tick. MES tick = 0.25."""
@@ -251,6 +265,21 @@ def self_test() -> bool:
         orders_stp = build_bracket(fake_ib, None, "SELL", "STP",
                                    6499.75, 6497.75, 6501.75)
         assert orders_stp["entry"].action == "SELL"
+
+        # 5. Per-symbol tick lookup (2026-09-06 fix): MYM/M2K must NOT round at MES's
+        # 0.25 tick -- that produced invalid, non-tradeable increments for either once
+        # they joined the live symbols list (MYM ticks in whole points; M2K in 0.10).
+        assert get_tick_size("MES") == 0.25
+        assert get_tick_size("MNQ") == 0.25
+        assert get_tick_size("MYM") == 1.0
+        assert get_tick_size("M2K") == 0.10
+        assert get_tick_size("UNKNOWN_SYMBOL") == 0.25  # falls back to the default
+        p_mym = calc_bracket_prices("BUY", "LMT", 53773.0, 8.0, get_tick_size("MYM"))
+        assert p_mym["entry_price"] == 53773.0 and p_mym["tp_price"] == 53781.0, \
+            "MYM at its real 1.0 tick must not get MES's 0.25 rounding"
+        p_m2k = calc_bracket_prices("BUY", "STP", 2979.43, 4.0, get_tick_size("M2K"))
+        assert abs(p_m2k["entry_price"] - 2979.5) < 1e-9, \
+            "M2K at its real 0.10 tick must round 2979.43+0.10=2979.53 to 2979.5, not a 0.25 multiple"
 
         print("[self-test] order_builder: PASS")
         return True
