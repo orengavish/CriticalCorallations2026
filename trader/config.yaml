@@ -21,12 +21,14 @@ symbols:
   # Was [MES] only originally -- backup at config.yaml.bak_20260906.
   #
   # 2026-09-07: briefly expanded to the full 104-symbol universe (4 futures + all
-  # 100 stocks), then scaled back down to 10 (the 4 futures + the 6 largest/most
-  # liquid stocks) at the user's own request ("cold feet" the night before first
-  # live run of the expanded scope) -- smaller, well-understood blast radius for
-  # this first real session. The other 94 stocks' critical_lines rows are still in
-  # the DB (armed=1) but simply never touched by a symbol not in this list --
-  # nothing to clean up to re-expand later, just add symbols back here.
+  # 100 stocks), then scaled back at the user's own request ("cold feet" the night
+  # before first live run of the expanded scope) to the 4 futures + 10 of the
+  # largest/most liquid stocks -- smaller, well-understood blast radius for this
+  # first real session. JPM and BRK.B skipped (JPM: no armed line for 2026-09-08;
+  # BRK.B: known IB dotted-class-share ticker quirk, avoided for a first run).
+  # The other ~90 stocks' critical_lines rows are still in the DB (armed=1) but
+  # simply never touched by a symbol not in this list -- nothing to clean up to
+  # re-expand later, just add symbols back here.
   - MES
   - MNQ
   - MYM
@@ -36,7 +38,11 @@ symbols:
   - NVDA
   - GOOGL
   - AMZN
-  - META              # trading symbols only — used by decider, broker, position_manager
+  - META
+  - AVGO
+  - TSLA
+  - LLY
+  - V                 # trading symbols only — used by decider, broker, position_manager
 
 fetcher:
   auto_fetch_enabled: true
@@ -75,11 +81,11 @@ shutdown:
   panic_threshold_minutes: 10
 
 decider:
-  # 2026-09-07: was raised to 300 for the (since scaled back) 104-symbol universe,
-  # then lowered to 20 for the 10-symbol scope -- 10 symbols x ~1.5s/price-fetch
-  # is ~15s/pass, so 20s comfortably fits (the original 10s default was tuned for
-  # a single symbol and would already be tight even at 10).
-  replenishment_poll_seconds: 20
+  # 2026-09-07: was raised to 300 for the (since scaled back) 104-symbol universe.
+  # Now 14 symbols (4 futures + 10 stocks) x ~1.5s/price-fetch is ~21s/pass, so 30s
+  # comfortably fits (the original 10s default was tuned for a single symbol and
+  # would already be tight even at 14).
+  replenishment_poll_seconds: 30
 
 broker:
   command_poll_seconds: 5
