@@ -21,7 +21,7 @@ import argparse
 import threading
 from datetime import datetime, timezone
 
-from ib_insync import IB, Future, util
+from ib_insync import IB, Future, Stock, util
 
 from lib.config_loader import get_config
 from lib.logger import get_logger
@@ -32,6 +32,12 @@ _EXCHANGE = "CME"
 _SYMBOL_EXCHANGE = {"MYM": "CBOT"}  # Micro Dow is listed under CBOT, not CME -- confirmed
                                     # via reqContractDetails (2026-08-29); MES/MNQ/M2K are CME.
 _CURRENCY = "USD"
+
+# The only 4 symbols this system has ever traded before 2026-09-07. Everything else
+# (the ~100-stock research universe) is assumed to be a US equity, routed via SMART --
+# no per-symbol exchange table needed the way futures need CME/CBOT disambiguation.
+_FUTURES_SYMBOLS = {"MES", "MNQ", "MYM", "M2K"}
+_STOCK_EXCHANGE = "SMART"
 
 
 class IBClient:
@@ -62,7 +68,7 @@ class IBClient:
         self._live_client_id:  int | None = None
         self._paper_client_id: int | None = None
 
-        self._contract_cache: dict[str, Future] = {}
+        self._contract_cache: dict[str, Future | Stock] = {}
 
         self._lock = threading.Lock()
         atexit.register(self.disconnect)
@@ -194,23 +200,42 @@ class IBClient:
         log.info(f"Price for {symbol}: {price}")
         return price
 
-    def _make_contract(self, symbol: str) -> Future:
-        """Build a generic continuous futures contract (resolved later by get_contract)."""
-        exchange = _SYMBOL_EXCHANGE.get(symbol, _EXCHANGE)
-        return Future(symbol=symbol, exchange=exchange, currency=_CURRENCY)
+    def _make_contract(self, symbol: str) -> Future | Stock:
+        """Build an unqualified contract (resolved later by get_contract). Futures need
+        the exchange disambiguated (CME vs CBOT); stocks route through SMART uniformly."""
+        if symbol in _FUTURES_SYMBOLS:
+            exchange = _SYMBOL_EXCHANGE.get(symbol, _EXCHANGE)
+            return Future(symbol=symbol, exchange=exchange, currency=_CURRENCY)
+        return Stock(symbol, _STOCK_EXCHANGE, _CURRENCY)
 
-    def get_contract(self, symbol: str) -> Future:
+    def get_contract(self, symbol: str) -> Future | Stock:
         """
-        Resolve the active front-month contract for symbol via LIVE connection.
-        Uses reqContractDetails to handle ambiguous contracts, picks nearest expiry.
-        Result is cached for the lifetime of this IBClient instance.
-        Returns a qualified Future contract.
+        Resolve the tradeable contract for symbol via LIVE connection. Result is cached
+        for the lifetime of this IBClient instance.
+
+        Futures: uses reqContractDetails to handle ambiguous contracts (multiple listed
+        expiries), picks nearest (front-month) expiry.
+        Stocks (anything not in _FUTURES_SYMBOLS): a Stock contract has no expiry to
+        disambiguate -- qualifyContracts() alone confirms it resolves to a real,
+        tradeable instrument (catches typos/delisted tickers the same way reqContractDetails
+        does for futures).
         """
         if symbol in self._contract_cache:
             return self._contract_cache[symbol]
 
         if not self.live or not self.live.isConnected():
             raise ConnectionError("LIVE connection is not active")
+
+        if symbol not in _FUTURES_SYMBOLS:
+            con = Stock(symbol, _STOCK_EXCHANGE, _CURRENCY)
+            qualified = self.live.qualifyContracts(con)
+            if not qualified:
+                raise ValueError(f"No contract found for stock symbol {symbol}")
+            resolved = qualified[0]
+            self._contract_cache[symbol] = resolved
+            log.info(f"Resolved contract: {symbol} -> {resolved.symbol} (STK/{_STOCK_EXCHANGE})")
+            return resolved
+
         exchange = _SYMBOL_EXCHANGE.get(symbol, _EXCHANGE)
         con = Future(symbol=symbol, exchange=exchange, currency=_CURRENCY)
         details = self.live.reqContractDetails(con)
@@ -314,6 +339,17 @@ def self_test() -> bool:
     """
     try:
         cfg = get_config()
+
+        # 0. Contract-type branching (offline, no IB connection needed): futures still
+        # get a Future() with the right exchange; anything else (the stock research
+        # universe) gets a Stock() routed via SMART, not silently mistaken for a future.
+        ibc0 = IBClient(cfg)
+        fut = ibc0._make_contract("MES")
+        assert isinstance(fut, Future) and fut.exchange == "CME"
+        fut_mym = ibc0._make_contract("MYM")
+        assert isinstance(fut_mym, Future) and fut_mym.exchange == "CBOT"
+        stk = ibc0._make_contract("AAPL")
+        assert isinstance(stk, Stock) and stk.exchange == "SMART" and stk.symbol == "AAPL"
 
         # 1. Object construction with valid config
         ibc = IBClient(cfg)

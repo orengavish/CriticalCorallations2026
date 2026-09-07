@@ -36,6 +36,7 @@ from lib.logger import get_logger
 from lib.db import get_db, init_db, get_filled_commands, get_system_state, set_system_state
 from lib.order_builder import determine_entry_type, calc_bracket_prices, round_tick, get_tick_size
 from lib.critical_lines import get_armed_lines
+from lib.session_clock import is_entry_cutoff, is_forced_exit_time
 
 log = get_logger("decider")
 
@@ -72,8 +73,17 @@ def generate_commands(symbol: str, date_str: str, current_price: float,
     Creates commands in BOTH directions (BUY + SELL) for each line,
     for each active bracket size.
     Returns number of commands inserted.
+
+    No new entries within 30 minutes of symbol's own market close (session_clock.py) --
+    mirrors the backtest's entry-cutoff rule (backtest/simulate_trades.py). Each symbol
+    is checked against its OWN close time/timezone (futures: CT; stocks: ET), not a
+    single shared clock.
     """
-    tick   = get_tick_size(symbol, default=cfg.orders.tick_size)
+    if is_entry_cutoff(symbol):
+        log.info(f"{symbol}: within entry cutoff of close -- not generating new commands")
+        return 0
+
+    tick   = get_tick_size(symbol)
     qty    = cfg.orders.quantity
     brackets = cfg.orders.active_brackets
 
@@ -158,7 +168,11 @@ def replenish(symbol: str, date_str: str, current_price: float,
         log.debug("Replenishment disabled — SESSION=SHUTDOWN")
         return 0
 
-    tick = get_tick_size(symbol, default=cfg.orders.tick_size)
+    if is_entry_cutoff(symbol):
+        log.debug(f"{symbol}: within entry cutoff of close -- replenishment disabled")
+        return 0
+
+    tick = get_tick_size(symbol)
     qty  = cfg.orders.quantity
 
     with get_db(db_path) as con:
@@ -226,6 +240,52 @@ def replenish(symbol: str, date_str: str, current_price: float,
     return count
 
 
+def force_close_symbol(symbol: str, db_path, ibc) -> int:
+    """
+    Force-flatten every open (FILLED) position for THIS symbol only, at market --
+    called once a symbol enters its own 5-minute forced-exit window (session_clock.py).
+
+    Deliberately NOT reqGlobalCancel() (unlike daily_paper_session.py's force_close_all,
+    which is fine to nuke every open order account-wide since it only ever runs at the
+    very end of its own dedicated session): with multiple symbols now live at once and
+    different asset classes closing at different times, an account-wide cancel here
+    would also kill other symbols' still-active resting orders. Cancels only THIS
+    symbol's own TP/SL legs before market-exiting -- same per-command mechanics as
+    force_close_all, just symbol-scoped instead of account-wide. Safe to call every
+    poll cycle: once a command's MKT exit fills and broker.py's normal fill-handling
+    moves it off FILLED, it simply stops showing up here -- no separate "already
+    triggered" flag needed.
+    """
+    from ib_insync import MarketOrder, Order
+
+    with get_db(db_path) as con:
+        filled = con.execute(
+            "SELECT * FROM commands WHERE symbol=? AND status='FILLED'", (symbol,)
+        ).fetchall()
+    if not filled:
+        return 0
+
+    closed = 0
+    for cmd in filled:
+        try:
+            contract = ibc.get_contract(symbol)
+            exit_action = "SELL" if cmd["direction"] == "BUY" else "BUY"
+            for oid in (cmd["ib_tp_order_id"], cmd["ib_sl_order_id"]):
+                if oid:
+                    try:
+                        o = Order(); o.orderId = oid
+                        ibc.paper.cancelOrder(o)
+                    except Exception:
+                        pass
+            mkt = MarketOrder(exit_action, cmd["quantity"])
+            ibc.paper.placeOrder(contract, mkt)
+            log.info(f"[forced_eod] MKT exit placed for cmd {cmd['id']} ({exit_action} {symbol})")
+            closed += 1
+        except Exception as e:
+            log.error(f"[forced_eod] MKT exit failed for cmd {cmd['id']}: {e}")
+    return closed
+
+
 def run_session_start(ibc, cfg, db_path, date_str: str = None):
     """
     Session start: read critical lines already in DB (entered via GUI),
@@ -288,6 +348,13 @@ def run_replenishment_loop(ibc, cfg, db_path, date_str: str = None):
                 continue
 
         for symbol in cfg.symbols:
+            if is_forced_exit_time(symbol):
+                n_closed = force_close_symbol(symbol, db_path, ibc)
+                if n_closed:
+                    log.info(f"[forced_eod] {symbol}: force-flattened {n_closed} position(s) "
+                             f"(within 5 min of close)")
+                continue  # no replenishment once a symbol is being forced flat
+
             price = get_current_price(symbol, ibc)
             if price is None:
                 log.warning(f"No price for {symbol} — skipping replenishment")
@@ -303,12 +370,23 @@ def run_replenishment_loop(ibc, cfg, db_path, date_str: str = None):
 
 def self_test() -> bool:
     import tempfile
+    mod = sys.modules[__name__]
+    original_entry_cutoff = mod.is_entry_cutoff
+    original_forced_exit  = mod.is_forced_exit_time
     try:
         from lib.logger import reset_loggers
         from lib.db import set_system_state, update_command_status
 
         cfg = get_config()
         tick = cfg.orders.tick_size
+
+        # The existing fixture below uses a fixed test date but real wall-clock time --
+        # without this, whatever moment this self-test happens to run at could
+        # spuriously land inside MES's real entry-cutoff/forced-exit window and zero
+        # out every assertion below. Disabled here; the cutoff/forced-exit logic itself
+        # gets its own dedicated, time-controlled assertions further down.
+        mod.is_entry_cutoff = lambda symbol, **kw: False
+        mod.is_forced_exit_time = lambda symbol, **kw: False
 
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "test.db"
@@ -411,6 +489,64 @@ def self_test() -> bool:
 
             reset_loggers()
 
+        # 4. Entry cutoff gate: generate_commands/replenish must respect it (0 commands
+        # when "in cutoff", normal generation otherwise) -- session_clock.py's own time
+        # math is tested there; this only checks decider.py wires the gate correctly.
+        with tempfile.TemporaryDirectory() as tmp2:
+            db_path2 = Path(tmp2) / "test2.db"
+            init_db(db_path2)
+            with get_db(db_path2) as con:
+                con.execute(
+                    "INSERT INTO critical_lines (symbol, date, line_type, price, strength, armed)"
+                    " VALUES ('MES', '2026-04-07', 'SUPPORT', 6490.00, 2, 1)"
+                )
+            mod.is_entry_cutoff = lambda symbol, **kw: True
+            n_cutoff = generate_commands("MES", "2026-04-07", 6500.0, cfg, db_path2)
+            assert n_cutoff == 0, "must generate nothing once within the entry cutoff"
+            mod.is_entry_cutoff = lambda symbol, **kw: False
+            n_normal = generate_commands("MES", "2026-04-07", 6500.0, cfg, db_path2)
+            assert n_normal > 0, "must generate normally once the cutoff lambda is lifted"
+
+        # 5. force_close_symbol: MKT-exits every FILLED command for the given symbol,
+        # leaves other symbols alone, and is a no-op with nothing open.
+        class _FakePaper:
+            def __init__(self): self.orders_placed = []; self.cancels = []
+            def placeOrder(self, contract, order): self.orders_placed.append((contract, order))
+            def cancelOrder(self, order): self.cancels.append(order)
+
+        class _FakeIBC:
+            def __init__(self): self.paper = _FakePaper()
+            def get_contract(self, symbol): return symbol  # identity stand-in
+
+        with tempfile.TemporaryDirectory() as tmp3:
+            db_path3 = Path(tmp3) / "test3.db"
+            init_db(db_path3)
+            with get_db(db_path3) as con:
+                con.execute(
+                    "INSERT INTO commands (symbol, line_price, line_type, line_strength, direction,"
+                    " entry_type, entry_price, tp_price, sl_price, bracket_size, source,"
+                    " quantity, logical_trade_id, status) VALUES"
+                    " ('MES', 6490, 'SUPPORT', 2, 'BUY', 'LMT', 6490, 6494, 6486, 4,"
+                    " 'critical_line', 1, 'lt1', 'FILLED')"
+                )
+                con.execute(
+                    "INSERT INTO commands (symbol, line_price, line_type, line_strength, direction,"
+                    " entry_type, entry_price, tp_price, sl_price, bracket_size, source,"
+                    " quantity, logical_trade_id, status) VALUES"
+                    " ('AAPL', 220, 'SUPPORT', 2, 'BUY', 'LMT', 220, 222, 218, 4,"
+                    " 'critical_line', 1, 'lt2', 'FILLED')"
+                )
+            fake_ibc = _FakeIBC()
+            n_closed = force_close_symbol("MES", db_path3, fake_ibc)
+            assert n_closed == 1, f"expected exactly 1 MES position force-closed, got {n_closed}"
+            assert len(fake_ibc.paper.orders_placed) == 1
+            _, order = fake_ibc.paper.orders_placed[0]
+            assert order.action == "SELL", "MES BUY position must be flattened with a SELL"
+
+            n_noop = force_close_symbol("MYM", db_path3, fake_ibc)
+            assert n_noop == 0, "no open MYM positions -- must be a no-op"
+            assert len(fake_ibc.paper.orders_placed) == 1, "AAPL's position must be untouched by an MES-scoped call"
+
         print("[self-test] decider: PASS")
         return True
 
@@ -418,6 +554,9 @@ def self_test() -> bool:
         print(f"[self-test] decider: FAIL -- {e}")
         import traceback; traceback.print_exc()
         return False
+    finally:
+        mod.is_entry_cutoff = original_entry_cutoff
+        mod.is_forced_exit_time = original_forced_exit
 
 
 if __name__ == "__main__":

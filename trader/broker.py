@@ -33,7 +33,7 @@ from lib.config_loader import get_config
 from lib.logger import get_logger
 from lib.db import get_db, init_db, get_pending_commands, update_command_status, get_system_state, record_completed_trade, spawn_replenishment, update_price_cache, get_cached_price
 from lib.ib_client import IBClient
-from lib.order_builder import build_bracket, place_bracket, round_tick, TICK_BY_SYMBOL as _TICK_BY_SYMBOL
+from lib.order_builder import build_bracket, place_bracket, round_tick, get_tick_size
 
 log = get_logger("broker")
 
@@ -526,7 +526,7 @@ def _drain_rebase_queue(ibc: IBClient, db_path) -> int:
             continue
 
         entry_price = cmd["entry_price"]
-        tick        = _TICK_BY_SYMBOL.get(cmd["symbol"], 0.25)
+        tick        = get_tick_size(cmd["symbol"])
         slippage    = abs(fill_price - entry_price)
 
         if slippage < tick:
@@ -790,7 +790,7 @@ def reconcile_naked_positions(ibc: IBClient, cfg) -> None:
             continue
 
         qty = abs(pos.position)
-        tick = _TICK_BY_SYMBOL.get(sym, 0.25)
+        tick = get_tick_size(sym)
         log.error(
             f"RECONCILE: {sym} has a naked position ({pos.position:+.0f} contracts, "
             f"no resting protective order) — placing emergency stop"

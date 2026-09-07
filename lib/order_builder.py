@@ -39,9 +39,16 @@ log = get_logger("order_builder")
 # mis-rounded entry/TP/SL prices the moment either was added to the live symbols list.
 TICK_BY_SYMBOL = {"MES": 0.25, "MNQ": 0.25, "MYM": 1.0, "M2K": 0.10}
 
+# US equities all tick at $0.01 post-decimalization -- unlike futures, no per-symbol
+# table is needed for the ~100-stock research universe. Added 2026-09-07 alongside
+# ib_client.py's Stock() support: any symbol NOT in TICK_BY_SYMBOL is now assumed to be
+# an equity, not "unknown, guess MES's tick" -- the old default (0.25) would have
+# mis-rounded every stock order the same way the original bug mis-rounded MYM/M2K.
+_STOCK_TICK = 0.01
 
-def get_tick_size(symbol: str, default: float = 0.25) -> float:
-    return TICK_BY_SYMBOL.get(symbol, default)
+
+def get_tick_size(symbol: str) -> float:
+    return TICK_BY_SYMBOL.get(symbol, _STOCK_TICK)
 
 
 def round_tick(price: float, tick_size: float = 0.25) -> float:
@@ -273,7 +280,11 @@ def self_test() -> bool:
         assert get_tick_size("MNQ") == 0.25
         assert get_tick_size("MYM") == 1.0
         assert get_tick_size("M2K") == 0.10
-        assert get_tick_size("UNKNOWN_SYMBOL") == 0.25  # falls back to the default
+        # 2026-09-07: anything not a known future is now assumed to be a US equity
+        # (0.01 tick), not "unknown, guess MES's 0.25" -- that guess would have
+        # mis-rounded every stock order the same way MYM/M2K were mis-rounded before.
+        assert get_tick_size("AAPL") == 0.01
+        assert get_tick_size("UNKNOWN_SYMBOL") == 0.01
         p_mym = calc_bracket_prices("BUY", "LMT", 53773.0, 8.0, get_tick_size("MYM"))
         assert p_mym["entry_price"] == 53773.0 and p_mym["tp_price"] == 53781.0, \
             "MYM at its real 1.0 tick must not get MES's 0.25 rounding"
