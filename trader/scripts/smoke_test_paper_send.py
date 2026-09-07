@@ -2,14 +2,15 @@
 trader/scripts/smoke_test_paper_send.py
 One-off smoke test: confirm the paper order-submission mechanics (build_bracket +
 place_bracket, the same functions broker.py's process_pending_commands() calls) still
-work end to end against the real paper IB connection -- deliberately does NOT go
-through the full decider/broker pipeline (that needs the LIVE connection too, for
-get_contract()/pricing, which isn't up), and deliberately does NOT expect a fill: it
-places a bracket absurdly far from any real price, confirms IB acknowledges all three
-legs (order IDs assigned, no rejection), then cancels all three immediately.
+work end to end against the real paper IB connection, for EITHER a future or a stock
+(same contract-type branching as lib/ib_client.py's get_contract()) -- deliberately does
+NOT expect a fill: it places a bracket absurdly far from any real price, confirms IB
+acknowledges all three legs (order IDs assigned, no rejection), then cancels all three
+immediately.
 
 Usage:
     python trader/scripts/smoke_test_paper_send.py [--symbol MES]
+    python trader/scripts/smoke_test_paper_send.py --symbol AAPL
 """
 
 import sys
@@ -20,9 +21,10 @@ from pathlib import Path
 _ROOT = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(_ROOT))
 
-from ib_insync import Future
+from ib_insync import Future, Stock
 from lib.config_loader import get_config
 from lib.order_builder import build_bracket, place_bracket, get_tick_size
+from lib.ib_client import _FUTURES_SYMBOLS, _SYMBOL_EXCHANGE, _EXCHANGE, _STOCK_EXCHANGE
 
 
 def main(symbol: str) -> bool:
@@ -33,16 +35,25 @@ def main(symbol: str) -> bool:
     print(f"Connected to PAPER {cfg.ib.paper_host}:{cfg.ib.paper_port}")
 
     try:
-        con = Future(symbol=symbol, exchange="CME" if symbol != "MYM" else "CBOT", currency="USD")
-        details = ib.reqContractDetails(con)
-        if not details:
-            print(f"FAIL: no contract details for {symbol}")
-            return False
-        # Front-month = nearest expiry, same selection rule as lib/ib_client.py's
-        # get_contract() (multiple expiries are listed simultaneously -- a bare
-        # qualifyContracts() is ambiguous, this is why the real code sorts first).
-        contract = sorted(details, key=lambda d: d.contract.lastTradeDateOrContractMonth or "")[0].contract
-        print(f"Qualified: {contract.localSymbol} (front-month, exp={contract.lastTradeDateOrContractMonth})")
+        if symbol in _FUTURES_SYMBOLS:
+            con = Future(symbol=symbol, exchange=_SYMBOL_EXCHANGE.get(symbol, _EXCHANGE), currency="USD")
+            details = ib.reqContractDetails(con)
+            if not details:
+                print(f"FAIL: no contract details for {symbol}")
+                return False
+            # Front-month = nearest expiry, same selection rule as lib/ib_client.py's
+            # get_contract() (multiple expiries are listed simultaneously -- a bare
+            # qualifyContracts() is ambiguous, this is why the real code sorts first).
+            contract = sorted(details, key=lambda d: d.contract.lastTradeDateOrContractMonth or "")[0].contract
+            print(f"Qualified: {contract.localSymbol} (front-month, exp={contract.lastTradeDateOrContractMonth})")
+        else:
+            con = Stock(symbol, _STOCK_EXCHANGE, "USD")
+            qualified = ib.qualifyContracts(con)
+            if not qualified:
+                print(f"FAIL: could not qualify stock {symbol}")
+                return False
+            contract = qualified[0]
+            print(f"Qualified: {contract.symbol} (STK/{_STOCK_EXCHANGE})")
 
         tick = get_tick_size(symbol)
         # Absurdly far below any real price -- guarantees no fill, purely tests
