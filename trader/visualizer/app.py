@@ -133,8 +133,16 @@ def api_stats():
             "SELECT COUNT(*) FROM commands WHERE status='CLOSED'"
             " AND date(updated_at)=?", (today,)
         ).fetchone()[0]
+        # 2026-09-08: RECONCILE_REQUIRED retired as a status (it used to remove a
+        # command from every FILLED/SUBMITTED dashboard view the moment broker
+        # flagged it for review). True errors and "flagged, needs a human look"
+        # are now counted separately -- needs_review rows keep their real status
+        # and stay visible in FILLED/SUBMITTED tiles/pages as before.
         errors = con.execute(
             "SELECT COUNT(*) FROM commands WHERE status IN ('ERROR','RECONCILE_REQUIRED')"
+        ).fetchone()[0]
+        needs_review = con.execute(
+            "SELECT COUNT(*) FROM commands WHERE needs_review=1"
         ).fetchone()[0]
 
         # Unrealized P&L — read from FILLED commands (positions table not populated)
@@ -164,6 +172,7 @@ def api_stats():
     counts = {r["status"]: r["cnt"] for r in status_rows}
     counts["CLOSED"] = closed_today
     counts["ERROR"]  = errors
+    counts["NEEDS_REVIEW"] = needs_review
 
     # ── Unrealized P&L ────────────────────────────────────────────────────
     try:

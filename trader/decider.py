@@ -570,6 +570,12 @@ if __name__ == "__main__":
     if args.self_test:
         sys.exit(0 if self_test() else 1)
 
+    from lib.singleton_lock import acquire_singleton_lock
+    if not acquire_singleton_lock("decider", Path(__file__).parent / "logs"):
+        log.error("decider already running (another live process holds the lock) "
+                   "— refusing to start a second instance")
+        sys.exit(1)
+
     cfg = get_config()
     db_path = Path(cfg.paths.db)
     init_db(db_path)

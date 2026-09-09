@@ -93,7 +93,15 @@ CREATE TABLE IF NOT EXISTS commands (
     quantity            INTEGER NOT NULL DEFAULT 1,
     status              TEXT    NOT NULL DEFAULT 'PENDING',
     -- PENDING | SUBMITTING | SUBMITTED | FILLED | EXITING | CLOSED
-    -- CANCELLED | ERROR | RECONCILE_REQUIRED
+    -- CANCELLED | ERROR
+    -- (RECONCILE_REQUIRED retired 2026-09-08: a stuck command's lifecycle status
+    -- now stays whatever it truly was -- SUBMITTED or FILLED -- so it never drops
+    -- out of dashboard views that filter on those statuses. needs_review/review_note
+    -- below carry the "broker lost track of this order, a human should look" signal
+    -- instead. Historical rows may still carry status='RECONCILE_REQUIRED' from
+    -- before this change -- harmless, just never written by new code.)
+    needs_review        INTEGER NOT NULL DEFAULT 0,
+    review_note         TEXT,
     ib_order_id         INTEGER,
     ib_tp_order_id      INTEGER,
     ib_sl_order_id      INTEGER,
@@ -510,6 +518,11 @@ def _migrate(path: Path = None):
         # explicit propagated trade-lineage id (migration roadmap item 3) -- nullable,
         # additive-only, NULL for historical rows written before this field existed.
         "ALTER TABLE commands ADD COLUMN logical_trade_id TEXT",
+        # 2026-09-08: needs_review/review_note replace status='RECONCILE_REQUIRED' --
+        # additive-only, default 0/NULL so every existing row is unaffected until
+        # explicitly flagged.
+        "ALTER TABLE commands ADD COLUMN needs_review INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE commands ADD COLUMN review_note TEXT",
         # critical_lines.source/algo_type/note/confidence: originally added ad-hoc
         # by back-trading/trading_dashboard.py's own _ensure_columns() helper, not
         # part of this canonical schema -- folded in here too so any module
@@ -689,6 +702,27 @@ def update_command_status(con, command_id: int, status: str, **kwargs):
     sets += ", updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')"
     values = list(fields.values()) + [command_id]
     con.execute(f"UPDATE commands SET {sets} WHERE id=?", values)
+
+
+def flag_needs_review(con, command_id: int, note: str):
+    """
+    Mark a command for human review without touching its lifecycle status --
+    it stays visible wherever its real status (SUBMITTED/FILLED) is shown.
+    Replaces the old status='RECONCILE_REQUIRED' overwrite (2026-09-08).
+    """
+    con.execute(
+        "UPDATE commands SET needs_review=1, review_note=?,"
+        " updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id=?",
+        (note, command_id),
+    )
+
+
+def clear_needs_review(con, command_id: int):
+    con.execute(
+        "UPDATE commands SET needs_review=0, review_note=NULL,"
+        " updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id=?",
+        (command_id,),
+    )
 
 
 def record_completed_trade(con, command_id: int) -> bool:
