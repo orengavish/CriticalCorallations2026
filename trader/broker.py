@@ -230,6 +230,26 @@ def process_pending_commands(ibc: IBClient, db_path, cfg) -> int:
     """
     Find all PENDING commands, claim them, submit to IB, write SUBMITTED.
     Returns number of orders submitted.
+
+    Two safety gates run right here, at the moment of submission, not just at command
+    creation time (2026-09-09 incident: a command can sit PENDING for a while -- a burst
+    from an external writer, e.g. GevaExtract, or simply this loop's own cadence -- and
+    the price it was built against can be stale by the time it actually reaches IB):
+
+    1. Admission cap: refuse to push this symbol/side past `orders.max_resting_per_side`
+       already-resting commands (SUBMITTED or unresolved FILLED). IB itself enforces a
+       hard cap around 15 per contract/side and rejects the rest with an ugly cascade of
+       error 201/202s (exactly what happened 2026-09-08); this stays comfortably under
+       that so legs still have room, instead of finding out from IB's rejection storm.
+    2. Fresh-price check: re-fetch the live price and confirm the command's own toggle
+       rule (order_builder.determine_entry_type) still holds, with a minimum buffer
+       (`orders.min_entry_buffer_ticks`, in ticks so it scales sensibly across MES's
+       0.25 tick vs a stock's 0.01 tick). A stale STP command whose trigger price the
+       market has already passed would otherwise fill immediately at whatever price IB
+       gives it -- how the 2026-08-17 batch filled ~100-185 points from its intended
+       entry. Anything that fails either gate is left PENDING (cap) or CANCELLED with a
+       reason (stale price) rather than submitted -- decider's replenishment/regeneration
+       will produce a fresh command off current conditions instead.
     """
     with get_db(db_path) as con:
         pending = get_pending_commands(con)
@@ -237,14 +257,65 @@ def process_pending_commands(ibc: IBClient, db_path, cfg) -> int:
     if not pending:
         return 0
 
+    max_per_side = getattr(cfg.orders, "max_resting_per_side", 10)
+    buffer_ticks = getattr(cfg.orders, "min_entry_buffer_ticks", 8)
+
     submitted = 0
     for cmd in pending:
         cid = cmd["id"]
+
+        # Gate 1: admission cap -- count already-resting exposure on this symbol/side
+        with get_db(db_path) as con:
+            resting = con.execute(
+                "SELECT COUNT(*) FROM commands WHERE symbol=? AND direction=?"
+                " AND (status='SUBMITTED' OR (status='FILLED' AND needs_review=0))",
+                (cmd["symbol"], cmd["direction"])
+            ).fetchone()[0]
+        if resting >= max_per_side:
+            log.warning(f"Command {cid} ({cmd['symbol']} {cmd['direction']}) held back — "
+                        f"{resting} already resting, at cap of {max_per_side}")
+            continue
 
         # Claim lock — atomic status change to SUBMITTING
         if not _claim_command(db_path, cid):
             log.debug(f"Command {cid} already claimed by another process — skip")
             continue
+
+        # Gate 2: fresh price re-check right before this hits IB
+        try:
+            fresh_price = ibc.get_price(cmd["symbol"])
+        except Exception as e:
+            fresh_price = None
+            log.warning(f"Command {cid}: could not fetch fresh price ({e}) — proceeding "
+                        f"without the pre-submit check")
+
+        if fresh_price is not None:
+            tick = get_tick_size(cmd["symbol"])
+            buffer_pts = buffer_ticks * tick
+            entry = cmd["entry_price"]
+            direction = cmd["direction"]
+            stale = False
+            if cmd["entry_type"] == "STP":
+                # A stop that's already through its trigger would fill immediately at
+                # whatever price IB gives it -- exactly the 2026-08-17 mechanism.
+                if direction == "BUY" and fresh_price >= entry:
+                    stale = True
+                elif direction == "SELL" and fresh_price <= entry:
+                    stale = True
+            # Buffer check applies to LMT and STP alike: refuse anything already too
+            # close to (or through) its own entry relative to current price.
+            if abs(fresh_price - entry) < buffer_pts:
+                stale = True
+
+            if stale:
+                log.warning(f"Command {cid} ({cmd['symbol']} {direction} {cmd['entry_type']} "
+                            f"@ {entry}) stale vs fresh price {fresh_price} — cancelling "
+                            f"instead of submitting at a bad price")
+                with get_db(db_path) as con:
+                    update_command_status(con, cid, "CANCELLED",
+                                           error_message=f"stale vs fresh price {fresh_price} "
+                                                          f"at submit time")
+                continue
 
         log.info(f"Processing command {cid}: {cmd['direction']} {cmd['entry_type']} "
                  f"{cmd['symbol']} @ {cmd['entry_price']}")
@@ -1026,11 +1097,14 @@ class _FakePaper:
 
 class _FakeIBClient:
     """Minimal stand-in for IBClient's paper-account surface -- no real IB needed."""
-    def __init__(self, trades=None, positions=None):
+    def __init__(self, trades=None, positions=None, price=None):
         self.paper = _FakePaper(trades or [])
         self._positions = positions or []
+        self._price = price
     def is_paper_connected(self): return True
     def get_positions(self): return self._positions
+    def get_price(self, symbol): return self._price
+    def get_contract(self, symbol): return object()
 
 
 def self_test() -> bool:
@@ -1177,6 +1251,61 @@ def self_test() -> bool:
                 log.info(f"[self-test] IB not available: {e} — SKIP")
 
             reset_loggers()
+
+            # 8. process_pending_commands admission gates (2026-09-09 fix)
+            #    8a. stale STP: price already through trigger -> CANCELLED, not submitted
+            with get_db(db_path) as con:
+                cur = con.execute("""
+                    INSERT INTO commands
+                        (symbol, line_price, line_type, line_strength,
+                         direction, entry_type, entry_price, tp_price, sl_price, bracket_size)
+                    VALUES ('MES', 6500.0, 'SUPPORT', 2,
+                            'BUY', 'STP', 6500.0, 6504.0, 6496.0, 4.0)
+                """)
+                id_stale_stp = con.execute("SELECT last_insert_rowid()").fetchone()[0]
+            fake_price_ibc = _FakeIBClient(price=6501.0)  # already past the 6500 STP trigger
+            process_pending_commands(fake_price_ibc, db_path, cfg)
+            with get_db(db_path) as con:
+                s = con.execute("SELECT status FROM commands WHERE id=?",
+                                 (id_stale_stp,)).fetchone()["status"]
+            assert s == "CANCELLED", f"stale STP should be cancelled, not submitted: {s}"
+
+            #    8b. buffer: price too close to a resting LMT's entry -> CANCELLED
+            with get_db(db_path) as con:
+                cur = con.execute("""
+                    INSERT INTO commands
+                        (symbol, line_price, line_type, line_strength,
+                         direction, entry_type, entry_price, tp_price, sl_price, bracket_size)
+                    VALUES ('MES', 6500.0, 'SUPPORT', 2,
+                            'BUY', 'LMT', 6500.0, 6502.0, 6498.0, 2.0)
+                """)
+                id_too_close = con.execute("SELECT last_insert_rowid()").fetchone()[0]
+            fake_close_ibc = _FakeIBClient(price=6500.1)  # 0.1pt away, under an 8-tick (2pt) buffer
+            process_pending_commands(fake_close_ibc, db_path, cfg)
+            with get_db(db_path) as con:
+                s = con.execute("SELECT status FROM commands WHERE id=?",
+                                 (id_too_close,)).fetchone()["status"]
+            assert s == "CANCELLED", f"too-close entry should be cancelled: {s}"
+
+            #    8c. admission cap: symbol/side already at cap -> new command held PENDING
+            cap = getattr(cfg.orders, "max_resting_per_side", 10)
+            for _ in range(cap):
+                _insert_cmd(symbol='MNQ', direction='BUY', status='SUBMITTED', needs_review=0)
+            with get_db(db_path) as con:
+                cur = con.execute("""
+                    INSERT INTO commands
+                        (symbol, line_price, line_type, line_strength,
+                         direction, entry_type, entry_price, tp_price, sl_price, bracket_size)
+                    VALUES ('MNQ', 19000.0, 'SUPPORT', 2,
+                            'BUY', 'LMT', 19000.0, 19010.0, 18990.0, 10.0)
+                """)
+                id_capped = con.execute("SELECT last_insert_rowid()").fetchone()[0]
+            fake_cap_ibc = _FakeIBClient(price=19000.0)
+            process_pending_commands(fake_cap_ibc, db_path, cfg)
+            with get_db(db_path) as con:
+                s = con.execute("SELECT status FROM commands WHERE id=?",
+                                 (id_capped,)).fetchone()["status"]
+            assert s == "PENDING", f"command past admission cap should stay PENDING: {s}"
 
         print("[self-test] broker: PASS")
         return True

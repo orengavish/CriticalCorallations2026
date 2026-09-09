@@ -70,6 +70,11 @@ orders:
   active_brackets: [4, 8, 16, 32]
   quantity: 1
   tick_size: 0.25
+  # 2026-09-09: broker.py admission gates (process_pending_commands), added after the
+  # 2026-09-08 order-storm incident -- see REBUILD_PLAN_2026-09-09.md Phase 1.
+  max_resting_per_side: 10        # stay under IB's own ~15-per-contract-per-side cap
+  min_entry_buffer_ticks: 8       # refuse a submit whose entry is closer than this to
+                                   # the fresh live price (in ticks, so it scales per symbol)
 
 position:
   stagnation_seconds: 300

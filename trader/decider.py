@@ -36,7 +36,7 @@ from lib.logger import get_logger
 from lib.db import get_db, init_db, get_filled_commands, get_system_state, set_system_state
 from lib.order_builder import determine_entry_type, calc_bracket_prices, round_tick, get_tick_size
 from lib.critical_lines import get_armed_lines
-from lib.session_clock import is_entry_cutoff, is_forced_exit_time
+from lib.session_clock import is_entry_cutoff, is_forced_exit_time, is_before_open, seconds_until_open
 
 log = get_logger("decider")
 
@@ -293,6 +293,16 @@ def run_session_start(ibc, cfg, db_path, date_str: str = None):
     Called once at the beginning of a trading session.
     """
     date_str = date_str or date.today().strftime("%Y-%m-%d")
+
+    # Don't generate a single command before the regular session actually opens --
+    # pre-market prices are thin/unreliable and would seed brackets off a bad reference
+    # price. All symbols in this system open at the same UTC instant (8:30 CT futures ==
+    # 9:30 ET stocks), so waiting on the whole list together is correct, not just per-symbol.
+    wait_s = max((seconds_until_open(s) for s in cfg.symbols), default=0)
+    if wait_s > 0:
+        log.info(f"Market not open yet -- waiting {wait_s:.0f}s for regular session open")
+        while any(is_before_open(s) for s in cfg.symbols):
+            time.sleep(min(30, max(1, seconds_until_open(cfg.symbols[0]))))
 
     for symbol in cfg.symbols:
         # Lines come from DB (entered via /lines GUI) — just count them

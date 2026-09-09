@@ -26,9 +26,11 @@ _FUTURES_SYMBOLS = {"MES", "MNQ", "MYM", "M2K"}
 
 _FUTURES_TZ = ZoneInfo("America/Chicago")
 _FUTURES_CLOSE = dtime(16, 0)   # matches simulate_trades.py's empirical ~16:00 CT close
+_FUTURES_OPEN = dtime(8, 30)    # CME equity-index RTH open, matches cash-market 9:30 ET open
 
 _STOCK_TZ = ZoneInfo("America/New_York")
 _STOCK_CLOSE = dtime(16, 0)     # regular US equity session close
+_STOCK_OPEN = dtime(9, 30)      # regular US equity session open
 
 
 def _close_today(symbol: str, now: datetime) -> datetime:
@@ -42,6 +44,33 @@ def _close_today(symbol: str, now: datetime) -> datetime:
     close_local = local_now.replace(hour=close_t.hour, minute=close_t.minute,
                                      second=0, microsecond=0)
     return close_local.astimezone(now.tzinfo or ZoneInfo("UTC"))
+
+
+def _open_today(symbol: str, now: datetime) -> datetime:
+    """Today's regular-session open datetime for symbol's asset class, same convention
+    as _close_today."""
+    if symbol in _FUTURES_SYMBOLS:
+        tz, open_t = _FUTURES_TZ, _FUTURES_OPEN
+    else:
+        tz, open_t = _STOCK_TZ, _STOCK_OPEN
+    local_now = now.astimezone(tz)
+    open_local = local_now.replace(hour=open_t.hour, minute=open_t.minute,
+                                    second=0, microsecond=0)
+    return open_local.astimezone(now.tzinfo or ZoneInfo("UTC"))
+
+
+def seconds_until_open(symbol: str, now: datetime | None = None) -> float:
+    """Seconds until symbol's market opens today. Negative if already past today's open."""
+    now = now or datetime.now(ZoneInfo("UTC"))
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=ZoneInfo("UTC"))
+    return (_open_today(symbol, now) - now).total_seconds()
+
+
+def is_before_open(symbol: str, now: datetime | None = None) -> bool:
+    """True if symbol's regular session has not opened yet today -- no new entries should
+    be generated or submitted (pre-market/after-hours prices are thin and unreliable)."""
+    return seconds_until_open(symbol, now) > 0
 
 
 def seconds_until_close(symbol: str, now: datetime | None = None) -> float:
@@ -94,6 +123,15 @@ def self_test() -> bool:
 
         # AAPL mid-morning (10:00 CT == 11:00 ET): 5 hours from its own 16:00 ET close.
         assert is_entry_cutoff("AAPL", t3, 30) is False
+
+        # Pre-market: 6:00 CT is before both MES's 8:30 CT open and AAPL's 9:30 ET open.
+        t4 = datetime(2026, 9, 8, 6, 0, tzinfo=_FUTURES_TZ).astimezone(utc)
+        assert is_before_open("MES", t4) is True
+        assert is_before_open("AAPL", t4) is True
+
+        # Mid-morning (10:00 CT == 11:00 ET): both already open.
+        assert is_before_open("MES", t3) is False
+        assert is_before_open("AAPL", t3) is False
 
         print("[self-test] session_clock: PASS")
         return True
