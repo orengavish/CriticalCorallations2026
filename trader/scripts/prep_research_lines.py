@@ -50,7 +50,15 @@ from generator.lines import build_lines                 # noqa: E402
 from data.market_data import get_daily_bars             # noqa: E402
 
 SYMBOLS = ["M2K", "MES", "MNQ", "MYM"]
-WINNING_REASONS = {"PREVIOUS_DAY_LOW", "PREVIOUS_DAY_HIGH+PIVOT_CONFLUENCE"}
+
+# 2026-09-11: reinstated 3 reasons that were computed by knowledge/rules.py all along but
+# excluded here since 2026-09-07 -- they didn't hold up as consistently as the original
+# two in that sweep, but the sample was small at the time (before the 7-year Databento
+# backfill). User decision: re-enable live rather than re-backtest first; watch results.
+WINNING_REASONS = {
+    "PREVIOUS_DAY_LOW", "PREVIOUS_DAY_HIGH+PIVOT_CONFLUENCE",
+    "FIVE_DAY_HIGH+PIVOT_CONFLUENCE", "FIVE_DAY_LOW", "PREVIOUS_DAY_LOW+PIVOT_CONFLUENCE",
+}
 DB_PATH = Path(r"C:\Projects\CriticalCorallations2026\trader\data\galao.db")
 
 _SCHEMA_CRITICAL_LINES = """

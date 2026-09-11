@@ -1675,11 +1675,20 @@ _BUCKET_MAP = {
 _ALGO_REASON_LABEL = {
     "PREVIOUS_DAY_LOW": "Algo 1",
     "PREVIOUS_DAY_HIGH+PIVOT_CONFLUENCE": "Algo 2",
+    # 2026-09-11: reinstated in prep_research_lines.py's WINNING_REASONS -- given their
+    # own Algo N labels rather than falling into an undifferentiated "Algo ?" bucket,
+    # same as 1/2, so their live results stay separately trackable.
+    "FIVE_DAY_HIGH+PIVOT_CONFLUENCE": "Algo 3",
+    "FIVE_DAY_LOW": "Algo 4",
+    "PREVIOUS_DAY_LOW+PIVOT_CONFLUENCE": "Algo 5",
 }
 _RESEARCH_REAL_SOURCES = {"research_ce", "research_ce_stock"}
 _RESEARCH_CONTROL_SOURCES = {"research_random", "research_random_stock"}
 _BUCKET_ORDER = ["GevaExtract", "Algo 1 (Real)", "Algo 1 (Control)",
-                 "Algo 2 (Real)", "Algo 2 (Control)", "Control",
+                 "Algo 2 (Real)", "Algo 2 (Control)",
+                 "Algo 3 (Real)", "Algo 3 (Control)",
+                 "Algo 4 (Real)", "Algo 4 (Control)",
+                 "Algo 5 (Real)", "Algo 5 (Control)", "Control",
                  "Critical Line", "Algo Lab", "Other"]
 
 
@@ -2242,6 +2251,8 @@ body:not(.busy-wait) .busy-strip{background:var(--gl-border)}
 .st-bucket-opt .n{color:var(--gl-faint);font-size:10px;margin-left:4px}
 .st-bucket-opt.active{background:var(--gl-accent);color:var(--gl-accent-ink)}
 .st-bucket-opt.active .n{color:var(--gl-accent-ink);opacity:.75}
+.unreliable-badge{color:var(--gl-bad);font-size:10px;margin-left:4px;font-weight:700;
+  text-transform:none;letter-spacing:0}
 
 .st-overall{font-family:var(--gl-mono);font-size:13px;display:flex;gap:16px;align-items:baseline}
 .st-overall .big{font-size:18px;font-weight:600}
@@ -2311,7 +2322,7 @@ body:not(.busy-wait) .busy-strip{background:var(--gl-border)}
     <!-- Header -->
     <div class="app-header">
       <span class="brand">Galao</span>
-      <span class="verchip">v5.05</span>
+      <span class="verchip">v5.07</span>
       <span class="gl-pill" id="session-broker-badge" style="color:var(--gl-muted)">Broker: —</span>
       <span class="gl-pill" id="session-decider-badge" style="color:var(--gl-muted)">Decider: —</span>
       <span class="text-muted" id="session-uptime" style="font-size:.7rem;min-width:3.5em"></span>
@@ -4397,7 +4408,19 @@ document.addEventListener('keydown', e=>{
 });
 
 // ── Stats screen ─────────────────────────────────────────────────────────────
-const ST_BUCKETS = ['All','GevaExtract','Algo 1 (Real)','Algo 1 (Control)','Algo 2 (Real)','Algo 2 (Control)','Control','Critical Line','Algo Lab','Other'];
+const ST_BUCKETS = ['All','GevaExtract','Algo 1 (Real)','Algo 1 (Control)','Algo 2 (Real)','Algo 2 (Control)','Algo 3 (Real)','Algo 3 (Control)','Algo 4 (Real)','Algo 4 (Control)','Algo 5 (Real)','Algo 5 (Control)','Control','Critical Line','Algo Lab','Other'];
+// 2026-09-11: Algo 3/4/5 (FIVE_DAY_HIGH+PIVOT_CONFLUENCE, FIVE_DAY_LOW,
+// PREVIOUS_DAY_LOW+PIVOT_CONFLUENCE) were reinstated after being excluded 2026-09-07 for
+// not holding up as consistently as Algo 1/2 in that backtest sweep -- flagged visibly
+// (not just in the hover tooltip, which nobody reliably notices) so a later comparison
+// doesn't forget these already carry a "graded not great once before" history.
+const ST_UNRELIABLE_ALGOS = new Set(['Algo 3', 'Algo 4', 'Algo 5']);
+function _stUnreliableBadge(bucketName){
+  const algo = (bucketName.match(/^Algo \d+/) || [])[0];
+  return algo && ST_UNRELIABLE_ALGOS.has(algo)
+    ? '<span class="unreliable-badge" title="Excluded 2026-09-07 for not holding up as consistently as Algo 1/2 in the backtest sweep -- reinstated 2026-09-11 on a smaller-sample hypothesis, not yet re-proven">⚠ unproven</span>'
+    : '';
+}
 let _stRange  = 'today';
 let _stBucket = 'All';
 let _stBracket = 'all';
@@ -4458,7 +4481,13 @@ const ST_BUCKET_HELP = {
   'Algo 1 (Control)': "Matched random-distance control line for each Algo 1 (Real) line, same symbol/moment.",
   'Algo 2 (Real)': "Two-winning-reasons experiment, treatment side, winning reason PREVIOUS_DAY_HIGH+PIVOT_CONFLUENCE.",
   'Algo 2 (Control)': "Matched random-distance control line for each Algo 2 (Real) line, same symbol/moment.",
-  'Control': "GevaExtract's own control: a matched random-distance line for each real Geva line (source 'geva_manual_control'). Unrelated to the Algo 1/2 experiment above.",
+  'Algo 3 (Real)': "Reinstated 2026-09-11 -- winning reason FIVE_DAY_HIGH+PIVOT_CONFLUENCE. Excluded 2026-09-07 for not holding up as consistently as Algo 1/2 in that sweep, on a smaller data sample; watching live results against the fuller 7-year backfill.",
+  'Algo 3 (Control)': "Matched random-distance control line for each Algo 3 (Real) line, same symbol/moment.",
+  'Algo 4 (Real)': "Reinstated 2026-09-11 -- winning reason FIVE_DAY_LOW. Same reinstatement rationale as Algo 3.",
+  'Algo 4 (Control)': "Matched random-distance control line for each Algo 4 (Real) line, same symbol/moment.",
+  'Algo 5 (Real)': "Reinstated 2026-09-11 -- winning reason PREVIOUS_DAY_LOW+PIVOT_CONFLUENCE. Same reinstatement rationale as Algo 3.",
+  'Algo 5 (Control)': "Matched random-distance control line for each Algo 5 (Real) line, same symbol/moment.",
+  'Control': "GevaExtract's own control: a matched random-distance line for each real Geva line (source 'geva_manual_control'). Unrelated to the Algo 1-5 experiments above.",
   'Critical Line': 'Legacy/orphaned commands with no critical_line_id reference at all -- pre-fix leftovers, not a real algorithm type.',
   'Algo Lab': 'Algo Lab parameter-grid submissions (strategy x tp x sl x direction x strength combos).',
   'Other': "Everything else, including GevaExtract's own automated MNQ noise (Geva never posts MNQ -- any geva_extract row on a non-MES symbol lands here).",
@@ -4474,7 +4503,13 @@ const ST_BUCKET_SHORT = {
   'Algo 1 (Control)': 'Random control matched to Algo 1 (Real).',
   'Algo 2 (Real)': 'Previous-day-high + pivot confluence lines.',
   'Algo 2 (Control)': 'Random control matched to Algo 2 (Real).',
-  'Control': "GevaExtract's own random control line (separate from Algo 1/2).",
+  'Algo 3 (Real)': 'Five-day-high + pivot confluence lines.',
+  'Algo 3 (Control)': 'Random control matched to Algo 3 (Real).',
+  'Algo 4 (Real)': 'Five-day-low lines.',
+  'Algo 4 (Control)': 'Random control matched to Algo 4 (Real).',
+  'Algo 5 (Real)': 'Previous-day-low + pivot confluence lines.',
+  'Algo 5 (Control)': 'Random control matched to Algo 5 (Real).',
+  'Control': "GevaExtract's own random control line (separate from Algo 1-5).",
   'Critical Line': 'Legacy/orphaned trades -- not a real algorithm.',
   'Algo Lab': 'Parameter-grid strategy testing.',
   'Other': "GevaExtract's own MNQ noise + uncategorized.",
@@ -4491,7 +4526,7 @@ function _stRender(){
 
   // Single-select bucket bar (rebuilt each load so counts stay current)
   document.getElementById('st-bucket-select').innerHTML = ST_BUCKETS.map(b=>
-    `<div class="st-bucket-opt ${b===_stBucket?'active':''}" data-bucket="${b}" title="${ST_BUCKET_HELP[b]||''}">${b}`+
+    `<div class="st-bucket-opt ${b===_stBucket?'active':''}" data-bucket="${b}" title="${ST_BUCKET_HELP[b]||''}">${b}${_stUnreliableBadge(b)}`+
     `<span class="n">${d.bucket_counts[b]}</span></div>`
   ).join('');
   document.querySelectorAll('.st-bucket-opt').forEach(el=>{
@@ -4554,7 +4589,7 @@ function _stRender(){
         </div>`).join('');
       return `<div class="cmp-card ${b===_stBucket?'active':''}" data-bucket="${b}" title="${ST_BUCKET_HELP[b]||''}">
         <div class="cmp-head">
-          <span class="cmp-name">${b}</span>
+          <span class="cmp-name">${b}${_stUnreliableBadge(b)}</span>
           <span class="cmp-overall" style="color:${o.usd>=0?'var(--gl-good)':'var(--gl-bad)'}">${o.usd>=0?'+':''}$${fmt(o.usd)}</span>
         </div>
         <div class="cmp-desc">${ST_BUCKET_SHORT[b]||''}</div>
@@ -5511,6 +5546,25 @@ document.addEventListener('shown.bs.tab',function(e){
 # ── Release notes ─────────────────────────────────────────────────────────────
 
 _RELEASE_NOTES = [
+    ("v5.07", "Visible \"unproven\" badge on Algo 3/4/5",
+              "User request: a hover-only tooltip isn't enough to remember, during a later "
+              "performance comparison, that Algo 3/4/5 were already graded not-great once "
+              "before their 2026-09-11 reinstatement. Added a visible '⚠ unproven' badge next "
+              "to their name everywhere they appear (the bucket-select bar and the comparison "
+              "cards on the Results screen) -- not just in the existing hover tooltip, which "
+              "the v5.03 changelog already noted nobody reliably finds."),
+    ("v5.06", "Results bucketing: Algo 3/4/5 added",
+              "trader/scripts/prep_research_lines.py's WINNING_REASONS reinstated 3 reasons "
+              "(FIVE_DAY_HIGH+PIVOT_CONFLUENCE, FIVE_DAY_LOW, PREVIOUS_DAY_LOW+PIVOT_CONFLUENCE) "
+              "that were excluded 2026-09-07 for not holding up as consistently as Algo 1/2 in "
+              "that backtest sweep, on a smaller data sample at the time -- user decision "
+              "2026-09-11 to re-enable live rather than re-backtest first against the fuller "
+              "7-year Databento data, and watch results. Without a matching dashboard change "
+              "these would have all collapsed into one undifferentiated 'Algo ?' bucket "
+              "(_ALGO_REASON_LABEL only knew Algo 1/2) -- added Algo 3/4/5 labels, bucket-order "
+              "entries, and hover/short descriptions so their live results stay separately "
+              "trackable, same as Algo 1/2 always have been. Futures only (prep_research_lines.py, "
+              "not the stocks version) -- this was diagnosed specifically against futures data."),
     ("v5.05", "Day Start: two line-extraction buttons; every button now grays out when there's "
               "nothing for it to do; new extraction-coverage summary line",
               "Added 'Extract Futures Lines' (POST /api/dayclean/extract-futures-lines -- runs "
