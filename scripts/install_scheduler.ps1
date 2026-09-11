@@ -30,9 +30,21 @@ $Action = New-ScheduledTaskAction -Execute $PythonW `
 
 $Trigger = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 5)
 
+# 2026-09-11: ExecutionTimeLimit was 4 minutes -- but trading_dashboard.py's
+# app.run() blocks forever by design (it's a persistent Flask server, not a
+# one-shot check), so Task Scheduler force-killed it every single cycle,
+# 4 minutes after every 5-minute trigger. Net effect: the dashboard was only
+# ever up for ~4 of every ~5-10 minutes (real-world gaps measured longer,
+# since MultipleInstances=IgnoreNew also skips a trigger that lands while the
+# previous instance is still mid-kill) -- this is the actual root cause of
+# "5003 is broken" (intermittently), not the pythonw change made alongside
+# this fix. 0 = unlimited, matching Fetcher2026's watchdog fix earlier today.
+# MultipleInstances=IgnoreNew + the script's own "exit immediately if port
+# 5003 already bound" check together already prevent a duplicate instance --
+# nothing here needs a hard time limit to stay safe.
 $SettingsArgs = @{
     MultipleInstances   = "IgnoreNew"
-    ExecutionTimeLimit  = (New-TimeSpan -Minutes 4)
+    ExecutionTimeLimit  = (New-TimeSpan -Minutes 0)
     RestartCount        = 3
     RestartInterval     = (New-TimeSpan -Minutes 1)
     StartWhenAvailable  = $true
