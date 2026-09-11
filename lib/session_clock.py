@@ -73,6 +73,20 @@ def is_before_open(symbol: str, now: datetime | None = None) -> bool:
     return seconds_until_open(symbol, now) > 0
 
 
+def seconds_until_trading_start(symbol: str, now: datetime | None = None,
+                                 delay_minutes: float = 0) -> float:
+    """Seconds until this system should actually start trading symbol today -- its regular
+    open plus an optional delay (2026-09-10: trading starts 30 min after the 16:30 IL open,
+    not at the open itself, until pre-market trading is added)."""
+    return seconds_until_open(symbol, now) + delay_minutes * 60
+
+
+def is_before_trading_start(symbol: str, now: datetime | None = None,
+                             delay_minutes: float = 0) -> bool:
+    """True if it's not yet time to start trading symbol today (open + delay_minutes)."""
+    return seconds_until_trading_start(symbol, now, delay_minutes) > 0
+
+
 def seconds_until_close(symbol: str, now: datetime | None = None) -> float:
     """Seconds remaining until symbol's market closes today. Negative if already past
     close (a holiday or an after-hours run -- callers treat negative the same as
@@ -132,6 +146,14 @@ def self_test() -> bool:
         # Mid-morning (10:00 CT == 11:00 ET): both already open.
         assert is_before_open("MES", t3) is False
         assert is_before_open("AAPL", t3) is False
+
+        # Trading-start delay: 8:45 CT is 15 min after MES's 8:30 CT open -- already
+        # open, but still before a 30-min post-open trading start.
+        t5 = datetime(2026, 9, 8, 8, 45, tzinfo=_FUTURES_TZ).astimezone(utc)
+        assert is_before_open("MES", t5) is False
+        assert is_before_trading_start("MES", t5, 30) is True
+        t6 = datetime(2026, 9, 8, 9, 0, tzinfo=_FUTURES_TZ).astimezone(utc)
+        assert is_before_trading_start("MES", t6, 30) is False
 
         print("[self-test] session_clock: PASS")
         return True

@@ -40,6 +40,7 @@ if str(_ROOT) not in sys.path:
 from lib.config_loader import get_config
 from lib.logger import get_logger
 from lib.db import get_db, init_db, get_system_state, set_system_state
+from lib.singleton_lock import is_locked_by_other, _pid_alive
 
 log = get_logger("session", log_dir=str(Path(__file__).parent / "logs"))
 
@@ -48,24 +49,6 @@ _COMPONENTS = ("broker", "decider")
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
-
-
-def _pid_alive(pid: int) -> bool:
-    """Cross-platform liveness check for a PID (used by the lock file guard)."""
-    try:
-        if sys.platform == "win32":
-            import ctypes
-            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-            h = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
-            if not h:
-                return False
-            ctypes.windll.kernel32.CloseHandle(h)
-            return True
-        else:
-            os.kill(pid, 0)
-            return True
-    except Exception:
-        return False
 
 
 class SessionManager:
@@ -103,6 +86,11 @@ class SessionManager:
         self._procs: dict[str, subprocess.Popen] = {}
         self._log_files: dict[str, object] = {}
         self._state: dict[str, str]        = {c: "dead" for c in _COMPONENTS}
+        # True for a component this SessionManager doesn't own a Popen handle for, but
+        # whose singleton lock (lib/singleton_lock.py) is held by another live process --
+        # i.e. it's genuinely running, just supervised elsewhere. Never restarted or
+        # counted as a crash by this instance.
+        self._external: dict[str, bool]    = {c: False for c in _COMPONENTS}
         self._restart_count: dict[str, int] = {c: 0 for c in _COMPONENTS}
         self._restart_delay: dict[str, int] = {c: self._backoff_base for c in _COMPONENTS}
         self._started_at: float | None = None
@@ -141,6 +129,13 @@ class SessionManager:
             for name in _COMPONENTS:
                 self._restart_count[name] = 0
                 self._restart_delay[name] = self._backoff_base
+                if is_locked_by_other(name, self._lock_dir()):
+                    log.info(f"{name} already running under another supervisor "
+                             f"(singleton lock held) — not spawning a duplicate")
+                    self._external[name] = True
+                    self._state[name] = "running"
+                    continue
+                self._external[name] = False
                 self._spawn(name)
             self._started_at = time.time()
             self._monitor_thread = threading.Thread(
@@ -193,6 +188,12 @@ class SessionManager:
 
     # ── Internals ────────────────────────────────────────────────────────
 
+    def _lock_dir(self) -> Path:
+        """Same directory broker.py/decider.py lock into (lib/singleton_lock.py),
+        derived from _trader_dir rather than _log_dir since the latter can come from a
+        relative config path resolved against a different process's CWD."""
+        return self._trader_dir / "logs"
+
     def _spawn(self, name: str) -> None:
         old = self._log_files.get(name)
         if old is not None:
@@ -216,6 +217,24 @@ class SessionManager:
             all_dead = True
             for name in _COMPONENTS:
                 p = self._procs.get(name)
+
+                if p is None:
+                    # No local handle -- either it's supervised elsewhere (re-check the
+                    # lock every poll, since that owner could exit at any time and this
+                    # component would then need a real spawn), or it never got a chance
+                    # to start and genuinely needs one.
+                    if is_locked_by_other(name, self._lock_dir()):
+                        with self._lock:
+                            self._external[name] = True
+                            self._state[name] = "running"
+                        all_dead = False
+                        continue
+                    if self._external[name]:
+                        log.info(f"{name}'s external owner is gone — taking over supervision")
+                        with self._lock:
+                            self._external[name] = False
+                    # Falls through to the dead/restart handling below.
+
                 dead = p is None or p.poll() is not None
                 if not dead:
                     all_dead = False
@@ -223,6 +242,30 @@ class SessionManager:
                         self._state[name] = "running"
                         self._restart_count[name] = 0
                         self._restart_delay[name] = self._backoff_base
+                    continue
+
+                # Our own tracked process (p) just died -- but if another live process
+                # already holds this component's singleton lock (e.g. someone manually
+                # restarted it, or a scheduled task did), that's the SAME external-takeover
+                # case as the p-is-None branch above, just arrived at via a different path.
+                # Without this check, this loop would blindly try to respawn a duplicate,
+                # get correctly rejected by the singleton lock every time, and burn through
+                # max_restarts into a permanent "dead" state despite the component actually
+                # running fine under someone else (2026-09-10: observed live).
+                if p is not None and is_locked_by_other(name, self._lock_dir()):
+                    with self._lock:
+                        self._external[name] = True
+                        self._state[name] = "running"
+                        self._restart_count[name] = 0
+                        self._restart_delay[name] = self._backoff_base
+                        # Clear the now-dead handle so the NEXT iteration takes the
+                        # p-is-None branch above -- that's the one with the "external
+                        # owner is gone, taking over" reset; without this, _external
+                        # stays stuck True even after we later spawn our own real
+                        # replacement (the takeover process's own exit is handled fine,
+                        # just via a path that never clears this flag).
+                        self._procs[name] = None
+                    all_dead = False
                     continue
 
                 rc = p.returncode if p is not None else None
@@ -419,6 +462,20 @@ while True:
             assert "started" in broker_log.read_text()
             assert "crashing on first run" in decider_log.read_text()
 
+            # NOTE (2026-09-10): a tracked process dying while someone ELSE takes over its
+            # singleton lock (as opposed to "no local handle at all", the case covered by
+            # the external-supervision test above) must also be recognized as external,
+            # not blindly respawned -- see the `is_locked_by_other` check added to the
+            # dead-process branch in _monitor_loop() above. This was a real, observed
+            # incident (a manual broker.py restart raced session.py's own monitor loop,
+            # which then burned through max_restarts trying to respawn a duplicate that
+            # the lock correctly kept rejecting) and the fix is verified against the live
+            # system. It's deliberately NOT covered by a dedicated automated test here:
+            # simulating the exact handoff race with real subprocesses proved itself
+            # flaky on Windows (multiple attempts produced spurious failures from timing,
+            # not from the logic under test), and the fix is a small, narrow addition
+            # that mirrors the already-tested p-is-None branch immediately above it.
+
             # double-start (PID lock) guard — must be a genuinely different OS
             # process, since two SessionManagers in this same test process
             # share a PID and the lock can't tell them apart (as intended:
@@ -460,9 +517,67 @@ while True:
             st2 = mgr.stop()
             assert st2["broker"] == "dead"
 
+            # 3. External-supervision recognition (2026-09-10 fix): a fresh SessionManager
+            # (standing in for one created after a dashboard restart, with no _procs
+            # memory of anything) must recognize a component whose singleton lock is
+            # already held by another live process as "running" rather than spawning a
+            # duplicate and crash-restart-looping once that duplicate gets blocked by the
+            # very same lock (2026-09-09 false-alarm incident).
+            from lib.singleton_lock import acquire_singleton_lock, _lock_handles
+            ext_dir = tmp_p / "ext" / "trader"
+            ext_dir.mkdir(parents=True)
+            ext_db_path = tmp_p / "ext_galao.db"
+            init_db(ext_db_path)
+            (ext_dir / "broker.py").write_text(_GOOD_SCRIPT.format(root=str(_ROOT), db=str(ext_db_path)))
+            (ext_dir / "decider.py").write_text(_GOOD_SCRIPT.format(root=str(_ROOT), db=str(ext_db_path)))
+
+            assert acquire_singleton_lock("decider", ext_dir / "logs"), \
+                "test setup: failed to acquire decider's own lock"
+            try:
+                ext_cfg = SimpleNamespace(
+                    paths=SimpleNamespace(db=str(ext_db_path), logs=str(ext_dir / "logs")),
+                    session=SimpleNamespace(
+                        monitor_poll_seconds=0.5, max_restarts=3,
+                        restart_backoff_base_seconds=0.5, restart_backoff_cap_seconds=2,
+                        stop_grace_seconds=5,
+                    ),
+                )
+                mgr3 = SessionManager(
+                    cfg=ext_cfg, db_path=ext_db_path, trader_dir=ext_dir,
+                    log_dir=ext_dir / "logs",
+                    component_cmds={
+                        "broker":  [sys.executable, "broker.py"],
+                        "decider": [sys.executable, "decider.py"],
+                    },
+                )
+                st3 = mgr3.start()
+                assert st3["broker"] == "running", f"broker should spawn normally: {st3}"
+                assert st3["decider"] == "running", f"decider should read as running (external): {st3}"
+                assert mgr3._procs.get("decider") is None, \
+                    "decider should get no local Popen handle -- it's externally supervised"
+                assert mgr3._external["decider"] is True
+
+                time.sleep(1.0)
+                assert mgr3.status()["decider"] == "running"
+                assert mgr3._restart_count["decider"] == 0, \
+                    "external component must never be counted as crashing/restarting"
+
+                mgr3.stop()
+                # mgr3.stop() already waits for its broker child to exit, but on
+                # Windows the OS can take a moment past that to fully release the
+                # child's inherited stdout handle -- without this, the outer
+                # TemporaryDirectory cleanup can hit a transient PermissionError
+                # trying to unlink ext/trader/logs/broker_stdout.log.
+                time.sleep(0.5)
+            finally:
+                f = _lock_handles.pop("decider", None)
+                if f is not None:
+                    f.close()
+
             reset_cache()
 
-        print("PASS -- session: spawn, stdout capture, crash-restart, PID lock, clean stop")
+        print("PASS -- session: spawn, stdout capture, crash-restart, PID lock, "
+              "external-supervision recognition, clean stop")
         return True
 
     except Exception as e:

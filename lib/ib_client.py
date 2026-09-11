@@ -77,6 +77,19 @@ class IBClient:
 
     def connect(self, live: bool = True, paper: bool = True):
         """Connect to LIVE and/or PAPER ports."""
+        # ib_insync needs an asyncio event loop in the CALLING thread. The main thread
+        # always has a default one; a Flask request thread (app.run(threaded=True)) does
+        # not (and a pooled thread reused across requests may hold a stale CLOSED one
+        # left behind by a previous connect()/disconnect() cycle) -- either way
+        # connect() then fails with "no current event loop in thread ..." or similar.
+        # Every per-request IBClient() caller hit this, not just one route, so the guard
+        # belongs here once rather than repeated in each caller (2026-09-10). Always
+        # installing a fresh loop is simpler and safer than checking get_event_loop()
+        # first, since a "successfully got" but already-closed loop wouldn't raise.
+        import asyncio
+        if threading.current_thread() is not threading.main_thread():
+            asyncio.set_event_loop(asyncio.new_event_loop())
+
         if live:
             self._connect_live()
         if paper:
@@ -120,6 +133,18 @@ class IBClient:
             ib = IB()
             cid = self._try_connect(ib, self._paper_host, self._paper_port,
                                     self._paper_ids, "PAPER")
+            # 2026-09-09 fix: the client ID pool is shuffled on every connect, so a
+            # restart very likely gets a different ID than last time. ib.trades() is
+            # only that session's own local cache -- a fresh client ID starts with an
+            # EMPTY view of orders a previous session placed, even though they're still
+            # resting fine at IB. broker.py's bracket-vanished detection (poll_tp_sl_fills)
+            # reads only from ib.trades(), so this alone made healthy TP/SL brackets look
+            # missing purely from restarting with a new identity -- a likely major
+            # contributor to today's RECONCILED rows. reqAllOpenOrders() asks IB for
+            # every open order on the account regardless of which client ID placed it,
+            # populating ib.trades() correctly before any polling code reads it.
+            ib.reqAllOpenOrders()
+            ib.sleep(1.0)
             self.paper = ib
             self._paper_client_id = cid
 

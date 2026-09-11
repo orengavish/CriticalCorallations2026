@@ -10,12 +10,15 @@ Usage:
     python back-trading/trading_dashboard.py --port 5003
 """
 
+import os
 import sys
+import ast
 import csv
 import json
 import socket
 import argparse
 import threading
+import subprocess
 from pathlib import Path
 from datetime import datetime, date, timezone, timedelta
 
@@ -26,7 +29,7 @@ if str(_ROOT) not in sys.path:
 
 from flask import Flask, jsonify, request, render_template_string
 
-from lib.db import get_db, get_cached_price, init_db
+from lib.db import get_db, get_cached_price, init_db, archive_and_delete_commands
 from lib.price_profile import ensure_profile as _ensure_price_profile, get_price_profile
 from trader.session import get_session_manager
 from lib import algo_lab, algo_pnl, correlation_lab
@@ -532,6 +535,241 @@ def api_session_start():
 @app.route("/api/session/stop", methods=["POST"])
 def api_session_stop():
     return jsonify(get_session_manager().stop())
+
+
+# ── Day Start panel (2026-09-10) ────────────────────────────────────────────────
+# Verify (read-only) / Clean DB noise (archive, never delete) / Cancel & Flatten IB --
+# the three actions proven manually during the 2026-09-08/09 incident cleanup, as
+# buttons instead of an ad-hoc script each time. See DAY_SUMMARY_AND_PLAN_2026-09-10.md
+# goal 5.
+
+@app.route("/api/dayclean/verify")
+def api_dayclean_verify():
+    """Read-only: DB residual counts + IB's real order/position counts, side by side."""
+    today = date.today().isoformat()
+    db_path = _resolve_db()
+    with get_db(db_path) as con:
+        stale_cancelled = con.execute(
+            "SELECT COUNT(*) FROM commands WHERE status='CANCELLED' AND date(updated_at) < ?",
+            (today,)
+        ).fetchone()[0]
+        stale_pending = con.execute(
+            "SELECT COUNT(*) FROM commands WHERE status IN ('PENDING','SUBMITTED')"
+            " AND date(created_at) < ?", (today,)
+        ).fetchone()[0]
+        needs_review = con.execute(
+            "SELECT COUNT(*) FROM commands WHERE needs_review=1"
+        ).fetchone()[0]
+        archived_total = con.execute(
+            "SELECT COUNT(*) FROM commands_archive"
+        ).fetchone()[0]
+
+    ib = {"connected": False, "resting_orders": None, "open_positions": None, "error": None}
+    try:
+        from lib.ib_client import IBClient
+        from lib.config_loader import get_config
+        cfg = get_config(_ROOT / "trader" / "config.yaml")
+        ibc = IBClient(cfg)
+        ibc.connect(live=False, paper=True)
+        try:
+            ibc.paper.reqAllOpenOrders()
+            ibc.paper.sleep(1.0)
+            ibc.paper.reqPositions()
+            ibc.paper.sleep(1.0)
+            ib["connected"] = True
+            ib["resting_orders"] = len(ibc.paper.openOrders())
+            ib["open_positions"] = len([p for p in ibc.paper.positions() if p.position != 0])
+        finally:
+            ibc.disconnect()
+    except Exception as e:
+        ib["error"] = str(e)
+
+    return jsonify({
+        "db": {
+            "stale_cancelled_noise": stale_cancelled,   # safe for Clean DB to archive
+            "stale_pending_from_past_days": stale_pending,  # flagged, NOT auto-cleaned
+            "needs_review": needs_review,
+            "already_archived": archived_total,
+        },
+        "ib": ib,
+    })
+
+
+@app.route("/api/dayclean/clean", methods=["POST"])
+def api_dayclean_clean():
+    """
+    Archives (never deletes outright, see archive_and_delete_commands) CANCELLED
+    commands from before today -- the same "old rejected noise" category manually
+    cleaned during the 2026-09-09 incident, nothing else. PENDING/SUBMITTED/FILLED/
+    CLOSED rows are never touched here regardless of age.
+    """
+    today = date.today().isoformat()
+    db_path = _resolve_db()
+    with get_db(db_path) as con:
+        ids = [r[0] for r in con.execute(
+            "SELECT id FROM commands WHERE status='CANCELLED' AND date(updated_at) < ?",
+            (today,)
+        ).fetchall()]
+        archived = archive_and_delete_commands(con, ids, reason="dayclean_button")
+    return jsonify({"archived": archived})
+
+
+@app.route("/api/dayclean/cancel-flatten", methods=["POST"])
+def api_dayclean_cancel_flatten():
+    """
+    Cancels all resting IB orders (reqGlobalCancel, both LIVE and PAPER) and flattens
+    all filled positions via reverse MKT orders on PAPER. Updates DB status only
+    (PENDING/SUBMITTING/SUBMITTED -> CANCELLED, FILLED -> CLOSED) -- never deletes rows.
+    Ported from visualizer/app.py's /api/cancel-all (legacy port-5001 dashboard) so this
+    is reachable from the one dashboard instead of two.
+    """
+    from lib.ib_client import IBClient
+    from lib.config_loader import get_config
+    from ib_insync import MarketOrder
+
+    now = datetime.now(timezone.utc).isoformat()
+    result = {"ib_cancel": "skipped", "ib_flatten": 0,
+              "db_cancelled": 0, "db_flattened": 0, "errors": []}
+    ibc = None
+    try:
+        cfg = get_config(_ROOT / "trader" / "config.yaml")
+        ibc = IBClient(cfg)
+        ibc.connect(live=True, paper=True)
+
+        for label, ib_conn in [("LIVE", ibc.live), ("PAPER", ibc.paper)]:
+            if ib_conn and ib_conn.isConnected():
+                try:
+                    ib_conn.reqGlobalCancel()
+                    print(f"[dayclean cancel-flatten] reqGlobalCancel -> {label}")
+                except Exception as e:
+                    result["errors"].append(f"reqGlobalCancel {label}: {e}")
+        result["ib_cancel"] = "ok"
+
+        if ibc.paper and ibc.paper.isConnected():
+            try:
+                ibc.paper.reqPositions()
+                ibc.paper.sleep(1.5)
+                for pos in ibc.paper.positions():
+                    qty = pos.position
+                    if qty == 0:
+                        continue
+                    action = "SELL" if qty > 0 else "BUY"
+                    try:
+                        ibc.place_order(pos.contract, MarketOrder(action, abs(qty)))
+                        result["ib_flatten"] += 1
+                    except Exception as e:
+                        result["errors"].append(f"close {pos.contract.symbol}: {e}")
+            except Exception as e:
+                result["errors"].append(f"positions: {e}")
+    except Exception as e:
+        result["errors"].append(f"IB connect: {e}")
+        result["ib_cancel"] = "failed"
+    finally:
+        if ibc:
+            try:
+                ibc.disconnect()
+            except Exception:
+                pass
+
+    try:
+        with get_db(_resolve_db()) as con:
+            r1 = con.execute(
+                "UPDATE commands SET status='CANCELLED', updated_at=?"
+                " WHERE status IN ('PENDING','SUBMITTING','SUBMITTED')", (now,)
+            )
+            result["db_cancelled"] = r1.rowcount
+            r2 = con.execute(
+                "UPDATE commands SET status='CLOSED',"
+                " exit_reason='manual_flatten', exit_time=?, updated_at=?"
+                " WHERE status='FILLED'", (now, now)
+            )
+            result["db_flattened"] = r2.rowcount
+    except Exception as e:
+        result["errors"].append(f"DB: {e}")
+
+    return jsonify(result)
+
+
+@app.route("/api/geva/import-manual-lines", methods=["POST"])
+def api_geva_import_manual_lines():
+    """
+    Automates real Geva-line ingestion (2026-09-10 -- see trader/scripts/
+    import_geva_manual_lines.py): reads today's already-parsed lines from
+    GevaExtract's own geva.db and inserts them as source='geva_manual' (+ a matched
+    random control), replacing the manual hand-paste-into-the-dashboard step.
+
+    Runs the import as a SEPARATE PROCESS rather than importing IBClient directly here
+    -- ib_insync needs a live event loop, and Flask's threaded request handler doesn't
+    reliably give it one (see lib/ib_client.py's connect() comment); a subprocess gets
+    its own clean main thread and sidesteps that entirely.
+
+    If new lines actually landed, restarts decider so they're picked up this session
+    instead of waiting for the next natural restart -- harmless if decider is still
+    parked at its pre-open gate (it'll just re-park), necessary if trading has already
+    started for the day.
+    """
+    body = request.get_json(silent=True) or {}
+    as_of = body.get("date") or date.today().isoformat()
+    force = bool(body.get("force", False))
+
+    cmd = [sys.executable, str(_ROOT / "trader" / "scripts" / "import_geva_manual_lines.py"),
+           "--date", as_of]
+    if force:
+        cmd.append("--force")
+
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    except subprocess.TimeoutExpired:
+        return jsonify({"ok": False, "error": "import script timed out after 60s"}), 500
+
+    # The script's last stdout line is a printed dict -- more robust than re-parsing
+    # its full log output, and avoids a second source of truth for the result shape.
+    result_line = next((l for l in reversed(proc.stdout.splitlines()) if l.startswith("{")), None)
+    parsed = None
+    if result_line:
+        try:
+            parsed = ast.literal_eval(result_line)
+        except (ValueError, SyntaxError):
+            pass
+
+    if proc.returncode != 0 or parsed is None:
+        return jsonify({"ok": False, "error": "import script failed",
+                         "stdout": proc.stdout, "stderr": proc.stderr}), 500
+
+    restarted_decider = False
+    if parsed.get("real_inserted", 0) > 0:
+        restarted_decider = _restart_decider_process()
+
+    return jsonify({"ok": True, **parsed, "restarted_decider": restarted_decider})
+
+
+def _restart_decider_process() -> bool:
+    """
+    Kills decider.py's current OS process (found via its singleton lock file's PID) so
+    session.py's monitor loop -- now fixed (2026-09-10) to recognize an externally
+    supervised component and restart it properly on real death -- respawns it fresh,
+    picking up any critical_lines rows added since it last ran run_session_start().
+    Returns False (no-op, not an error) if decider isn't currently running at all.
+    """
+    lock_path = _ROOT / "trader" / "logs" / "decider.lock"
+    if not lock_path.exists():
+        return False
+    try:
+        from lib.singleton_lock import _pid_alive
+        pid = int(lock_path.read_text().strip())
+    except (OSError, ValueError):
+        return False
+    if not _pid_alive(pid):
+        return False
+    try:
+        if sys.platform == "win32":
+            subprocess.run(["taskkill", "/F", "/PID", str(pid)],
+                            capture_output=True, timeout=10)
+        else:
+            os.kill(pid, 9)
+        return True
+    except Exception:
+        return False
 
 
 @app.route("/api/lines/create", methods=["POST"])
@@ -1192,6 +1430,279 @@ def api_submitted():
     return jsonify([dict(r) for r in rows])
 
 
+@app.route("/api/broker-queue")
+def api_broker_queue():
+    """
+    Feeds the Broker screen: the PENDING/SUBMITTED/FILLED queue across every
+    source (not filtered to source='trading_dashboard' like /api/submitted --
+    that filter is why the old Submitted tab shows almost nothing real).
+    """
+    cols = ("id, symbol, direction, entry_type, entry_price, tp_price, sl_price,"
+            " bracket_size, source, status, needs_review, fill_price, created_at, updated_at")
+
+    def rows(con, status):
+        return [dict(r) for r in con.execute(
+            f"SELECT {cols} FROM commands WHERE status=? ORDER BY id DESC LIMIT 300", (status,)
+        ).fetchall()]
+
+    def true_count(con, status):
+        return con.execute(
+            "SELECT COUNT(*) FROM commands WHERE status=?", (status,)
+        ).fetchone()[0]
+
+    # 2026-09-10: today / yesterday / all days, same pattern as Results' st-range --
+    # "closed_today" keys below now mean "closed in the selected range".
+    range_sel = request.args.get("range", "today")
+    if range_sel == "yesterday":
+        closed_date_clause = "date(exit_time)=?"
+        closed_date_params = ((date.today() - timedelta(days=1)).isoformat(),)
+    elif range_sel == "all":
+        closed_date_clause = "1=1"
+        closed_date_params = ()
+    else:
+        range_sel = "today"
+        closed_date_clause = "date(exit_time)=?"
+        closed_date_params = (date.today().isoformat(),)
+
+    with get_db(_resolve_db()) as con:
+        pending   = rows(con, "PENDING")
+        submitted = rows(con, "SUBMITTED")
+        filled    = rows(con, "FILLED")
+
+        # Real totals, not len(pending) etc. -- those lists are capped at 300 for display,
+        # so their length silently freezes at 300 once a bucket exceeds it (caught live,
+        # 2026-09-09: PENDING sat at exactly 300 while the true count was 322 and climbing).
+        n_pending   = true_count(con, "PENDING")
+        n_submitted = true_count(con, "SUBMITTED")
+        n_filled    = true_count(con, "FILLED")
+
+        closed_today = [dict(r) for r in con.execute(
+            "SELECT id, symbol, direction, source, exit_reason, pnl_points, exit_time"
+            f" FROM commands WHERE status='CLOSED' AND {closed_date_clause}"
+            " ORDER BY id DESC LIMIT 300", closed_date_params
+        ).fetchall()]
+        n_closed_today = con.execute(
+            f"SELECT COUNT(*) FROM commands WHERE status='CLOSED' AND {closed_date_clause}",
+            closed_date_params
+        ).fetchone()[0]
+
+        try:
+            from lib.config_loader import get_config
+            cap = getattr(get_config().orders, "max_resting_per_side", 10)
+        except Exception:
+            cap = 10
+        held_back = [dict(r) for r in con.execute(
+            "SELECT symbol, direction, COUNT(*) c FROM commands WHERE status='SUBMITTED'"
+            " GROUP BY symbol, direction HAVING c >= ?", (cap,)
+        ).fetchall()]
+
+        recent_stale = [dict(r) for r in con.execute(
+            "SELECT id, symbol, direction, error_message, updated_at FROM commands"
+            " WHERE status='CANCELLED' AND error_message LIKE 'stale vs fresh price%'"
+            " ORDER BY id DESC LIMIT 20"
+        ).fetchall()]
+
+    net_pts = sum(r["pnl_points"] or 0 for r in closed_today)
+    net_usd = sum((r["pnl_points"] or 0) * algo_pnl.SYMBOL_MULTIPLIERS.get(r["symbol"], 1.0)
+                  for r in closed_today)
+
+    return jsonify({
+        "pending": pending, "submitted": submitted, "filled": filled,
+        "closed_today": closed_today,
+        "range": range_sel,
+        "counts": {"pending": n_pending, "submitted": n_submitted,
+                   "filled": n_filled, "closed_today": n_closed_today},
+        "net_pnl_today": {"points": round(net_pts, 2), "usd": round(net_usd, 2)},
+        "held_back": held_back,
+        "recent_stale": recent_stale,
+        "cap": cap,
+    })
+
+
+# source -> display bucket. research_ce/research_random (the "two-winning-reasons"
+# experiment) are split further by their own winning-reason below, not lumped into one
+# blended Real/Control -- everything else stands as its own type, per this screen's spec.
+_BUCKET_MAP = {
+    "geva_extract":          "GevaExtract",
+    # 2026-09-09: geva_manual is real Geva-Facebook signal (hand-entered, since
+    # GevaExtract's own automated pipeline is blocked) -- it belongs with GevaExtract,
+    # not with the unrelated Real/Control research experiment (research_ce/random).
+    "geva_manual":           "GevaExtract",
+    "geva_manual_control":   "Control",  # matched random-distance control for the above
+    "critical_line":         "Critical Line",
+    "algo_lab":              "Algo Lab",
+}
+# 2026-09-10: the two-winning-reasons experiment's exact winning reason, already saved
+# in critical_lines.note as JSON ({"reason": "...", ...}) by prep_research_lines*.py but
+# previously left unsurfaced, blended into one "Real" bucket -- goal 2/4 of today's plan.
+_ALGO_REASON_LABEL = {
+    "PREVIOUS_DAY_LOW": "Algo 1",
+    "PREVIOUS_DAY_HIGH+PIVOT_CONFLUENCE": "Algo 2",
+}
+_RESEARCH_REAL_SOURCES = {"research_ce", "research_ce_stock"}
+_RESEARCH_CONTROL_SOURCES = {"research_random", "research_random_stock"}
+_BUCKET_ORDER = ["GevaExtract", "Algo 1 (Real)", "Algo 1 (Control)",
+                 "Algo 2 (Real)", "Algo 2 (Control)", "Control",
+                 "Critical Line", "Algo Lab", "Other"]
+
+
+def _bucket_for(source, symbol, note=None):
+    # GevaExtract only ever posts MES/ES levels (confirmed 2026-09-09 against Geva's own
+    # Facebook post history) -- a geva_extract row on any other symbol (MNQ) is this
+    # system's own synthetic proportional scaling, not real Geva signal. Counting it as
+    # "GevaExtract" is exactly the mislabeling that made the first version of this screen
+    # unreadable -- route it to Other instead.
+    if source == "geva_extract" and symbol != "MES":
+        return "Other"
+    if source in _RESEARCH_REAL_SOURCES or source in _RESEARCH_CONTROL_SOURCES:
+        reason = None
+        if note:
+            try:
+                reason = json.loads(note).get("reason")
+            except (ValueError, TypeError):
+                pass
+        algo = _ALGO_REASON_LABEL.get(reason, "Algo ?")
+        side = "Real" if source in _RESEARCH_REAL_SOURCES else "Control"
+        return f"{algo} ({side})"
+    return _BUCKET_MAP.get(source, "Other")
+
+
+def _summarize(subset):
+    n = len(subset)
+    if n == 0:
+        return {"n": 0, "win_pct": 0, "wins": 0, "losses": 0, "flat": 0,
+                "pts": 0, "usd": 0, "avg_win": 0, "avg_loss": 0, "profit_factor": None}
+    wins   = [r for r in subset if r["pnl_points"] > 0]
+    losses = [r for r in subset if r["pnl_points"] < 0]
+    win_pts  = sum(r["pnl_points"] for r in wins)
+    loss_pts = sum(r["pnl_points"] for r in losses)
+    return {
+        "n": n, "win_pct": round(len(wins) / n * 100, 1),
+        "wins": len(wins), "losses": len(losses), "flat": n - len(wins) - len(losses),
+        "pts": round(sum(r["pnl_points"] for r in subset), 2),
+        "usd": round(sum(r["usd"] for r in subset), 2),
+        "avg_win": round(win_pts / len(wins), 2) if wins else 0,
+        "avg_loss": round(loss_pts / len(losses), 2) if losses else 0,
+        "profit_factor": round(win_pts / abs(loss_pts), 2) if loss_pts else None,
+    }
+
+
+@app.route("/api/closed-stats")
+def api_closed_stats():
+    """
+    Closed-trade performance for ONE bucket at a time (?bucket=, default GevaExtract),
+    optionally narrowed to one bracket size (?bracket=, default all). Feeds the Stats
+    screen: a one-line Real-vs-Control strip (always both, regardless of selected
+    bucket -- it's a fixed comparison pair, not one more bucket choice) and the main
+    event, a symbol x (direction, entry_type) matrix for the selected bucket.
+    """
+    date_from  = request.args.get("date_from") or date.today().isoformat()
+    date_to    = request.args.get("date_to")   or date.today().isoformat()
+    bucket     = request.args.get("bucket", "All")
+    bracket    = request.args.get("bracket", "all")
+    entry_type = request.args.get("entry_type", "all")   # all | LMT | STP
+    exit_reason_f = request.args.get("exit_reason", "all")  # all | TP | SL | RECONCILED | ...
+
+    with get_db(_resolve_db()) as con:
+        rows = [dict(r) for r in con.execute(
+            "SELECT c.id, c.symbol, c.source AS cmd_source, cl.source AS line_source,"
+            " cl.note AS line_note,"
+            " c.direction, c.entry_type, c.bracket_size, c.entry_price, c.exit_price,"
+            " c.exit_reason, c.pnl_points, c.fill_time, c.exit_time"
+            " FROM commands c LEFT JOIN critical_lines cl ON cl.id = c.critical_line_id"
+            " WHERE c.status='CLOSED' AND date(c.exit_time) BETWEEN ? AND ?"
+            " AND c.pnl_points IS NOT NULL",
+            (date_from, date_to)
+        ).fetchall()]
+
+    for r in rows:
+        # The line's own source is ground truth when it exists (fixes historical rows
+        # mislabeled 'critical_line' before decider.py propagated line source into the
+        # command -- see 2026-09-09 commit). Falls back to the command's own source for
+        # rows with no critical_line_id at all (algo_lab, geva_extract).
+        r["true_source"] = r["line_source"] or r["cmd_source"]
+        r["bucket"] = _bucket_for(r["true_source"], r["symbol"], r["line_note"])
+        r["usd"] = r["pnl_points"] * algo_pnl.SYMBOL_MULTIPLIERS.get(r["symbol"], 1.0)
+
+    algo_vs_control = {
+        algo: {"real": _summarize([r for r in rows if r["bucket"] == f"{algo} (Real)"]),
+               "control": _summarize([r for r in rows if r["bucket"] == f"{algo} (Control)"])}
+        for algo in ("Algo 1", "Algo 2")
+    }
+
+    # Bracket is a global filter, not a comparison dimension -- 2026-09-09 finding that
+    # the same real line fans out across multiple bracket sizes means mixing brackets
+    # into a bucket-vs-bucket comparison would dilute it with near-duplicate entries.
+    # Applied once here, before both the comparison and the trade list below.
+    brackets_available = sorted({r["bracket_size"] for r in rows if r["bracket_size"] is not None})
+    filtered_rows = rows
+    if bracket != "all":
+        try:
+            bracket_f = float(bracket)
+            filtered_rows = [r for r in rows if r["bracket_size"] == bracket_f]
+        except ValueError:
+            pass
+
+    # 2026-09-09 finding: most closed trades today are exit_reason='RECONCILED' (an
+    # estimated exit from the connection/client-ID visibility bug, not a real IB fill) --
+    # the entry_type win/loss split was mostly measuring that, not real market behavior.
+    # Both filters applied here, same "global, before comparison and table" treatment as
+    # bracket above.
+    exit_reasons_available = sorted({r["exit_reason"] for r in filtered_rows if r["exit_reason"]})
+    if entry_type != "all":
+        filtered_rows = [r for r in filtered_rows if r["entry_type"] == entry_type]
+    if exit_reason_f == "not_reconciled":
+        filtered_rows = [r for r in filtered_rows if r["exit_reason"] != "RECONCILED"]
+    elif exit_reason_f != "all":
+        filtered_rows = [r for r in filtered_rows if r["exit_reason"] == exit_reason_f]
+
+    # Bucket-vs-bucket comparison, the actual point of this screen: every bucket side by
+    # side, each broken into Stop vs Limit -- testing "stop orders are the problem" as a
+    # hypothesis across every source at once, not just one bucket in isolation.
+    comparison = {}
+    for b in _BUCKET_ORDER:
+        b_rows = [r for r in filtered_rows if r["bucket"] == b]
+        comparison[b] = {
+            "overall": _summarize(b_rows),
+            "by_entry_type": {
+                et: _summarize([r for r in b_rows if r["entry_type"] == et])
+                for et in sorted({r["entry_type"] for r in b_rows if r["entry_type"]})
+            },
+        }
+
+    bucket_rows = filtered_rows if bucket == "All" else [r for r in filtered_rows if r["bucket"] == bucket]
+
+    # Individual trades, not aggregated -- summary tables kept hiding that "n=12" could
+    # mean 2 real events fanned out across brackets (2026-09-09 finding). One row per
+    # actual closed command, sorted by symbol then fill time. Entry/exit price matter
+    # most here; timestamp least -- kept last.
+    table = sorted(
+        [{"id": r["id"], "symbol": r["symbol"], "type": r["true_source"],
+          "direction": r["direction"], "entry_type": r["entry_type"],
+          "bracket_size": r["bracket_size"], "entry_price": r["entry_price"],
+          "exit_price": r["exit_price"], "exit_reason": r["exit_reason"],
+          "pnl_points": r["pnl_points"],
+          "usd": round(r["pnl_points"] * algo_pnl.SYMBOL_MULTIPLIERS.get(r["symbol"], 1.0), 2),
+          "fill_time": r["fill_time"], "exit_time": r["exit_time"]}
+         for r in bucket_rows],
+        key=lambda t: (t["symbol"], t["fill_time"] or "")
+    )
+
+    return jsonify({
+        "date_from": date_from, "date_to": date_to,
+        "bucket": bucket, "bracket": bracket,
+        "entry_type": entry_type, "exit_reason": exit_reason_f,
+        "bucket_counts": {"All": len(rows),
+                          **{b: len([r for r in rows if r["bucket"] == b]) for b in _BUCKET_ORDER}},
+        "algo_vs_control": algo_vs_control,
+        "overall": _summarize(bucket_rows),
+        "brackets_available": brackets_available,
+        "exit_reasons_available": exit_reasons_available,
+        "comparison": comparison,
+        "table": table,
+    })
+
+
 @app.route("/api/available_dates")
 def api_available_dates():
     """Dates that have CSV data for at least one requested symbol in the given range."""
@@ -1527,6 +2038,119 @@ body:not(.busy-wait) .busy-strip{background:var(--gl-border)}
 .gl-card h6{font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--gl-muted);font-weight:700;margin-bottom:10px}
 .gl-stat-k{font-size:10px;color:var(--gl-faint);text-transform:uppercase;letter-spacing:.05em}
 .gl-stat-v{font-family:var(--gl-mono);font-size:22px;font-variant-numeric:tabular-nums}
+
+/* ── Broker screen ── */
+.dayclean-bar{display:flex;align-items:center;gap:8px;padding:8px 12px;margin-bottom:10px;
+  background:var(--gl-panel);border:1px solid var(--gl-border);border-radius:8px}
+.broker-stats{display:grid;grid-template-columns:repeat(6,1fr);gap:1px;background:var(--gl-border);
+  border:1px solid var(--gl-border);border-radius:8px;overflow:hidden;margin-bottom:14px;
+  position:sticky;top:0;z-index:5}
+.broker-stat{background:var(--gl-panel);padding:10px 12px}
+.broker-stat .k{font-size:10px;color:var(--gl-faint);text-transform:uppercase;letter-spacing:.05em;margin-bottom:4px}
+.broker-stat .v{font-family:var(--gl-mono);font-size:18px;font-variant-numeric:tabular-nums}
+.broker-stat .v.good{color:var(--gl-good)}
+.broker-stat .v.bad{color:var(--gl-bad)}
+.broker-stat .v.warn{color:var(--gl-accent)}
+
+.broker-board{display:grid;grid-template-columns:1fr 1fr;gap:12px;height:48vh;margin-bottom:14px;min-width:0}
+.broker-right{display:grid;grid-template-rows:1fr 1fr;gap:12px;min-height:0;min-width:0}
+.broker-col{background:var(--gl-panel);border:1px solid var(--gl-border);border-radius:8px;
+  padding:10px 12px;display:flex;flex-direction:column;min-height:0;min-width:0}
+.broker-col h6{font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--gl-muted);
+  font-weight:700;margin-bottom:8px;flex-shrink:0}
+/* min-width:0 is load-bearing here: without it, a flex column won't shrink below its
+   content's natural width, so rows marked white-space:nowrap blow the column out
+   sideways (the whole board scrolls right) instead of clipping/scrolling inside it. */
+.broker-list{overflow-y:auto;overflow-x:hidden;display:flex;flex-direction:column;gap:5px;min-height:0;min-width:0}
+.broker-list-h{flex-direction:row;flex-wrap:nowrap;overflow-x:auto;overflow-y:hidden}
+.broker-row{min-width:0;max-width:100%}
+
+.broker-row{font-family:var(--gl-mono);font-size:11.5px;background:var(--gl-panel-2);
+  border:1px solid var(--gl-border);border-radius:5px;padding:6px 9px;
+  display:flex;align-items:center;gap:8px;flex-shrink:0;white-space:nowrap}
+.broker-row .sym{font-weight:700;min-width:36px}
+.broker-row .dir-buy{color:var(--gl-good)}
+.broker-row .dir-sell{color:var(--gl-bad)}
+.broker-row .src{color:var(--gl-faint);font-size:10px;border:1px solid var(--gl-border);
+  border-radius:3px;padding:0 4px}
+.broker-row .age{margin-left:auto;color:var(--gl-faint);font-size:10px}
+.broker-row .rev{color:var(--gl-accent)}
+
+/* A row that just arrived in this bucket since the last poll -- flash+settle,
+   the "moved here" cue, instead of a full cross-panel position animation. */
+@keyframes bk-arrive{
+  0%{background:var(--gl-accent-dim);transform:scale(1.03)}
+  100%{background:var(--gl-panel-2);transform:scale(1)}
+}
+.broker-row.just-arrived{animation:bk-arrive 900ms ease-out}
+
+.broker-closed-strip{background:var(--gl-panel);border:1px solid var(--gl-border);
+  border-radius:8px;padding:10px 12px;max-height:30vh;display:flex;flex-direction:column;
+  overflow:hidden}
+.broker-closed-strip h6{flex-shrink:0}
+.broker-closed-strip .broker-list{flex:1 1 auto}
+
+/* ── Stats screen: top bar capped small, matrix takes the rest ── */
+/* .st-page, not #tab-stats itself -- the tab-pane element's display is Bootstrap's to
+   control (show/hide on tab switch); overriding it directly with an ID selector out-
+   specifies that and forces the pane to always render, breaking every other tab. */
+.st-page{display:flex;flex-direction:column;height:calc(100vh - 140px)}
+.st-topbar{flex:0 0 auto;max-height:20vh;display:flex;flex-direction:column;gap:8px;
+  padding-bottom:10px;margin-bottom:10px;border-bottom:1px solid var(--gl-border)}
+.st-topbar-row{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+
+.st-range.active,.bk-range.active{background:var(--gl-accent);border-color:var(--gl-accent);color:var(--gl-accent-ink)}
+
+/* single-select bucket -- a segmented control, not independent toggle chips */
+.st-bucket-select{display:flex;border:1px solid var(--gl-border);border-radius:6px;overflow:hidden}
+.st-bucket-opt{font-size:12px;padding:6px 14px;background:var(--gl-panel);color:var(--gl-muted);
+  cursor:pointer;user-select:none;border-right:1px solid var(--gl-border)}
+.st-bucket-opt:last-child{border-right:none}
+.st-bucket-opt .n{color:var(--gl-faint);font-size:10px;margin-left:4px}
+.st-bucket-opt.active{background:var(--gl-accent);color:var(--gl-accent-ink)}
+.st-bucket-opt.active .n{color:var(--gl-accent-ink);opacity:.75}
+
+.st-overall{font-family:var(--gl-mono);font-size:13px;display:flex;gap:16px;align-items:baseline}
+.st-overall .big{font-size:18px;font-weight:600}
+.st-rvc-line{font-size:11.5px;color:var(--gl-muted);margin-left:auto;text-align:right}
+.st-rvc-line b{color:var(--gl-ink)}
+
+/* 2026-09-10: comparison capped to its own content height instead of claiming 2/3 of
+   the page -- the trade table below is the thing people actually scroll through, it
+   was cramped into the smaller share before. */
+.st-comparison-wrap{flex:0 0 auto;max-height:30vh;min-height:0;overflow:auto;margin-bottom:10px}
+.st-matrix-wrap{flex:1 1 auto;min-height:0;overflow:auto;border:1px solid var(--gl-border);
+  border-radius:8px;background:var(--gl-panel)}
+.st-matrix-header{display:flex;align-items:center;gap:10px;padding:8px 12px;height:37px;
+  box-sizing:border-box;border-bottom:1px solid var(--gl-border);position:sticky;top:0;
+  background:var(--gl-panel);z-index:3}
+.st-matrix-header .lbl{font-size:12px;color:var(--gl-muted)}
+.st-matrix-header .lbl b{color:var(--gl-ink)}
+
+/* ── Comparison: one card per bucket, Stop/Limit broken out inside ── */
+.cmp-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px}
+.cmp-card{background:var(--gl-panel);border:1px solid var(--gl-border);border-radius:8px;
+  padding:12px 14px;cursor:pointer;transition:border-color .15s,box-shadow .15s}
+.cmp-card:hover{border-color:var(--gl-accent)}
+.cmp-card.active{border-color:var(--gl-accent);box-shadow:0 0 0 1px var(--gl-accent) inset}
+.cmp-card h6{font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--gl-muted);
+  font-weight:700;margin-bottom:8px}
+.cmp-overall{font-family:var(--gl-mono);font-variant-numeric:tabular-nums;font-size:19px;margin-bottom:2px}
+.cmp-sub{font-size:11px;color:var(--gl-muted);margin-bottom:10px}
+.cmp-et-row{display:flex;justify-content:space-between;font-family:var(--gl-mono);
+  font-variant-numeric:tabular-nums;font-size:11.5px;padding:4px 0;border-top:1px solid var(--gl-border)}
+.cmp-et-row .et-label{color:var(--gl-muted);font-family:'IBM Plex Sans',sans-serif}
+.cmp-empty{color:var(--gl-faint);font-size:11px;font-style:italic}
+#st-matrix-table{margin:0;font-family:var(--gl-mono);font-variant-numeric:tabular-nums}
+#st-matrix-table thead th{position:sticky;top:37px;background:var(--gl-panel-2);z-index:2;
+  border-bottom:1px solid var(--gl-border);font-family:'SF Mono',ui-monospace,monospace;
+  text-transform:none;letter-spacing:0}
+#st-matrix-table td,#st-matrix-table th{white-space:nowrap;font-size:12.5px;padding:7px 16px;text-align:right}
+#st-matrix-table td:first-child,#st-matrix-table th:first-child{text-align:left}
+.st-sortable{cursor:pointer;user-select:none}
+.st-sortable:hover{color:var(--gl-ink)}
+.st-sortable.sort-asc::after{content:" \25B2";font-size:9px}
+.st-sortable.sort-desc::after{content:" \25BC";font-size:9px}
 </style>
 </head>
 <body>
@@ -1542,6 +2166,7 @@ body:not(.busy-wait) .busy-strip{background:var(--gl-border)}
     <button class="rail-item" data-group="correlation"><span class="ico">&#9678;</span><span class="lbl">Correlation</span></button>
     <button class="rail-item" data-group="algolab"><span class="ico">&#9879;</span><span class="lbl">Algo Lab</span></button>
     <button class="rail-item" data-group="trading"><span class="ico">&#9635;</span><span class="lbl">Trading</span></button>
+    <button class="rail-item" data-group="results"><span class="ico">&#128202;</span><span class="lbl">Results</span></button>
     <a class="rail-item" id="rail-link-geva" target="_blank"><span class="ico">&#128279;</span><span class="lbl">Geva Extract</span></a>
     <div class="rail-spacer"></div>
   </nav>
@@ -1583,7 +2208,9 @@ body:not(.busy-wait) .busy-strip{background:var(--gl-border)}
         <li class="nav-item" data-group="charts"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-srviz" id="btn-srviz-tab">Sup/Res Viz</button></li>
         <li class="nav-item" data-group="algolab"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-algolab-grid" id="btn-algolab-grid-tab">Grid &amp; Submit</button></li>
         <li class="nav-item" data-group="algolab"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-algolab-pnl" id="btn-algolab-pnl-tab">P&amp;L Breakdown</button></li>
+        <li class="nav-item" data-group="trading"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-broker" id="btn-broker-tab">Broker</button></li>
         <li class="nav-item" data-group="trading"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-submitted" id="btn-sub-tab">Submitted</button></li>
+        <li class="nav-item" data-group="results"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-stats" id="btn-stats-tab">Results</button></li>
       </ul>
       <ul class="dropdown-menu dropdown-menu-dark" id="menu-links">
         <li><a class="dropdown-item" id="menu-link-cc2026"  target="_blank">CC2026 Dashboard (this)</a></li>
@@ -2084,6 +2711,112 @@ body:not(.busy-wait) .busy-strip{background:var(--gl-border)}
     <span style="color:rgba(255,165,0,0.8)">&#9135;&#9135; Day low</span>
     <span style="color:#aaa">&#9135;&#9135; Day sep.</span>
     <span style="color:#fff">&#9135; Manual</span>
+  </div>
+</div>
+
+<!-- ══════════════════════ STATS ══════════════════════ -->
+<div class="tab-pane fade" id="tab-stats">
+ <div class="st-page">
+
+  <div class="st-topbar">
+    <div class="st-topbar-row">
+      <div class="st-bucket-select" id="st-bucket-select"></div>
+      <div class="d-flex gap-1 ms-auto align-items-center">
+        <select class="form-select form-select-sm" id="st-bracket-select" style="width:auto"></select>
+        <select class="form-select form-select-sm" id="st-entrytype-select" style="width:auto">
+          <option value="all">Stop + Limit</option>
+          <option value="LMT">Limit only</option>
+          <option value="STP">Stop only</option>
+        </select>
+        <select class="form-select form-select-sm" id="st-exitreason-select" style="width:auto"></select>
+        <button class="btn btn-sm btn-outline-secondary st-range active" data-range="today">Today</button>
+        <button class="btn btn-sm btn-outline-secondary st-range" data-range="yesterday">Yesterday</button>
+        <button class="btn btn-sm btn-outline-secondary st-range" data-range="all">All time</button>
+        <button class="btn btn-sm btn-outline-secondary" onclick="loadStats()">&#8635;</button>
+      </div>
+    </div>
+    <div class="st-topbar-row">
+      <div class="st-overall" id="st-overall"></div>
+      <div class="st-rvc-line" id="st-rvc-line"></div>
+    </div>
+  </div>
+
+  <div class="st-comparison-wrap">
+    <div class="cmp-grid" id="st-comparison"></div>
+  </div>
+
+  <div class="st-matrix-wrap">
+    <div class="st-matrix-header">
+      <span class="lbl">Showing: <b id="st-matrix-filter-label">All</b></span>
+      <button class="btn btn-sm btn-outline-secondary ms-auto" id="st-show-all-btn">Show All Trades</button>
+    </div>
+    <table class="table table-sm table-hover table-borderless mb-0" id="st-matrix-table">
+      <thead class="text-muted small">
+        <tr>
+          <th class="st-sortable" data-field="symbol">Symbol</th>
+          <th class="st-sortable" data-field="type">Type</th>
+          <th class="st-sortable" data-field="entry_type">Order</th>
+          <th class="st-sortable" data-field="direction">Dir</th>
+          <th class="st-sortable" data-field="bracket_size">Bracket</th>
+          <th class="st-sortable" data-field="entry_price">Entry</th>
+          <th class="st-sortable" data-field="exit_price">Exit</th>
+          <th class="st-sortable" data-field="exit_reason">Reason</th>
+          <th class="st-sortable" data-field="pnl_points">Pts</th>
+          <th class="st-sortable" data-field="usd">$</th>
+          <th class="st-sortable" data-field="exit_time">Time</th>
+        </tr>
+      </thead>
+      <tbody id="st-matrix-tbody"></tbody>
+    </table>
+  </div>
+ </div>
+</div>
+
+<!-- ══════════════════════ BROKER ══════════════════════ -->
+<div class="tab-pane fade" id="tab-broker">
+  <div class="dayclean-bar">
+    <b class="small">Day Start</b>
+    <button class="btn btn-sm btn-outline-secondary" onclick="dcVerify()">Verify</button>
+    <button class="btn btn-sm btn-outline-warning" onclick="dcClean()">Clean DB noise</button>
+    <button class="btn btn-sm btn-outline-danger" onclick="dcCancelFlatten()">Cancel &amp; Flatten IB</button>
+    <span class="small text-muted" id="dc-status"></span>
+  </div>
+  <div class="broker-stats">
+    <div class="broker-stat"><div class="k">Pending</div><div class="v" id="bk-c-pending">—</div></div>
+    <div class="broker-stat"><div class="k">Submitted</div><div class="v" id="bk-c-submitted">—</div></div>
+    <div class="broker-stat"><div class="k">Filled</div><div class="v" id="bk-c-filled">—</div></div>
+    <div class="broker-stat"><div class="k" id="bk-closed-label">Closed today</div><div class="v" id="bk-c-closed">—</div></div>
+    <div class="broker-stat"><div class="k" id="bk-pnl-label">Net P&amp;L today</div><div class="v" id="bk-pnl">—</div></div>
+    <div class="broker-stat"><div class="k">At cap (held back)</div><div class="v" id="bk-held">—</div></div>
+  </div>
+
+  <div class="broker-board">
+    <div class="broker-col broker-pending">
+      <h6>Pending <span class="text-muted small">— waiting for broker</span></h6>
+      <div class="broker-list" id="bk-pending"></div>
+    </div>
+    <div class="broker-right">
+      <div class="broker-col broker-submitted">
+        <h6>Submitted <span class="text-muted small">— waiting to fill</span></h6>
+        <div class="broker-list" id="bk-submitted"></div>
+      </div>
+      <div class="broker-col broker-filled">
+        <h6>Filled <span class="text-muted small">— open positions</span></h6>
+        <div class="broker-list" id="bk-filled"></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="broker-closed-strip">
+    <div class="d-flex align-items-center gap-1 mb-1">
+      <h6 class="mb-0" id="bk-closed-title">Closed today</h6>
+      <div class="d-flex gap-1 ms-auto">
+        <button class="btn btn-sm btn-outline-secondary bk-range active" data-bkrange="today">Today</button>
+        <button class="btn btn-sm btn-outline-secondary bk-range" data-bkrange="yesterday">Yesterday</button>
+        <button class="btn btn-sm btn-outline-secondary bk-range" data-bkrange="all">All days</button>
+      </div>
+    </div>
+    <div class="broker-list" id="bk-closed"></div>
   </div>
 </div>
 
@@ -3327,6 +4060,336 @@ function toggleAutoRef(){
 
 document.getElementById('btn-sub-tab').addEventListener('click',loadSubmitted);
 
+// ── Broker screen ─────────────────────────────────────────────────────────────
+let _bkTimer=null;
+let _bkSeenIds=new Set();   // ids already rendered somewhere, across all polls
+
+function _bkRow(r,bucket){
+  const dirCls = r.direction==='BUY' ? 'dir-buy' : 'dir-sell';
+  const justArrived = !_bkSeenIds.has(bucket+':'+r.id) ? ' just-arrived' : '';
+  const age = r.updated_at ? (r.updated_at.slice(11,16)) : '';
+  let extra='';
+  if(bucket==='closed'){
+    const pnl=r.pnl_points;
+    const cls = pnl>0?'dir-buy':(pnl<0?'dir-sell':'');
+    extra = `<span class="${cls}">${pnl>=0?'+':''}${fmt(pnl)}pt</span><span class="src">${r.exit_reason||''}</span>`;
+  } else {
+    extra = `<span>${fmt(r.entry_price)}</span>`+
+            (r.tp_price!=null?`<span class="dir-buy">${fmt(r.tp_price)}</span>`:'')+
+            (r.sl_price!=null?`<span class="dir-sell">${fmt(r.sl_price)}</span>`:'')+
+            (r.needs_review?'<span class="rev">&#9888; review</span>':'');
+  }
+  return `<div class="broker-row${justArrived}" data-id="${bucket}:${r.id}">`+
+         `<span class="sym">${r.symbol}</span>`+
+         `<span class="${dirCls}">${r.direction}</span>`+
+         `<span class="src">${r.source||''}</span>`+
+         extra+
+         `<span class="age">${age}</span>`+
+         `</div>`;
+}
+
+function _bkRender(id,list,bucket){
+  const el=document.getElementById(id);
+  el.innerHTML = list.map(r=>_bkRow(r,bucket)).join('') ||
+    '<div class="text-muted small p-2">&mdash;</div>';
+  for(const r of list) _bkSeenIds.add(bucket+':'+r.id);
+}
+
+// ── Day Start panel ──────────────────────────────────────────────────────────
+function _dcSetStatus(msg, isErr){
+  const el = document.getElementById('dc-status');
+  el.innerHTML = msg;
+  el.style.color = isErr ? 'var(--gl-bad)' : 'var(--gl-muted)';
+}
+async function dcVerify(){
+  _dcSetStatus('checking...');
+  try{
+    const d = await (await fetch('/api/dayclean/verify')).json();
+    const ib = d.ib.connected
+      ? `IB: ${d.ib.resting_orders} resting orders, ${d.ib.open_positions} open positions`
+      : `IB: unreachable (${d.ib.error||'?'})`;
+    _dcSetStatus(`DB: ${d.db.stale_cancelled_noise} old CANCELLED (safe to clean), `+
+      `${d.db.stale_pending_from_past_days} stale PENDING/SUBMITTED (needs manual look), `+
+      `${d.db.needs_review} flagged needs_review, ${d.db.already_archived} already archived `+
+      `&middot; ${ib}`);
+  }catch(e){ _dcSetStatus('verify failed: '+e, true); }
+}
+async function dcClean(){
+  if(!confirm('Archive (not delete) old CANCELLED noise from before today?')) return;
+  _dcSetStatus('cleaning...');
+  try{
+    const d = await (await fetch('/api/dayclean/clean',{method:'POST'})).json();
+    _dcSetStatus(`Archived ${d.archived} old CANCELLED rows to commands_archive.`);
+  }catch(e){ _dcSetStatus('clean failed: '+e, true); }
+}
+async function dcCancelFlatten(){
+  if(!confirm('Cancel ALL resting IB orders and flatten ALL open positions (LIVE+PAPER)? This is immediate and affects the real account.')) return;
+  _dcSetStatus('cancelling + flattening...');
+  try{
+    const d = await (await fetch('/api/dayclean/cancel-flatten',{method:'POST'})).json();
+    _dcSetStatus(`IB cancel: ${d.ib_cancel} &middot; flattened ${d.ib_flatten} positions `+
+      `&middot; DB: ${d.db_cancelled} cancelled, ${d.db_flattened} closed`+
+      (d.errors.length ? ` &middot; errors: ${d.errors.join('; ')}` : ''), d.errors.length>0);
+  }catch(e){ _dcSetStatus('cancel/flatten failed: '+e, true); }
+}
+
+let _bkRange = 'today';
+const _BK_RANGE_LABEL = {today: 'today', yesterday: 'yesterday', all: 'all days'};
+
+async function loadBroker(){
+  try{
+    const d=await (await fetch('/api/broker-queue?range='+_bkRange)).json();
+    _bkRender('bk-pending',   d.pending,      'pending');
+    _bkRender('bk-submitted', d.submitted,    'submitted');
+    _bkRender('bk-filled',    d.filled,       'filled');
+    _bkRender('bk-closed',    d.closed_today, 'closed');
+
+    document.getElementById('bk-c-pending').textContent   = d.counts.pending;
+    document.getElementById('bk-c-submitted').textContent = d.counts.submitted;
+    document.getElementById('bk-c-filled').textContent    = d.counts.filled;
+    document.getElementById('bk-c-closed').textContent    = d.counts.closed_today;
+    const rangeLbl = _BK_RANGE_LABEL[d.range] || d.range;
+    document.getElementById('bk-closed-label').textContent = `Closed (${rangeLbl})`;
+    document.getElementById('bk-pnl-label').textContent    = `Net P&L (${rangeLbl})`;
+    document.getElementById('bk-closed-title').textContent = `Closed (${rangeLbl})`;
+
+    // Live in the browser tab title too -- visible without the tab even being
+    // focused, no scrolling needed to see where things stand.
+    document.title = `P:${d.counts.pending} S:${d.counts.submitted} F:${d.counts.filled} `+
+                      `| ${d.net_pnl_today.usd>=0?'+':''}$${d.net_pnl_today.usd.toFixed(2)} — Galao`;
+
+    const pnlEl=document.getElementById('bk-pnl');
+    const usd=d.net_pnl_today.usd;
+    pnlEl.textContent = (usd>=0?'+$':'-$')+Math.abs(usd).toFixed(2);
+    pnlEl.className = 'v '+(usd>0?'good':(usd<0?'bad':''));
+
+    const heldEl=document.getElementById('bk-held');
+    if(d.held_back.length){
+      heldEl.textContent = d.held_back.map(h=>`${h.symbol} ${h.direction} (${h.c})`).join(', ');
+      heldEl.className='v warn';
+    } else {
+      heldEl.textContent='none'; heldEl.className='v';
+    }
+  }catch(e){}
+}
+
+document.getElementById('btn-broker-tab').addEventListener('click',()=>{
+  loadBroker();
+  clearInterval(_bkTimer);
+  _bkTimer=setInterval(loadBroker,5000);   // matches broker.py's own command_poll_seconds
+});
+
+// Leaving the Broker tab stops its poll and restores the normal tab title --
+// any other top-tab button click does it.
+document.querySelectorAll('#mainTab .top-tab:not(#btn-broker-tab)').forEach(b=>{
+  b.addEventListener('click',()=>{ clearInterval(_bkTimer); document.title='Galao'; });
+});
+
+// Keyboard shortcuts: 'b' -> Broker, Escape -> Overview. Ignored while typing in a field.
+document.addEventListener('keydown', e=>{
+  const tag=(e.target.tagName||'').toLowerCase();
+  if(tag==='input'||tag==='textarea'||tag==='select') return;
+  if(e.key==='b'||e.key==='B'){ selectGroupTab('trading','tab-broker'); document.getElementById('btn-broker-tab').click(); }
+  else if(e.key==='Escape'){ clearInterval(_bkTimer); selectGroupTab('overview','tab-overview'); }
+});
+
+// ── Stats screen ─────────────────────────────────────────────────────────────
+const ST_BUCKETS = ['All','GevaExtract','Algo 1 (Real)','Algo 1 (Control)','Algo 2 (Real)','Algo 2 (Control)','Control','Critical Line','Algo Lab','Other'];
+let _stRange  = 'today';
+let _stBucket = 'All';
+let _stBracket = 'all';
+let _stEntryType = 'all';
+let _stExitReason = 'all';
+let _stSortField = null;
+let _stSortDir = 'asc';
+
+function _pf(v){ return v!=null ? v : '&mdash;'; }
+
+const ST_TYPE_NAMES = {
+  'geva_manual': 'Geva (real)', 'geva_manual_control': 'Geva (control)',
+  'research_ce': 'Real (futures)', 'research_ce_stock': 'Real (stock)',
+  'research_random': 'Control (futures)', 'research_random_stock': 'Control (stock)',
+  'critical_line': 'Legacy/orphaned', 'algo_lab': 'Algo Lab', 'geva_extract': 'GevaExtract raw',
+};
+
+function _stTableRow(r){
+  const ptsCls = r.pnl_points>0?'text-success':(r.pnl_points<0?'text-danger':'');
+  const usdCls = r.usd>0?'text-success':(r.usd<0?'text-danger':'');
+  const dirCls = r.direction==='BUY'?'text-success':'text-danger';
+  const ts = r.exit_time ? r.exit_time.slice(5,16).replace('T',' ') : '&mdash;';
+  return `<tr><td><b>${r.symbol}</b></td><td title="${r.type||''}">${ST_TYPE_NAMES[r.type]||r.type||'&mdash;'}</td>`+
+         `<td>${r.entry_type}</td><td class="${dirCls}">${r.direction}</td>`+
+         `<td>${r.bracket_size}</td><td>${fmt(r.entry_price)}</td><td>${fmt(r.exit_price)}</td>`+
+         `<td>${r.exit_reason||'&mdash;'}</td>`+
+         `<td class="${ptsCls}">${fmt(r.pnl_points)}</td><td class="${usdCls}">$${fmt(r.usd)}</td>`+
+         `<td class="text-muted">${ts}</td></tr>`;
+}
+
+async function loadStats(){
+  try{
+    const params = new URLSearchParams();
+    if(_stRange==='today'){
+      const t=new Date().toISOString().slice(0,10);
+      params.set('date_from',t); params.set('date_to',t);
+    } else if(_stRange==='yesterday'){
+      const y=new Date(Date.now()-86400000).toISOString().slice(0,10);
+      params.set('date_from',y); params.set('date_to',y);
+    } else {
+      params.set('date_from','2000-01-01');
+    }
+    params.set('bucket', _stBucket);
+    params.set('bracket', _stBracket);
+    params.set('entry_type', _stEntryType);
+    params.set('exit_reason', _stExitReason);
+    const d = await (await fetch('/api/closed-stats?'+params)).json();
+    _stLastData = d;
+    _stRender();
+  }catch(e){}
+}
+
+let _stLastData=null;
+const ST_BUCKET_HELP = {
+  'All': 'Every closed trade, across every source below.',
+  'GevaExtract': "Real Geva Facebook signal (source 'geva_manual') -- hand-entered MES lines, since GevaExtract's own automated pipeline is blocked (2026-09-09, made no sense: 1,410 chasing MARKET re-entries, ~99% losers).",
+  'Algo 1 (Real)': "Two-winning-reasons experiment, treatment side, winning reason PREVIOUS_DAY_LOW.",
+  'Algo 1 (Control)': "Matched random-distance control line for each Algo 1 (Real) line, same symbol/moment.",
+  'Algo 2 (Real)': "Two-winning-reasons experiment, treatment side, winning reason PREVIOUS_DAY_HIGH+PIVOT_CONFLUENCE.",
+  'Algo 2 (Control)': "Matched random-distance control line for each Algo 2 (Real) line, same symbol/moment.",
+  'Control': "GevaExtract's own control: a matched random-distance line for each real Geva line (source 'geva_manual_control'). Unrelated to the Algo 1/2 experiment above.",
+  'Critical Line': 'Legacy/orphaned commands with no critical_line_id reference at all -- pre-fix leftovers, not a real algorithm type.',
+  'Algo Lab': 'Algo Lab parameter-grid submissions (strategy x tp x sl x direction x strength combos).',
+  'Other': "Everything else, including GevaExtract's own automated MNQ noise (Geva never posts MNQ -- any geva_extract row on a non-MES symbol lands here).",
+};
+
+function _stSelectBucket(bucket){
+  _stBucket = bucket;
+  _stBracket = 'all';   // bracket list is bucket-specific, reset on switch
+  loadStats();
+}
+
+function _stRender(){
+  const d=_stLastData; if(!d) return;
+
+  // Single-select bucket bar (rebuilt each load so counts stay current)
+  document.getElementById('st-bucket-select').innerHTML = ST_BUCKETS.map(b=>
+    `<div class="st-bucket-opt ${b===_stBucket?'active':''}" data-bucket="${b}" title="${ST_BUCKET_HELP[b]||''}">${b}`+
+    `<span class="n">${d.bucket_counts[b]}</span></div>`
+  ).join('');
+  document.querySelectorAll('.st-bucket-opt').forEach(el=>{
+    el.addEventListener('click',()=>_stSelectBucket(el.dataset.bucket));
+  });
+  document.getElementById('st-matrix-filter-label').textContent = _stBucket;
+
+  // Bracket filter -- only brackets that actually exist for this bucket
+  const brSel = document.getElementById('st-bracket-select');
+  brSel.innerHTML = '<option value="all">All brackets</option>'+
+    d.brackets_available.map(b=>`<option value="${b}">bracket ${b}</option>`).join('');
+  brSel.value = _stBracket;
+  brSel.onchange = ()=>{ _stBracket = brSel.value; loadStats(); };
+
+  // Stop/Limit filter -- fixed options, always both available
+  const etSel = document.getElementById('st-entrytype-select');
+  etSel.value = _stEntryType;
+  etSel.onchange = ()=>{ _stEntryType = etSel.value; loadStats(); };
+
+  // Exit-reason filter -- 2026-09-09: most trades today are RECONCILED (an estimated
+  // exit from the connection/client-ID bug), not a real TP/SL fill. This isolates them.
+  const erSel = document.getElementById('st-exitreason-select');
+  erSel.innerHTML = '<option value="all">Any exit reason</option>'+
+    (d.exit_reasons_available.includes('RECONCILED') ? '<option value="not_reconciled">Real fills only (exclude RECONCILED)</option>' : '')+
+    d.exit_reasons_available.map(x=>`<option value="${x}">Only: ${x}</option>`).join('');
+  erSel.value = _stExitReason;
+  erSel.onchange = ()=>{ _stExitReason = erSel.value; loadStats(); };
+
+  // Compact inline overall for the selected bucket+bracket
+  const o=d.overall;
+  document.getElementById('st-overall').innerHTML = `
+    <span>n=<b>${o.n}</b></span>
+    <span>${o.win_pct}% win</span>
+    <span class="big" style="color:${o.usd>=0?'var(--gl-good)':'var(--gl-bad)'}">${o.usd>=0?'+':''}$${fmt(o.usd)}</span>
+    <span>PF ${_pf(o.profit_factor)}</span>`;
+
+  // Algo 1 vs Algo 2 vs their own Controls -- always both, regardless of selected bucket.
+  // Replaces the old single blended "Real vs Control" line (2026-09-10, goal 2/4).
+  document.getElementById('st-rvc-line').innerHTML = ['Algo 1','Algo 2'].map(algo=>{
+    const p = d.algo_vs_control[algo];
+    const r = p.real, c = p.control, edge = r.usd - c.usd;
+    return `${algo}: <b style="color:${r.usd>=0?'var(--gl-good)':'var(--gl-bad)'}">${r.usd>=0?'+':''}$${fmt(r.usd)}</b> (n=${r.n})`+
+      ` vs Ctrl <b style="color:${c.usd>=0?'var(--gl-good)':'var(--gl-bad)'}">${c.usd>=0?'+':''}$${fmt(c.usd)}</b> (n=${c.n})`+
+      ` &middot; edge ${edge>=0?'+':''}$${fmt(edge)}`;
+  }).join('<br>');
+
+  // Bucket-vs-bucket comparison, Stop/Limit broken out inside each -- only buckets with
+  // any trades today are shown, so GevaExtract/Control/Critical Line (today's actual
+  // activity) surface without empty Real/Algo Lab/Other cards cluttering the compare.
+  document.getElementById('st-comparison').innerHTML = ST_BUCKETS
+    .filter(b => b!=='All' && d.comparison[b] && d.comparison[b].overall.n > 0)
+    .map(b => {
+      const c = d.comparison[b];
+      const o = c.overall;
+      const etRows = Object.entries(c.by_entry_type).map(([et, v]) => `
+        <div class="cmp-et-row">
+          <span class="et-label">${et}</span>
+          <span>n=${v.n}</span><span>${v.win_pct}%</span>
+          <span style="color:${v.usd>=0?'var(--gl-good)':'var(--gl-bad)'}">${v.usd>=0?'+':''}$${fmt(v.usd)}</span>
+        </div>`).join('');
+      return `<div class="cmp-card ${b===_stBucket?'active':''}" data-bucket="${b}">
+        <h6 title="${ST_BUCKET_HELP[b]||''}">${b}</h6>
+        <div class="cmp-overall" style="color:${o.usd>=0?'var(--gl-good)':'var(--gl-bad)'}">${o.usd>=0?'+':''}$${fmt(o.usd)}</div>
+        <div class="cmp-sub">n=${o.n} &middot; ${o.win_pct}% win &middot; PF ${_pf(o.profit_factor)}</div>
+        ${etRows || '<div class="cmp-empty">no entry-type breakdown</div>'}
+      </div>`;
+    }).join('') || '<div class="cmp-empty">No closed trades yet for the selected bracket/range.</div>';
+  document.querySelectorAll('.cmp-card').forEach(el=>{
+    el.addEventListener('click',()=>_stSelectBucket(el.dataset.bucket));
+  });
+
+  // Individual trades, not aggregated -- see 2026-09-09 note on the endpoint
+  let tableRows = d.table;
+  if(_stSortField){
+    const f=_stSortField, mul=_stSortDir==='asc'?1:-1;
+    tableRows = [...tableRows].sort((a,b)=>{
+      const av=a[f], bv=b[f];
+      if(av==null && bv==null) return 0;
+      if(av==null) return 1;
+      if(bv==null) return -1;
+      return av<bv ? -mul : av>bv ? mul : 0;
+    });
+  }
+  document.getElementById('st-matrix-tbody').innerHTML = tableRows.length
+    ? tableRows.map(_stTableRow).join('')
+    : '<tr><td colspan="11" class="text-muted small p-3">No closed trades for this bucket in range.</td></tr>';
+
+  document.querySelectorAll('.st-sortable').forEach(th=>{
+    th.classList.toggle('sort-asc', th.dataset.field===_stSortField && _stSortDir==='asc');
+    th.classList.toggle('sort-desc', th.dataset.field===_stSortField && _stSortDir==='desc');
+    th.onclick = ()=>{
+      if(_stSortField===th.dataset.field){ _stSortDir = _stSortDir==='asc'?'desc':'asc'; }
+      else { _stSortField = th.dataset.field; _stSortDir = 'asc'; }
+      _stRender();
+    };
+  });
+}
+
+document.querySelectorAll('.st-range').forEach(btn=>{
+  btn.addEventListener('click',()=>{
+    document.querySelectorAll('.st-range').forEach(b=>b.classList.remove('active'));
+    btn.classList.add('active');
+    _stRange = btn.dataset.range;
+    loadStats();
+  });
+});
+document.getElementById('st-show-all-btn').addEventListener('click',()=>_stSelectBucket('All'));
+document.querySelectorAll('.bk-range').forEach(btn=>{
+  btn.addEventListener('click',()=>{
+    document.querySelectorAll('.bk-range').forEach(b=>b.classList.remove('active'));
+    btn.classList.add('active');
+    _bkRange = btn.dataset.bkrange;
+    loadBroker();
+  });
+});
+document.getElementById('btn-stats-tab').addEventListener('click', loadStats);
+
 // ── Sandbox ───────────────────────────────────────────────────────────────────
 // Line shape helpers — Support=green, Resistance=red; !=solid bright, blank=solid, ?=dashed dim
 function _sbLineColor(type, conf){
@@ -4150,7 +5213,7 @@ document.getElementById('btn-overview-tab').addEventListener('click',loadOvervie
 
 // ── Rail navigation (groups) ─────────────────────────────────────────────────
 const GROUP_LABELS={overview:'Overview',levels:'Levels',
-  charts:'Charts',correlation:'Correlation',algolab:'Algo Lab',trading:'Trading'};
+  charts:'Charts',correlation:'Correlation',algolab:'Algo Lab',trading:'Trading',results:'Results'};
 
 function setActiveRailGroup(group){
   document.querySelectorAll('.rail-item').forEach(b=>b.classList.toggle('active',b.dataset.group===group));

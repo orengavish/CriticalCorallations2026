@@ -18,6 +18,7 @@ Self-test:
 import sys
 import sqlite3
 import argparse
+import json
 from pathlib import Path
 from contextlib import contextmanager
 
@@ -651,6 +652,20 @@ def _migrate(path: Path = None):
         )""",
         "CREATE INDEX IF NOT EXISTS idx_price_profile_sd ON price_profile(symbol, date)",
         "CREATE INDEX IF NOT EXISTS idx_commands_source_algo ON commands(source, algo_type)",
+        # 2026-09-10: cleanup must archive, never DELETE outright -- an earlier "keep only
+        # verified-good rows" pass deleted every real trade record on 6 dates along with
+        # the noise it meant to remove (see MES Trade History Audit's "Known gaps"
+        # section). Full original row kept as JSON so no future column ever needs
+        # syncing between commands and its archive.
+        """CREATE TABLE IF NOT EXISTS commands_archive (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            original_id INTEGER NOT NULL,
+            symbol TEXT, source TEXT, status TEXT,
+            reason TEXT NOT NULL,
+            row_json TEXT NOT NULL,
+            archived_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+        )""",
+        "CREATE INDEX IF NOT EXISTS idx_commands_archive_original ON commands_archive(original_id)",
     ]
     with get_db(path) as con:
         for stmt in alter_stmts:
@@ -715,6 +730,30 @@ def flag_needs_review(con, command_id: int, note: str):
         " updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id=?",
         (note, command_id),
     )
+
+
+def archive_and_delete_commands(con, ids: list[int], reason: str) -> int:
+    """
+    The only sanctioned way to remove rows from `commands`: copy each one into
+    commands_archive (full row as JSON) before deleting it. Never DELETE commands
+    directly outside this function -- see commands_archive's migration comment.
+    Returns the number of rows archived+deleted.
+    """
+    if not ids:
+        return 0
+    placeholders = ",".join("?" * len(ids))
+    rows = con.execute(
+        f"SELECT * FROM commands WHERE id IN ({placeholders})", ids
+    ).fetchall()
+    for row in rows:
+        d = dict(row)
+        con.execute(
+            "INSERT INTO commands_archive (original_id, symbol, source, status, reason, row_json)"
+            " VALUES (?,?,?,?,?,?)",
+            (d["id"], d.get("symbol"), d.get("source"), d.get("status"), reason, json.dumps(d)),
+        )
+    con.execute(f"DELETE FROM commands WHERE id IN ({placeholders})", ids)
+    return len(rows)
 
 
 def clear_needs_review(con, command_id: int):

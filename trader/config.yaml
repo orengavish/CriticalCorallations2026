@@ -20,15 +20,13 @@ symbols:
   # trader/scripts/prep_research_lines*.py and RESEARCH_RUNBOOK_2026-09-07.md).
   # Was [MES] only originally -- backup at config.yaml.bak_20260906.
   #
-  # 2026-09-07: briefly expanded to the full 104-symbol universe (4 futures + all
-  # 100 stocks), then scaled back at the user's own request ("cold feet" the night
-  # before first live run of the expanded scope) to the 4 futures + 10 of the
-  # largest/most liquid stocks -- smaller, well-understood blast radius for this
-  # first real session. JPM and BRK.B skipped (JPM: no armed line for 2026-09-08;
-  # BRK.B: known IB dotted-class-share ticker quirk, avoided for a first run).
-  # The other ~90 stocks' critical_lines rows are still in the DB (armed=1) but
-  # simply never touched by a symbol not in this list -- nothing to clean up to
-  # re-expand later, just add symbols back here.
+  # 2026-09-09: scaled up from the 10-stock first-session set to 30, picked for
+  # liquidity/fast fills from the ~90-symbol candidate pool that has armed lines
+  # (a judgment call, not ranked against a live volume feed -- swap freely).
+  # Their critical_lines rows are dated 2026-09-08 (no fresher research lines
+  # existed at scale-up time) -- known, accepted tradeoff, not an oversight.
+  # JPM and BRK.B still skipped (JPM: no armed line; BRK.B: IB dotted-class-share
+  # ticker quirk).
   - MES
   - MNQ
   - MYM
@@ -42,7 +40,27 @@ symbols:
   - AVGO
   - TSLA
   - LLY
-  - V                 # trading symbols only — used by decider, broker, position_manager
+  - V
+  - BAC
+  - WFC
+  - AMD
+  - CSCO
+  - XOM
+  - MU
+  - QCOM
+  - KO
+  - PG
+  - JNJ
+  - UNH
+  - HD
+  - GS
+  - MA
+  - TXN
+  - VZ
+  - SCHW
+  - GE
+  - MO
+  - CVX                # trading symbols only — used by decider, broker, position_manager
 
 fetcher:
   auto_fetch_enabled: true
@@ -56,6 +74,9 @@ fetcher:
 
 session:
   open_offset_minutes: 30
+  # 2026-09-10: user decision -- start trading 30 min after the real open (17:00 IL, not
+  # the 16:30 IL open itself) until pre-market trading is added. 0 = trade at the open.
+  trading_start_delay_minutes: 30
   shutdown_offset_minutes: 60
   timezone: America/Chicago
   monitor_poll_seconds: 5          # session.py: how often to check broker/decider liveness
@@ -67,14 +88,24 @@ session:
 orders:
   # Changed 2026-09-06 from [2, 4] for the two-winning-reasons research experiment --
   # backtesting found no reason to trade brackets 1-2 (see summarize_sweep.py sweep).
-  active_brackets: [4, 8, 16, 32]
+  # 2026-09-09: dropped 32 -- decided to standardize on [4, 8, 16] going forward.
+  active_brackets: [4, 8, 16]
   quantity: 1
   tick_size: 0.25
   # 2026-09-09: broker.py admission gates (process_pending_commands), added after the
   # 2026-09-08 order-storm incident -- see REBUILD_PLAN_2026-09-09.md Phase 1.
   max_resting_per_side: 10        # stay under IB's own ~15-per-contract-per-side cap
+                                   # 2026-09-10: applies to geva_manual too now -- its prior
+                                   # exemption let real exposure quietly compound across days
+                                   # (12 lines 09-09 + 16 more 09-10) until IB itself rejected
+                                   # orders outright (45 resting legs/side, a real incident).
+                                   # It still gets first priority when capacity exists.
   min_entry_buffer_ticks: 8       # refuse a submit whose entry is closer than this to
                                    # the fresh live price (in ticks, so it scales per symbol)
+  # 2026-09-10: control-group lines (geva_manual_control, research_random*) fan out to
+  # only this bracket instead of active_brackets -- cuts control volume to a third with
+  # no loss to the real-vs-control comparison (user decision). See decider.py _CONTROL_SOURCES.
+  control_active_brackets: [4]
 
 position:
   stagnation_seconds: 300
@@ -87,10 +118,10 @@ shutdown:
 
 decider:
   # 2026-09-07: was raised to 300 for the (since scaled back) 104-symbol universe.
-  # Now 14 symbols (4 futures + 10 stocks) x ~1.5s/price-fetch is ~21s/pass, so 30s
-  # comfortably fits (the original 10s default was tuned for a single symbol and
-  # would already be tight even at 14).
-  replenishment_poll_seconds: 30
+  # 2026-09-09: scaled back up to 34 symbols (4 futures + 30 stocks) -- at the same
+  # ~1.5s/price-fetch that's ~51s/pass, so the previous 30s no longer fits (would
+  # mean a pass never actually finishes before the next one is due). Raised to 90s.
+  replenishment_poll_seconds: 90
 
 broker:
   command_poll_seconds: 5

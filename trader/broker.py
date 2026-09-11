@@ -260,20 +260,64 @@ def process_pending_commands(ibc: IBClient, db_path, cfg) -> int:
     max_per_side = getattr(cfg.orders, "max_resting_per_side", 10)
     buffer_ticks = getattr(cfg.orders, "min_entry_buffer_ticks", 8)
 
+    # 2026-09-09 priority decision: real Geva signal (geva_manual) matters most, then
+    # decider's own critical-line-derived commands, everything else last. Processing
+    # order alone (not a separate cap) achieves this -- whatever capacity exists each
+    # cycle goes to the highest-priority commands first, so a flood of research_ce/
+    # random/algo_lab commands can no longer starve out the small, well-bounded set of
+    # real Geva lines just by arriving in front of them in the queue.
+    _SOURCE_PRIORITY = {"geva_manual": 0, "critical_line": 1}
+    pending = sorted(pending, key=lambda c: _SOURCE_PRIORITY.get(c["source"], 2))
+
     submitted = 0
     for cmd in pending:
         cid = cmd["id"]
 
-        # Gate 1: admission cap -- count already-resting exposure on this symbol/side
+        # Gate 0: GevaExtract's own automated submission pipeline is blocked from
+        # reaching the market at all (2026-09-09 decision) -- its output made no sense
+        # (2 real signal events fanned out into 1,410 chasing MARKET-order re-entries,
+        # ~99% losers). Geva's lines stay a valid signal source -- they now flow through
+        # this system's own decider.py (source='critical_line'/'geva_manual') instead of
+        # GevaExtract's separate insert-commands.py path executing unsupervised.
+        if cmd["source"] == "geva_extract":
+            with get_db(db_path) as con:
+                update_command_status(con, cid, "CANCELLED",
+                                       error_message="GevaExtract execution blocked (2026-09-09)")
+            continue
+
+        # Gate 1: admission cap -- count already-resting exposure on this symbol/side.
+        # A bracket order rests 3 legs at IB the moment it's SUBMITTED, not just once
+        # filled -- entry on its own direction, TP+SL on the OPPOSITE direction
+        # (confirmed live 2026-09-08: "orderId=8743 BUY LMT PreSubmitted" alongside
+        # "orderId=8742 SELL STP PreSubmitted" for the same still-unfilled command).
+        # Counting only same-direction entries (as this gate did until now) misses that
+        # every opposite-direction command already contributes 2 resting legs on THIS
+        # side -- undercounting real IB exposure by roughly 2x and letting IB's own
+        # 15-per-side cap get hit anyway despite this gate being in place.
+        # 2026-09-10: geva_manual's cap exemption was removed after it let real
+        # exposure quietly compound across multiple days (12 lines on 09-09 + 16 more on
+        # 09-10, all bypassing this gate) until IB's own hard per-side limit finally
+        # rejected new orders outright -- 45 resting legs per side found live, an actual
+        # incident, not a hypothetical. geva_manual still gets first crack at whatever
+        # capacity exists each cycle via the priority sort above, it's just no longer
+        # unbounded.
+        opposite = "SELL" if cmd["direction"] == "BUY" else "BUY"
         with get_db(db_path) as con:
-            resting = con.execute(
+            same_side_entries = con.execute(
                 "SELECT COUNT(*) FROM commands WHERE symbol=? AND direction=?"
                 " AND (status='SUBMITTED' OR (status='FILLED' AND needs_review=0))",
                 (cmd["symbol"], cmd["direction"])
             ).fetchone()[0]
+            opposite_side_legs = con.execute(
+                "SELECT COUNT(*) FROM commands WHERE symbol=? AND direction=?"
+                " AND (status='SUBMITTED' OR (status='FILLED' AND needs_review=0))",
+                (cmd["symbol"], opposite)
+            ).fetchone()[0]
+        resting = same_side_entries + opposite_side_legs * 2
         if resting >= max_per_side:
             log.warning(f"Command {cid} ({cmd['symbol']} {cmd['direction']}) held back — "
-                        f"{resting} already resting, at cap of {max_per_side}")
+                        f"~{resting} resting on that side (entries + opposite TP/SL legs), "
+                        f"at cap of {max_per_side}")
             continue
 
         # Claim lock — atomic status change to SUBMITTING
@@ -350,6 +394,22 @@ def process_pending_commands(ibc: IBClient, db_path, cfg) -> int:
             submitted += 1
 
         except Exception as e:
+            # A transient IB disconnect (e.g. a Gateway restart mid-session) must NOT
+            # permanently kill the command -- ERROR is terminal and nothing ever retries
+            # it, so a brief outage otherwise silently drops real signal forever (2026-07-03
+            # and 2026-09-10: 60 real geva_manual commands stuck in ERROR from one Gateway
+            # blip, never resubmitted). Leave it PENDING so the next poll cycle retries it
+            # once the connection is back, instead of writing any status at all here.
+            if "not connected" in str(e).lower():
+                log.warning(f"Command {cid} submission deferred (IB not connected): {e} "
+                            f"— resetting to PENDING for retry")
+                # The claim-lock above already wrote SUBMITTING; explicitly reset to
+                # PENDING here so the *next poll cycle* retries it, rather than leaving it
+                # stuck in SUBMITTING until broker.py's next full restart (its only other
+                # SUBMITTING->PENDING reset point is startup, see run_broker()).
+                with get_db(db_path) as con:
+                    update_command_status(con, cid, "PENDING")
+                continue
             log.error(f"Command {cid} submission failed: {e}")
             with get_db(db_path) as con:
                 update_command_status(con, cid, "ERROR", error_message=str(e))
@@ -1253,6 +1313,23 @@ def self_test() -> bool:
             reset_loggers()
 
             # 8. process_pending_commands admission gates (2026-09-09 fix)
+            #    8z. GevaExtract execution block: never submitted, regardless of anything else
+            with get_db(db_path) as con:
+                con.execute("""
+                    INSERT INTO commands
+                        (symbol, line_price, line_type, line_strength, source,
+                         direction, entry_type, entry_price, tp_price, sl_price, bracket_size)
+                    VALUES ('MES', 6500.0, 'SUPPORT', 2, 'geva_extract',
+                            'BUY', 'LMT', 6500.0, 6502.0, 6498.0, 2.0)
+                """)
+                id_geva_blocked = con.execute("SELECT last_insert_rowid()").fetchone()[0]
+            process_pending_commands(_FakeIBClient(price=6500.0), db_path, cfg)
+            with get_db(db_path) as con:
+                r_geva = con.execute("SELECT status, error_message FROM commands WHERE id=?",
+                                      (id_geva_blocked,)).fetchone()
+            assert r_geva["status"] == "CANCELLED", f"geva_extract should be blocked, not submitted: {r_geva['status']}"
+            assert "blocked" in (r_geva["error_message"] or ""), "expected a blocked-reason message"
+
             #    8a. stale STP: price already through trigger -> CANCELLED, not submitted
             with get_db(db_path) as con:
                 cur = con.execute("""
@@ -1306,6 +1383,84 @@ def self_test() -> bool:
                 s = con.execute("SELECT status FROM commands WHERE id=?",
                                  (id_capped,)).fetchone()["status"]
             assert s == "PENDING", f"command past admission cap should stay PENDING: {s}"
+
+            #    8d. opposite-side TP/SL legs count too: 6 resting SELL commands (12
+            #    opposite-side legs on BUY) already exceed a cap of 10 -> new BUY held back
+            #    even though same-side BUY entry count is 0
+            for _ in range(6):
+                _insert_cmd(symbol='M2K', direction='SELL', status='SUBMITTED', needs_review=0)
+            with get_db(db_path) as con:
+                con.execute("""
+                    INSERT INTO commands
+                        (symbol, line_price, line_type, line_strength,
+                         direction, entry_type, entry_price, tp_price, sl_price, bracket_size)
+                    VALUES ('M2K', 2000.0, 'SUPPORT', 2, 'BUY', 'LMT', 2000.0, 2010.0, 1990.0, 10.0)
+                """)
+                id_opposite = con.execute("SELECT last_insert_rowid()").fetchone()[0]
+            process_pending_commands(_FakeIBClient(price=2000.0), db_path, cfg)
+            with get_db(db_path) as con:
+                s = con.execute("SELECT status FROM commands WHERE id=?", (id_opposite,)).fetchone()["status"]
+            assert s == "PENDING", f"opposite-side TP/SL legs should count toward the cap: {s}"
+
+            #    8e. geva_manual is no longer exempt from the cap (2026-09-10 reversal --
+            #    the exemption let real exposure quietly compound across days until IB's
+            #    own hard limit rejected orders outright, a real incident). It still gets
+            #    first crack at whatever capacity exists via the priority sort, but once
+            #    the cap is genuinely full it holds back like everything else.
+            for _ in range(cap):
+                _insert_cmd(symbol='MYM', direction='BUY', status='SUBMITTED', needs_review=0)
+            with get_db(db_path) as con:
+                con.execute("""
+                    INSERT INTO commands
+                        (symbol, line_price, line_type, line_strength, source,
+                         direction, entry_type, entry_price, tp_price, sl_price, bracket_size)
+                    VALUES ('MYM', 40000.0, 'SUPPORT', 2, 'geva_manual',
+                            'BUY', 'LMT', 40000.0, 40010.0, 39990.0, 10.0)
+                """)
+                id_geva_capped = con.execute("SELECT last_insert_rowid()").fetchone()[0]
+            process_pending_commands(_FakeIBClient(price=39980.0), db_path, cfg)
+            with get_db(db_path) as con:
+                s = con.execute("SELECT status FROM commands WHERE id=?", (id_geva_capped,)).fetchone()["status"]
+            assert s == "PENDING", \
+                f"geva_manual must respect the admission cap like everything else now: {s}"
+
+            #    8e2. ...but geva_manual still gets priority when capacity DOES exist: a
+            #    geva_manual command queued behind a pile of lower-priority ones for a
+            #    symbol/side with room must still get processed (not starved by queue order).
+            for _ in range(3):
+                _insert_cmd(symbol='GS', direction='BUY', status='SUBMITTED', needs_review=0,
+                            source='research_ce')
+            with get_db(db_path) as con:
+                con.execute("""
+                    INSERT INTO commands
+                        (symbol, line_price, line_type, line_strength, source,
+                         direction, entry_type, entry_price, tp_price, sl_price, bracket_size)
+                    VALUES ('GS', 500.0, 'SUPPORT', 2, 'geva_manual',
+                            'BUY', 'LMT', 500.0, 502.0, 498.0, 2.0)
+                """)
+                id_geva_priority = con.execute("SELECT last_insert_rowid()").fetchone()[0]
+            process_pending_commands(_FakeIBClient(price=499.9), db_path, cfg)
+            with get_db(db_path) as con:
+                s = con.execute("SELECT status FROM commands WHERE id=?", (id_geva_priority,)).fetchone()["status"]
+            assert s != "PENDING", \
+                f"geva_manual should still get priority when the cap has room: {s}"
+
+            #    8f. transient IB disconnect during submission must NOT permanently kill the
+            #    command (2026-07-03 and 2026-09-10: a Gateway blip left 60 real commands
+            #    stuck in ERROR forever, since nothing ever retries ERROR). It must stay
+            #    PENDING so the next poll cycle retries once the connection is back.
+            id_not_conn = _insert_cmd(symbol='AAPL', status='PENDING', needs_review=0,
+                                       entry_price=190.0, tp_price=192.0, sl_price=188.0)
+            not_conn_ibc = _FakeIBClient(price=189.5)
+            not_conn_ibc.paper.bracketOrder = lambda *a, **kw: (_ for _ in ()).throw(
+                Exception("Not connected"))
+            process_pending_commands(not_conn_ibc, db_path, cfg)
+            with get_db(db_path) as con:
+                r_not_conn = con.execute(
+                    "SELECT status, error_message FROM commands WHERE id=?",
+                    (id_not_conn,)).fetchone()
+            assert r_not_conn["status"] == "PENDING", \
+                f"a transient 'Not connected' failure must leave the command PENDING for retry, not {r_not_conn['status']}"
 
         print("[self-test] broker: PASS")
         return True

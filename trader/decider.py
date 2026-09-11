@@ -33,12 +33,18 @@ import sys; sys.path.insert(0, str(_ROOT)) if str(_ROOT) not in sys.path else No
 
 from lib.config_loader import get_config
 from lib.logger import get_logger
-from lib.db import get_db, init_db, get_filled_commands, get_system_state, set_system_state
+from lib.db import get_db, init_db, get_filled_commands, get_system_state, set_system_state, update_command_status
 from lib.order_builder import determine_entry_type, calc_bracket_prices, round_tick, get_tick_size
 from lib.critical_lines import get_armed_lines
-from lib.session_clock import is_entry_cutoff, is_forced_exit_time, is_before_open, seconds_until_open
+from lib.session_clock import (is_entry_cutoff, is_forced_exit_time, is_before_open,
+                                seconds_until_open, is_before_trading_start,
+                                seconds_until_trading_start)
 
 log = get_logger("decider")
+
+# Control-group sources fan out to fewer brackets than real/treatment lines --
+# see generate_commands()'s brackets_control.
+_CONTROL_SOURCES = {"geva_manual_control", "research_random", "research_random_stock"}
 
 
 def _now_utc() -> str:
@@ -85,7 +91,11 @@ def generate_commands(symbol: str, date_str: str, current_price: float,
 
     tick   = get_tick_size(symbol)
     qty    = cfg.orders.quantity
-    brackets = cfg.orders.active_brackets
+    brackets_real = cfg.orders.active_brackets
+    # 2026-09-10: control-group lines fan out to 1 bracket size instead of all of them --
+    # the real-vs-control comparison holds at the line level, this just cuts control's
+    # order volume to a third with no loss of what's being tested (user decision).
+    brackets_control = getattr(cfg.orders, "control_active_brackets", None) or brackets_real[:1]
 
     with get_db(db_path) as con:
         lines = get_armed_lines(con, symbol, date_str)
@@ -117,6 +127,12 @@ def generate_commands(symbol: str, date_str: str, current_price: float,
         line_price  = line["price"]
         line_type   = line["line_type"]
         strength    = line["strength"]
+        # Propagate the line's own source (e.g. geva_manual, geva_manual_control,
+        # research_ce, research_random) into the commands it generates, instead of
+        # flattening everything to 'critical_line' -- otherwise real-signal and
+        # control-group trades become indistinguishable downstream (2026-09-09).
+        line_source = line["source"] or "critical_line"
+        brackets = brackets_control if line_source in _CONTROL_SOURCES else brackets_real
 
         for bracket_size in brackets:
             for direction in ("BUY", "SELL"):
@@ -135,12 +151,12 @@ def generate_commands(symbol: str, date_str: str, current_price: float,
                              direction, entry_type, entry_price, tp_price, sl_price,
                              bracket_size, source, critical_line_id, quantity,
                              logical_trade_id, status)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'critical_line', ?, ?, ?, 'PENDING')
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')
                     """, (
                         symbol, line_price, line_type, strength,
                         direction, entry_type,
                         prices["entry_price"], prices["tp_price"], prices["sl_price"],
-                        bracket_size, line["id"], qty, logical_trade_id
+                        bracket_size, line_source, line["id"], qty, logical_trade_id
                     ))
                 count += 1
                 log.debug(
@@ -222,12 +238,12 @@ def replenish(symbol: str, date_str: str, current_price: float,
                     (symbol, line_price, line_type, line_strength,
                      direction, entry_type, entry_price, tp_price, sl_price,
                      bracket_size, source, quantity, logical_trade_id, status)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'critical_line', ?, ?, 'PENDING')
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')
             """, (
                 cmd["symbol"], cmd["line_price"], cmd["line_type"], cmd["line_strength"],
                 cmd["direction"], entry_type,
                 prices["entry_price"], prices["tp_price"], prices["sl_price"],
-                cmd["bracket_size"], qty, cmd["logical_trade_id"]
+                cmd["bracket_size"], cmd["source"] or "critical_line", qty, cmd["logical_trade_id"]
             ))
 
         log.info(
@@ -242,8 +258,8 @@ def replenish(symbol: str, date_str: str, current_price: float,
 
 def force_close_symbol(symbol: str, db_path, ibc) -> int:
     """
-    Force-flatten every open (FILLED) position for THIS symbol only, at market --
-    called once a symbol enters its own 5-minute forced-exit window (session_clock.py).
+    Force-flatten THIS symbol only, at market -- called once a symbol enters its own
+    5-minute forced-exit window (session_clock.py).
 
     Deliberately NOT reqGlobalCancel() (unlike daily_paper_session.py's force_close_all,
     which is fine to nuke every open order account-wide since it only ever runs at the
@@ -251,10 +267,19 @@ def force_close_symbol(symbol: str, db_path, ibc) -> int:
     different asset classes closing at different times, an account-wide cancel here
     would also kill other symbols' still-active resting orders. Cancels only THIS
     symbol's own TP/SL legs before market-exiting -- same per-command mechanics as
-    force_close_all, just symbol-scoped instead of account-wide. Safe to call every
-    poll cycle: once a command's MKT exit fills and broker.py's normal fill-handling
-    moves it off FILLED, it simply stops showing up here -- no separate "already
-    triggered" flag needed.
+    force_close_all, just symbol-scoped instead of account-wide.
+
+    2026-09-10: rewritten after a live incident exposed two bugs in the original,
+    per-command version: (1) it fired one naked MarketOrder per FILLED command every
+    poll cycle, with nothing tying that order back to the command row -- broker.py's own
+    fill-reconciliation only matches fills against a command's ib_tp_order_id/
+    ib_sl_order_id, so these orders were invisible to it and commands stayed FILLED
+    forever, meaning (2) the SAME commands got re-flattened on every single poll,
+    forever -- normally harmless, but with two decider processes briefly running at once
+    (a separate bug) this produced 124 duplicate stray MKT orders in under 3 minutes.
+    Now: sizes exactly ONE order off the real net IB position (immune to double-counting
+    stacked/partially-filled commands) and marks every FILLED command CLOSED as soon as
+    the flatten is issued, so a repeat call the very next poll finds nothing left to do.
     """
     from ib_insync import MarketOrder, Order
 
@@ -265,25 +290,54 @@ def force_close_symbol(symbol: str, db_path, ibc) -> int:
     if not filled:
         return 0
 
-    closed = 0
+    if ibc.paper is None:
+        # 2026-09-10: this exact gap (decider connected live-only, ibc.paper always None)
+        # silently broke forced EOD flattening for at least 2 days -- each attempt logged
+        # a per-command AttributeError and moved on, easy to miss in the noise. Fail loud
+        # and up front instead so it can never again quietly do nothing for every symbol.
+        log.error(f"[forced_eod] {symbol}: ibc.paper is None -- cannot force-flatten "
+                   f"{len(filled)} position(s); decider's paper connection is down")
+        return 0
+
     for cmd in filled:
+        for oid in (cmd["ib_tp_order_id"], cmd["ib_sl_order_id"]):
+            if oid:
+                try:
+                    o = Order(); o.orderId = oid
+                    ibc.paper.cancelOrder(o)
+                except Exception:
+                    pass
+
+    contract = ibc.get_contract(symbol)
+    net = 0.0
+    try:
+        for p in ibc.get_positions():
+            if p.contract.symbol == symbol:
+                net += p.position
+    except Exception as e:
+        log.error(f"[forced_eod] {symbol}: could not read live position, "
+                   f"skipping this poll: {e}")
+        return 0
+
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    if net != 0:
         try:
-            contract = ibc.get_contract(symbol)
-            exit_action = "SELL" if cmd["direction"] == "BUY" else "BUY"
-            for oid in (cmd["ib_tp_order_id"], cmd["ib_sl_order_id"]):
-                if oid:
-                    try:
-                        o = Order(); o.orderId = oid
-                        ibc.paper.cancelOrder(o)
-                    except Exception:
-                        pass
-            mkt = MarketOrder(exit_action, cmd["quantity"])
+            action = "SELL" if net > 0 else "BUY"
+            mkt = MarketOrder(action, abs(net))
             ibc.paper.placeOrder(contract, mkt)
-            log.info(f"[forced_eod] MKT exit placed for cmd {cmd['id']} ({exit_action} {symbol})")
-            closed += 1
+            log.info(f"[forced_eod] MKT exit placed for {symbol}: {action} {abs(net)}")
         except Exception as e:
-            log.error(f"[forced_eod] MKT exit failed for cmd {cmd['id']}: {e}")
-    return closed
+            log.error(f"[forced_eod] {symbol}: MKT exit failed, leaving commands FILLED "
+                       f"for retry next poll: {e}")
+            return 0
+
+    with get_db(db_path) as con:
+        for cmd in filled:
+            update_command_status(con, cmd["id"], "CLOSED",
+                                  exit_time=now, exit_reason="FORCED_EOD")
+    log.info(f"[forced_eod] {symbol}: force-flattened {len(filled)} command(s) "
+             f"(net position was {net})")
+    return len(filled)
 
 
 def run_session_start(ibc, cfg, db_path, date_str: str = None):
@@ -298,11 +352,17 @@ def run_session_start(ibc, cfg, db_path, date_str: str = None):
     # pre-market prices are thin/unreliable and would seed brackets off a bad reference
     # price. All symbols in this system open at the same UTC instant (8:30 CT futures ==
     # 9:30 ET stocks), so waiting on the whole list together is correct, not just per-symbol.
-    wait_s = max((seconds_until_open(s) for s in cfg.symbols), default=0)
+    #
+    # 2026-09-10: on top of the open itself, trading intentionally starts
+    # `trading_start_delay_minutes` after the open (30 min -> 17:00 IL, not the 16:30 IL
+    # open) -- explicit user decision until pre-market trading is added; 0 restores the
+    # old at-the-open behavior.
+    delay_min = getattr(cfg.session, "trading_start_delay_minutes", 0)
+    wait_s = max((seconds_until_trading_start(s, delay_minutes=delay_min) for s in cfg.symbols), default=0)
     if wait_s > 0:
-        log.info(f"Market not open yet -- waiting {wait_s:.0f}s for regular session open")
-        while any(is_before_open(s) for s in cfg.symbols):
-            time.sleep(min(30, max(1, seconds_until_open(cfg.symbols[0]))))
+        log.info(f"Not trading yet -- waiting {wait_s:.0f}s (open + {delay_min}min delay)")
+        while any(is_before_trading_start(s, delay_minutes=delay_min) for s in cfg.symbols):
+            time.sleep(min(30, max(1, seconds_until_trading_start(cfg.symbols[0], delay_minutes=delay_min))))
 
     for symbol in cfg.symbols:
         # Lines come from DB (entered via /lines GUI) — just count them
@@ -341,11 +401,14 @@ def run_replenishment_loop(ibc, cfg, db_path, date_str: str = None):
             log.info("SESSION=SHUTDOWN — replenishment loop exiting")
             break
 
-        # Reconnect if IB went down (e.g. IBC watchdog restart)
-        if ibc and not ibc.is_live_connected():
-            log.warning("LIVE connection lost — attempting reconnect")
+        # Reconnect if IB went down (e.g. IBC watchdog restart). Checks PAPER too now --
+        # decider holds a paper connection solely for force_close_symbol()'s MKT exits,
+        # and that side dropping silently would reproduce the exact "ibc.paper is None"
+        # bug this paper=True wiring was added to fix.
+        if ibc and (not ibc.is_live_connected() or not ibc.is_paper_connected()):
+            log.warning("IB connection lost — attempting reconnect")
             try:
-                ok = ibc.reconnect(live=True, paper=False, max_attempts=3)
+                ok = ibc.reconnect(live=True, paper=True, max_attempts=3)
                 if ok:
                     log.info("Reconnected to LIVE")
                 else:
@@ -359,10 +422,7 @@ def run_replenishment_loop(ibc, cfg, db_path, date_str: str = None):
 
         for symbol in cfg.symbols:
             if is_forced_exit_time(symbol):
-                n_closed = force_close_symbol(symbol, db_path, ibc)
-                if n_closed:
-                    log.info(f"[forced_eod] {symbol}: force-flattened {n_closed} position(s) "
-                             f"(within 5 min of close)")
+                force_close_symbol(symbol, db_path, ibc)  # logs its own outcome
                 continue  # no replenishment once a symbol is being forced flat
 
             price = get_current_price(symbol, ibc)
@@ -458,6 +518,26 @@ def self_test() -> bool:
             assert total_after == expected, \
                 f"Dedup guard failed -- expected {expected} total commands, got {total_after}"
 
+            # 1d. Control-group lines fan out to control_active_brackets (1 bracket),
+            # not active_brackets (3) -- cuts control volume without touching real lines.
+            with get_db(db_path) as con:
+                con.execute(
+                    "INSERT INTO critical_lines (symbol, date, line_type, price, strength, armed, source)"
+                    " VALUES ('MES', ?, 'SUPPORT', 6480.00, 1, 1, 'geva_manual_control')",
+                    (today,)
+                )
+            n_control = generate_commands("MES", today, current_price, cfg, db_path)
+            control_brackets = getattr(cfg.orders, "control_active_brackets", None) or brackets[:1]
+            expected_control = len(control_brackets) * 2  # 1 line * N control brackets * 2 directions
+            assert n_control == expected_control, \
+                f"Expected {expected_control} control commands, got {n_control}"
+            with get_db(db_path) as con:
+                control_rows = con.execute(
+                    "SELECT bracket_size FROM commands WHERE source='geva_manual_control'"
+                ).fetchall()
+            assert {r["bracket_size"] for r in control_rows} == set(control_brackets), \
+                f"Control commands used wrong brackets: {sorted({r['bracket_size'] for r in control_rows})}"
+
             # 2. Replenishment test
             # Mark one command as FILLED
             cmd_id = rows[0]["id"]
@@ -517,16 +597,23 @@ def self_test() -> bool:
             n_normal = generate_commands("MES", "2026-04-07", 6500.0, cfg, db_path2)
             assert n_normal > 0, "must generate normally once the cutoff lambda is lifted"
 
-        # 5. force_close_symbol: MKT-exits every FILLED command for the given symbol,
-        # leaves other symbols alone, and is a no-op with nothing open.
+        # 5. force_close_symbol: sizes ONE MKT exit off the real net IB position, marks
+        # every FILLED command CLOSED so a repeat call is a no-op, and leaves other
+        # symbols alone. 2026-09-10 rewrite -- see the function's own docstring for why
+        # (a live incident: the old per-command design re-fired an exit every poll
+        # forever since nothing ever moved commands off FILLED).
+        class _FakePos:
+            def __init__(self, symbol, qty): self.contract = type("C", (), {"symbol": symbol}); self.position = qty
+
         class _FakePaper:
             def __init__(self): self.orders_placed = []; self.cancels = []
             def placeOrder(self, contract, order): self.orders_placed.append((contract, order))
             def cancelOrder(self, order): self.cancels.append(order)
 
         class _FakeIBC:
-            def __init__(self): self.paper = _FakePaper()
+            def __init__(self, positions): self.paper = _FakePaper(); self._positions = positions
             def get_contract(self, symbol): return symbol  # identity stand-in
+            def get_positions(self): return self._positions
 
         with tempfile.TemporaryDirectory() as tmp3:
             db_path3 = Path(tmp3) / "test3.db"
@@ -546,16 +633,73 @@ def self_test() -> bool:
                     " ('AAPL', 220, 'SUPPORT', 2, 'BUY', 'LMT', 220, 222, 218, 4,"
                     " 'critical_line', 1, 'lt2', 'FILLED')"
                 )
-            fake_ibc = _FakeIBC()
+            fake_ibc = _FakeIBC([_FakePos("MES", 1), _FakePos("AAPL", 1)])
             n_closed = force_close_symbol("MES", db_path3, fake_ibc)
-            assert n_closed == 1, f"expected exactly 1 MES position force-closed, got {n_closed}"
+            assert n_closed == 1, f"expected exactly 1 MES command closed, got {n_closed}"
             assert len(fake_ibc.paper.orders_placed) == 1
             _, order = fake_ibc.paper.orders_placed[0]
-            assert order.action == "SELL", "MES BUY position must be flattened with a SELL"
+            assert order.action == "SELL", "net long MES position must be flattened with a SELL"
+            assert order.totalQuantity == 1
+            with get_db(db_path3) as con:
+                row = con.execute("SELECT status, exit_reason FROM commands WHERE logical_trade_id='lt1'").fetchone()
+                assert row["status"] == "CLOSED" and row["exit_reason"] == "FORCED_EOD"
+                aapl_row = con.execute("SELECT status FROM commands WHERE logical_trade_id='lt2'").fetchone()
+                assert aapl_row["status"] == "FILLED", "AAPL must be untouched by an MES-scoped call"
+
+            # 5b. Repeat call: the command is already CLOSED, so this must be a clean
+            # no-op and must NOT place a second exit order -- this is the exact
+            # idempotency gap that let two decider processes fire 124 duplicate MKT
+            # orders for the same stale FILLED rows in the live incident.
+            n_repeat = force_close_symbol("MES", db_path3, fake_ibc)
+            assert n_repeat == 0, "already-closed MES must not be re-flattened"
+            assert len(fake_ibc.paper.orders_placed) == 1, "must not place a duplicate exit order"
 
             n_noop = force_close_symbol("MYM", db_path3, fake_ibc)
             assert n_noop == 0, "no open MYM positions -- must be a no-op"
-            assert len(fake_ibc.paper.orders_placed) == 1, "AAPL's position must be untouched by an MES-scoped call"
+
+            # 5c. Net IB position is already flat (e.g. stacked BUY+SELL commands
+            # cancelled out) -- must still close the stale FILLED rows, but must NOT
+            # place a pointless zero-quantity market order.
+            with get_db(db_path3) as con:
+                con.execute(
+                    "INSERT INTO commands (symbol, line_price, line_type, line_strength, direction,"
+                    " entry_type, entry_price, tp_price, sl_price, bracket_size, source,"
+                    " quantity, logical_trade_id, status) VALUES"
+                    " ('QCOM', 180, 'SUPPORT', 2, 'BUY', 'LMT', 180, 182, 178, 4,"
+                    " 'critical_line', 1, 'lt3', 'FILLED')"
+                )
+            flat_ibc = _FakeIBC([_FakePos("QCOM", 0)])
+            n_flat = force_close_symbol("QCOM", db_path3, flat_ibc)
+            assert n_flat == 1, "stale FILLED row must still be closed even if IB is already flat"
+            assert len(flat_ibc.paper.orders_placed) == 0, "must not place an order when net position is 0"
+
+            # 5d. ibc.paper is None (the real 2026-09-10 production bug: decider connected
+            # live-only) must fail loud with 0 closed, never a bare AttributeError.
+            with get_db(db_path3) as con:
+                con.execute(
+                    "INSERT INTO commands (symbol, line_price, line_type, line_strength, direction,"
+                    " entry_type, entry_price, tp_price, sl_price, bracket_size, source,"
+                    " quantity, logical_trade_id, status) VALUES"
+                    " ('XOM', 164, 'SUPPORT', 2, 'BUY', 'LMT', 164, 166, 162, 4,"
+                    " 'critical_line', 1, 'lt4', 'FILLED')"
+                )
+            class _FakeIBCNoPaper:
+                paper = None
+                def get_contract(self, symbol): return symbol
+            n_none = force_close_symbol("XOM", db_path3, _FakeIBCNoPaper())
+            assert n_none == 0, "ibc.paper is None must be a clean no-op, not a crash"
+            with get_db(db_path3) as con:
+                row = con.execute("SELECT status FROM commands WHERE logical_trade_id='lt4'").fetchone()
+                assert row["status"] == "FILLED", "must stay FILLED for retry, not silently closed"
+
+        # 5c. Regression guard: decider's own __main__ must connect with paper=True.
+        # This exact line (paper=False, "decider only needs LIVE for price") is what
+        # broke force_close_symbol's MKT exits for at least 2 days before being caught by
+        # a live trade review -- nothing above exercises the REAL wiring, only fakes, so
+        # this checks the actual source line directly.
+        _this_source = Path(__file__).read_text()
+        assert "ibc.connect(live=True, paper=True)" in _this_source, \
+            "decider.py's __main__ must connect paper=True -- force_close_symbol needs ibc.paper"
 
         print("[self-test] decider: PASS")
         return True
@@ -592,7 +736,16 @@ if __name__ == "__main__":
 
     from lib.ib_client import IBClient
     ibc = IBClient(cfg)
-    ibc.connect(live=True, paper=False)  # Decider only needs LIVE for price
+    # 2026-09-10: paper=True too, not just live -- force_close_symbol() (the 5-minute
+    # forced-flatten-at-close safety net) calls ibc.paper.placeOrder()/cancelOrder()
+    # directly from THIS process's replenishment loop. With paper=False, ibc.paper is
+    # None and every force-close attempt has been silently crashing with
+    # "'NoneType' object has no attribute 'placeOrder'" since the feature was added --
+    # confirmed live in decider's own logs on both 2026-09-09 and 2026-09-10, meaning no
+    # stock position has ever actually been force-flattened at close. The self-test for
+    # force_close_symbol used a fake ibc.paper that was always populated, which is
+    # exactly why it never caught this.
+    ibc.connect(live=True, paper=True)
 
     if args.mode == "session":
         run_session_start(ibc, cfg, db_path)
