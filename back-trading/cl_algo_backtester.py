@@ -251,7 +251,21 @@ def run(db_path: Path, history_dir: Path,
         ).fetchall()
         for r in rows:
             key = (r["symbol"], r["date"])
-            lines_cache.setdefault(key, []).append(dict(r))
+            line = dict(r)
+            # Extract which line-detection rule armed this line (Algo 1-5's WINNING_REASONS
+            # etc.), if any -- from critical_lines.note's JSON (see prep_research_lines.py's
+            # insert_pairs()). Most lines (manual/Geva/auto-detector) have no reason tag.
+            line["_detect_reason"] = None
+            line["_detect_kind"]   = None
+            note = line.get("note")
+            if note:
+                try:
+                    note_d = json.loads(note)
+                    line["_detect_reason"] = note_d.get("reason")
+                    line["_detect_kind"]   = note_d.get("kind")
+                except (ValueError, TypeError):
+                    pass
+            lines_cache.setdefault(key, []).append(line)
 
     # CSV cache: (symbol, date) → (trades_df, bidask_df)
     csv_cache: dict[tuple, tuple] = {}
@@ -346,7 +360,8 @@ def run(db_path: Path, history_dir: Path,
                                           line["price"], line["line_type"], line["strength"],
                                           cmd["direction"], cmd["entry_type"],
                                           cmd["entry_price"], cmd["tp_price"], cmd["sl_price"],
-                                          None, None, "EXPIRED", None, None, None, split))
+                                          None, None, "EXPIRED", None, None, None, split,
+                                          line["_detect_reason"], line["_detect_kind"]))
                         continue
 
                     # TP/SL relative to actual fill price (matters for STP where fill includes slippage)
@@ -382,7 +397,8 @@ def run(db_path: Path, history_dir: Path,
                                           cmd["direction"], cmd["entry_type"],
                                           cmd["entry_price"], cmd["tp_price"], cmd["sl_price"],
                                           fill_p, fill_t.isoformat(),
-                                          exit_r, exit_fp, pnl, ticks_ex, split))
+                                          exit_r, exit_fp, pnl, ticks_ex, split,
+                                          line["_detect_reason"], line["_detect_kind"]))
                     except Exception:
                         errors += 1
                         batch_all.append((date_str, sym, at, tp, sl_t, df_filt, sm,
@@ -390,7 +406,8 @@ def run(db_path: Path, history_dir: Path,
                                           cmd["direction"], cmd["entry_type"],
                                           cmd["entry_price"], cmd["tp_price"], cmd["sl_price"],
                                           fill_p, fill_t.isoformat(),
-                                          "ERROR", None, None, None, split))
+                                          "ERROR", None, None, None, split,
+                                          line["_detect_reason"], line["_detect_kind"]))
 
         # Flush entire day's batch at once (one DB write per day)
         if batch_all:
@@ -404,8 +421,8 @@ def run(db_path: Path, history_dir: Path,
                          entry_price, tp_price, sl_price,
                          entry_fill_price, entry_fill_time,
                          exit_reason, exit_fill_price, pnl_ticks, ticks_to_exit,
-                         split)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                         split, line_detect_reason, line_detect_kind)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """, batch_all)
             written += len(batch_all)
             if verbose:

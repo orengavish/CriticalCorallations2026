@@ -252,6 +252,13 @@ CREATE TABLE IF NOT EXISTS cl_algo_sim_results (
     ticks_to_exit       INTEGER,
     split               TEXT,               -- train|validation|out_of_sample (nullable: rows
                                               -- written before this column existed have NULL)
+    line_detect_reason  TEXT,               -- e.g. 'PREVIOUS_DAY_LOW' -- which rule armed this
+                                              -- line (which "Algo N" in the dashboard's bucket
+                                              -- labeling), copied from critical_lines.note at
+                                              -- backtest time. NULL for untagged lines.
+    line_detect_kind    TEXT,               -- 'real' | 'random_control', same source -- lets
+                                              -- reason-level scoring compare against its own
+                                              -- matched control, not just raw PnL.
     created_at          TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
     UNIQUE(date, symbol, algo_type, tp_ticks, sl_ticks,
            direction_filter, strength_max, line_price, direction)
@@ -279,7 +286,37 @@ CREATE TABLE IF NOT EXISTS cl_algo_combo_scores (
     composite_score     REAL,
     rank                INTEGER,
     data_status         TEXT    NOT NULL DEFAULT 'ok',
+    mc_pvalue           REAL,   -- Monte-Carlo permutation p-value (lower = more likely real edge)
+    loocv_ratio         REAL,   -- leave-one-out mean / full-sample mean (near 1.0 = stable)
     UNIQUE(scored_at, symbol, algo_type, tp_ticks, sl_ticks, direction_filter, strength_max)
+);
+
+-- Which line-detection RULE to trust (Algo 1-5, PREVIOUS_DAY_LOW etc.) -- a different
+-- question from cl_algo_combo_scores' entry-style/bracket-geometry ranking above. Pools
+-- across every entry-style/bracket combo already simulated for a given reason, for the
+-- statistical power a single reason's own trade count can't offer split further.
+CREATE TABLE IF NOT EXISTS cl_algo_reason_scores (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    scored_at           TEXT    NOT NULL,
+    symbol              TEXT    NOT NULL,
+    line_detect_reason  TEXT    NOT NULL,
+    line_detect_kind    TEXT    NOT NULL,   -- 'real' | 'random_control'
+    n_sims              INTEGER NOT NULL DEFAULT 0,
+    n_fills             INTEGER NOT NULL DEFAULT 0,
+    n_tp                INTEGER NOT NULL DEFAULT 0,
+    n_sl                INTEGER NOT NULL DEFAULT 0,
+    n_expired_exit      INTEGER NOT NULL DEFAULT 0,
+    win_rate            REAL,
+    profit_factor       REAL,
+    expectancy          REAL,
+    sharpe              REAL,
+    sqn                 REAL,
+    composite_score     REAL,
+    rank                INTEGER,
+    data_status         TEXT    NOT NULL DEFAULT 'ok',
+    mc_pvalue           REAL,
+    loocv_ratio         REAL,
+    UNIQUE(scored_at, symbol, line_detect_reason, line_detect_kind)
 );
 
 CREATE TABLE IF NOT EXISTS cl_algo_score_history (
@@ -539,6 +576,16 @@ def _migrate(path: Path = None):
         # (those pre-date bug 6/7/8 fixes anyway and are already known-invalid).
         "ALTER TABLE cl_algo_sim_results ADD COLUMN split TEXT",
         "ALTER TABLE cl_algo_fd_results ADD COLUMN split TEXT",
+        # anti-overfit guards (comparison-engine build): Monte-Carlo permutation p-value
+        # and leave-one-out CV ratio, alongside the existing stability-neighbor check --
+        # nullable, additive-only, NULL for scores written before these existed.
+        "ALTER TABLE cl_algo_combo_scores ADD COLUMN mc_pvalue REAL",
+        "ALTER TABLE cl_algo_combo_scores ADD COLUMN loocv_ratio REAL",
+        # comparison-engine build, part 2: which line-detection rule (Algo 1-5's WINNING_REASONS,
+        # or any other tagged source) armed the line a sim result traded -- nullable,
+        # additive-only, NULL for every row simulated before this existed.
+        "ALTER TABLE cl_algo_sim_results ADD COLUMN line_detect_reason TEXT",
+        "ALTER TABLE cl_algo_sim_results ADD COLUMN line_detect_kind TEXT",
         # Idempotent CREATE IF NOT EXISTS for tables added after initial schema
         """CREATE TABLE IF NOT EXISTS price_cache (
             symbol       TEXT PRIMARY KEY,
@@ -572,7 +619,7 @@ def _migrate(path: Path = None):
             entry_price REAL NOT NULL, tp_price REAL NOT NULL, sl_price REAL NOT NULL,
             entry_fill_price REAL, entry_fill_time TEXT,
             exit_reason TEXT, exit_fill_price REAL, pnl_ticks REAL, ticks_to_exit INTEGER,
-            split TEXT,
+            split TEXT, line_detect_reason TEXT, line_detect_kind TEXT,
             created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
             UNIQUE(date,symbol,algo_type,tp_ticks,sl_ticks,direction_filter,strength_max,line_price,direction)
         )""",
@@ -586,7 +633,20 @@ def _migrate(path: Path = None):
             n_expired_exit INTEGER NOT NULL DEFAULT 0,
             win_rate REAL, profit_factor REAL, expectancy REAL, sharpe REAL, sqn REAL,
             composite_score REAL, rank INTEGER, data_status TEXT NOT NULL DEFAULT 'ok',
+            mc_pvalue REAL, loocv_ratio REAL,
             UNIQUE(scored_at,symbol,algo_type,tp_ticks,sl_ticks,direction_filter,strength_max)
+        )""",
+        """CREATE TABLE IF NOT EXISTS cl_algo_reason_scores (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            scored_at TEXT NOT NULL, symbol TEXT NOT NULL,
+            line_detect_reason TEXT NOT NULL, line_detect_kind TEXT NOT NULL,
+            n_sims INTEGER NOT NULL DEFAULT 0, n_fills INTEGER NOT NULL DEFAULT 0,
+            n_tp INTEGER NOT NULL DEFAULT 0, n_sl INTEGER NOT NULL DEFAULT 0,
+            n_expired_exit INTEGER NOT NULL DEFAULT 0,
+            win_rate REAL, profit_factor REAL, expectancy REAL, sharpe REAL, sqn REAL,
+            composite_score REAL, rank INTEGER, data_status TEXT NOT NULL DEFAULT 'ok',
+            mc_pvalue REAL, loocv_ratio REAL,
+            UNIQUE(scored_at,symbol,line_detect_reason,line_detect_kind)
         )""",
         """CREATE TABLE IF NOT EXISTS cl_algo_score_history (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1030,6 +1090,7 @@ def self_test() -> bool:
             expected = {"commands", "positions", "ib_events", "system_state",
                         "critical_lines", "release_notes", "fetch_log", "completed_trades",
                         "cl_algo_sim_results", "cl_algo_combo_scores",
+                        "cl_algo_reason_scores",
                         "cl_algo_score_history", "cl_algo_learner_runs",
                         "cl_algo_day_params", "cl_algo_fd_results",
                         "price_profile"}

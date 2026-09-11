@@ -1987,6 +1987,67 @@ def api_algo_lab_pnl():
     return jsonify({"summary": summary, "breakdown": breakdown})
 
 
+@app.route("/api/algo-compare")
+def api_algo_compare():
+    """
+    Comparison engine, read-only: the latest cl_algo_reason_scores (which line-
+    detection rule -- Algo 1-5 -- backtests best against its own matched control)
+    and cl_algo_combo_scores (which entry-style/bracket combo) rows, plus the latest
+    learner convergence status and today's live research_ce/research_random trades
+    for context. Does NOT trigger a new scoring run -- that's run_cl_algo_pipeline.py's
+    job (cron/manual); this just reads whatever it last wrote.
+    """
+    db_path = _resolve_db()
+    symbol  = request.args.get("symbol", "MES")
+
+    with get_db(db_path) as con:
+        reason_latest = con.execute(
+            "SELECT scored_at FROM cl_algo_reason_scores WHERE symbol=? "
+            "ORDER BY scored_at DESC LIMIT 1", (symbol,)
+        ).fetchone()
+        reasons = []
+        if reason_latest:
+            reasons = [dict(r) for r in con.execute(
+                "SELECT * FROM cl_algo_reason_scores WHERE symbol=? AND scored_at=? "
+                "ORDER BY rank ASC NULLS LAST, composite_score DESC",
+                (symbol, reason_latest["scored_at"])
+            ).fetchall()]
+
+        combo_latest = con.execute(
+            "SELECT scored_at FROM cl_algo_combo_scores WHERE symbol=? "
+            "ORDER BY scored_at DESC LIMIT 1", (symbol,)
+        ).fetchone()
+        combos = []
+        if combo_latest:
+            combos = [dict(r) for r in con.execute(
+                "SELECT * FROM cl_algo_combo_scores WHERE symbol=? AND scored_at=? "
+                "ORDER BY rank ASC NULLS LAST, composite_score DESC LIMIT 20",
+                (symbol, combo_latest["scored_at"])
+            ).fetchall()]
+
+        learner_row = con.execute(
+            "SELECT * FROM cl_algo_learner_runs WHERE symbol=? "
+            "ORDER BY run_at DESC LIMIT 1", (symbol,)
+        ).fetchone()
+        learner_run = dict(learner_row) if learner_row else None
+
+    # Live context: today's research_ce/research_random trades (source-level only --
+    # algo_pnl.get_breakdown() groups by critical_lines.source, not by the specific
+    # WINNING_REASON inside it, so this can't split by Algo 1-5 individually yet).
+    live_breakdown = [g for g in algo_pnl.get_breakdown(db_path)
+                       if g["source"] in ("research_ce", "research_random")]
+
+    return jsonify({
+        "symbol":           symbol,
+        "reason_scores":    reasons,
+        "reason_scored_at": reason_latest["scored_at"] if reason_latest else None,
+        "combo_scores":     combos,
+        "combo_scored_at":  combo_latest["scored_at"] if combo_latest else None,
+        "learner_run":      learner_run,
+        "live_breakdown":   live_breakdown,
+    })
+
+
 # ── Sup/Res visualization data (feeds the Graph tab's line overlay) ───────────
 
 @app.route("/api/srviz/<symbol>")
@@ -2322,7 +2383,7 @@ body:not(.busy-wait) .busy-strip{background:var(--gl-border)}
     <!-- Header -->
     <div class="app-header">
       <span class="brand">Galao</span>
-      <span class="verchip">v5.07</span>
+      <span class="verchip">v5.08</span>
       <span class="gl-pill" id="session-broker-badge" style="color:var(--gl-muted)">Broker: —</span>
       <span class="gl-pill" id="session-decider-badge" style="color:var(--gl-muted)">Decider: —</span>
       <span class="text-muted" id="session-uptime" style="font-size:.7rem;min-width:3.5em"></span>
@@ -2357,6 +2418,7 @@ body:not(.busy-wait) .busy-strip{background:var(--gl-border)}
         <li class="nav-item" data-group="trading"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-broker" id="btn-broker-tab">Broker</button></li>
         <li class="nav-item" data-group="trading"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-submitted" id="btn-sub-tab">Submitted</button></li>
         <li class="nav-item" data-group="results"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-stats" id="btn-stats-tab">Results</button></li>
+        <li class="nav-item" data-group="results"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-compare" id="btn-compare-tab">Compare</button></li>
       </ul>
       <ul class="dropdown-menu dropdown-menu-dark" id="menu-links">
         <li><a class="dropdown-item" id="menu-link-cc2026"  target="_blank">CC2026 Dashboard (this)</a></li>
@@ -2914,6 +2976,44 @@ body:not(.busy-wait) .busy-strip{background:var(--gl-border)}
       </thead>
       <tbody id="st-matrix-tbody"></tbody>
     </table>
+  </div>
+ </div>
+</div>
+
+<!-- ══════════════════════ COMPARE ══════════════════════ -->
+<!-- Comparison engine: which line-detection rule (Algo 1-5) and which entry-style/bracket
+     combo the backtest evidence actually supports, with out-of-sample-aware anti-overfit
+     guards (MC p-value, LOOCV) instead of by-eye judgment. Read-only view over the latest
+     cl_algo_reason_scores / cl_algo_combo_scores / cl_algo_learner_runs rows -- does not
+     trigger a scoring run itself (run_cl_algo_pipeline.py does that, cron/manual). -->
+<div class="tab-pane fade" id="tab-compare">
+ <div class="st-page">
+  <div class="st-topbar">
+    <div class="st-topbar-row">
+      <select class="form-select form-select-sm" id="cmp-symbol-select" style="width:auto">
+        <option value="MES">MES</option>
+        <option value="MNQ">MNQ</option>
+        <option value="MYM">MYM</option>
+        <option value="M2K">M2K</option>
+      </select>
+      <span class="text-muted small ms-2" id="cmp-scored-at"></span>
+      <button class="btn btn-sm btn-outline-secondary ms-auto" onclick="loadCompare()">&#8635;</button>
+    </div>
+  </div>
+
+  <div class="cmp-section">
+    <h6 class="text-muted small text-uppercase mb-2">Line-detection rules (Algo 1-5) — real vs. matched control</h6>
+    <div id="cmp-reason-table"></div>
+  </div>
+
+  <div class="cmp-section mt-4">
+    <h6 class="text-muted small text-uppercase mb-2">Entry-style / bracket combos</h6>
+    <div id="cmp-combo-table"></div>
+  </div>
+
+  <div class="cmp-section mt-4">
+    <h6 class="text-muted small text-uppercase mb-2">Live trades so far (research_ce / research_random)</h6>
+    <div id="cmp-live-table"></div>
   </div>
  </div>
 </div>
@@ -5385,6 +5485,77 @@ async function loadAlgoPnl(){
 document.getElementById('btn-algolab-grid-tab').addEventListener('click',algoLabLoadConfig);
 document.getElementById('btn-algolab-pnl-tab').addEventListener('click',loadAlgoPnl);
 
+// ── Compare (comparison engine) ─────────────────────────────────────────────────
+function _cmpStatusBadge(status){
+  const map={ok:'text-success',low_confidence:'text-warning',unstable:'text-warning',
+             insufficient_data:'text-muted',no_fills:'text-muted'};
+  return `<span class="${map[status]||'text-muted'}">${status}</span>`;
+}
+async function loadCompare(){
+  const symbol=document.getElementById('cmp-symbol-select').value;
+  _enterBusy();
+  try{
+    const d=await (await fetch('/api/algo-compare?symbol='+symbol)).json();
+
+    document.getElementById('cmp-scored-at').textContent =
+      (d.reason_scored_at||d.combo_scored_at) ?
+        `Last scored: reasons=${d.reason_scored_at||'never'}  combos=${d.combo_scored_at||'never'}` :
+        'No scoring run has been recorded for this symbol yet.';
+
+    const reasonRows = d.reason_scores.map(r=>`<tr>
+      <td>${r.line_detect_reason}</td><td>${r.line_detect_kind}</td>
+      <td>${r.rank??'—'}</td><td>${_cmpStatusBadge(r.data_status)}</td>
+      <td>${r.n_fills}</td><td>${r.win_rate!=null?_fmtPct(r.win_rate):'—'}</td>
+      <td>${r.profit_factor!=null?r.profit_factor.toFixed(2):'—'}</td>
+      <td>${r.mc_pvalue!=null?r.mc_pvalue.toFixed(4):'—'}</td>
+      <td>${r.loocv_ratio!=null?r.loocv_ratio.toFixed(2):'—'}</td>
+    </tr>`).join('');
+    document.getElementById('cmp-reason-table').innerHTML = `
+      <table class="table table-sm table-hover mb-0">
+        <thead class="text-muted small"><tr>
+          <th>Reason (Algo N)</th><th>Kind</th><th>Rank</th><th>Status</th>
+          <th>N fills</th><th>Win%</th><th>PF</th><th>MC p</th><th>LOOCV</th>
+        </tr></thead>
+        <tbody>${reasonRows||'<tr><td colspan="9" class="text-muted">No backtested reason data yet -- needs tick history for the research-line dates, and/or more live fills.</td></tr>'}</tbody>
+      </table>`;
+
+    const comboRows = d.combo_scores.map(c=>`<tr>
+      <td>${c.algo_type}</td><td>${c.tp_ticks}/${c.sl_ticks}</td>
+      <td>${c.direction_filter}</td><td>${c.rank??'—'}</td>
+      <td>${_cmpStatusBadge(c.data_status)}</td><td>${c.n_fills}</td>
+      <td>${c.win_rate!=null?_fmtPct(c.win_rate):'—'}</td>
+      <td>${c.profit_factor!=null?c.profit_factor.toFixed(2):'—'}</td>
+      <td>${c.mc_pvalue!=null?c.mc_pvalue.toFixed(4):'—'}</td>
+      <td>${c.loocv_ratio!=null?c.loocv_ratio.toFixed(2):'—'}</td>
+    </tr>`).join('');
+    document.getElementById('cmp-combo-table').innerHTML = `
+      <table class="table table-sm table-hover mb-0">
+        <thead class="text-muted small"><tr>
+          <th>Entry style</th><th>TP/SL</th><th>Dir</th><th>Rank</th><th>Status</th>
+          <th>N fills</th><th>Win%</th><th>PF</th><th>MC p</th><th>LOOCV</th>
+        </tr></thead>
+        <tbody>${comboRows||'<tr><td colspan="10" class="text-muted">No scoring run yet -- run back-trading/run_cl_algo_pipeline.py.</td></tr>'}</tbody>
+      </table>`;
+
+    const liveRows = d.live_breakdown.map(g=>`<tr>
+      <td>${g.symbol}</td><td>${g.source}</td><td>${g.n_trades}</td>
+      <td>${_fmtPct(g.win_rate)}</td>
+      <td class="${g.total_pnl_dollars>=0?'text-success':'text-danger'}">${_fmtMoney(g.total_pnl_dollars)}</td>
+    </tr>`).join('');
+    document.getElementById('cmp-live-table').innerHTML = `
+      <table class="table table-sm table-hover mb-0">
+        <thead class="text-muted small"><tr>
+          <th>Symbol</th><th>Source</th><th>N trades</th><th>Win%</th><th>$</th>
+        </tr></thead>
+        <tbody>${liveRows||'<tr><td colspan="5" class="text-muted">No closed research_ce/research_random trades yet.</td></tr>'}</tbody>
+      </table>
+      <p class="text-muted small mt-1">Source-level only -- live trades aren't tagged with which specific
+      WINNING_REASON (Algo 1-5) produced them yet, only research_ce vs research_random.</p>`;
+  }catch(e){}finally{_exitBusy();}
+}
+document.getElementById('btn-compare-tab').addEventListener('click',loadCompare);
+document.getElementById('cmp-symbol-select').addEventListener('change',loadCompare);
+
 // ── Correlation ───────────────────────────────────────────────────────────────
 async function loadCorrMatrix(){
   const window_=document.getElementById('corr-window').value;
@@ -5546,6 +5717,25 @@ document.addEventListener('shown.bs.tab',function(e){
 # ── Release notes ─────────────────────────────────────────────────────────────
 
 _RELEASE_NOTES = [
+    ("v5.08", "New Compare tab: comparison engine for algorithms and line-detection rules",
+              "Part 1 of the next build cycle -- replaces by-eye decisions (like today's "
+              "Algo 3/4/5 reinstatement) with real, out-of-sample-aware ranking. New "
+              "/api/algo-compare route reads cl_algo_reason_scores (which WINNING_REASON "
+              "rule -- Algo 1-5 -- backtests best against its own matched control) and "
+              "cl_algo_combo_scores (which entry-style/bracket combo), both now scored "
+              "with Monte-Carlo permutation p-value + LOOCV anti-overfit guards in "
+              "cl_algo_scorer.py (MIN_N_FILLS 3->20, profit_factor no-loss default "
+              "999->99 cap). Also fixed a real bug found while porting: june/back-trading/"
+              "bt_scorer.py's own MC p-value always returned 1.0 (reordering a fixed pnl "
+              "list can't change Sharpe -- mean/std are order-invariant); replaced with a "
+              "correct null model (random win/loss direction, same magnitudes) here. "
+              "Checked against live data: cl_algo_reason_scores has nothing to show yet -- "
+              "the research-line dates (2026-09-07/08/10/11) have no tick history in "
+              "june/trader/data/history (which stops at 2026-07-03), and only 1 CLOSED "
+              "live trade exists across research_ce/research_random combined. The Algo "
+              "3/4/5 question stays genuinely open pending more data, not resolved by "
+              "eye a second time -- the tab shows this honestly rather than fabricating "
+              "a verdict."),
     ("v5.07", "Visible \"unproven\" badge on Algo 3/4/5",
               "User request: a hover-only tooltip isn't enough to remember, during a later "
               "performance comparison, that Algo 3/4/5 were already graded not-great once "
