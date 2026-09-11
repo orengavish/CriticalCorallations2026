@@ -194,3 +194,15 @@ correlation:
   windows: [20, 50, 100]           # rolling window choices offered in the UI, in 30m bars
   default_window: 50
   max_series_points: 500           # cap on rolling-correlation-over-time chart points
+
+# ── Correlation Trading (Part 2 of the comparison-engine build cycle) ──────────
+# The actual live algorithm (trader/correlation_signal.py + correlation_trail.py) --
+# distinct from the read-only correlation: block above. Geva's laggard/breakout-
+# retest rule (Galgo2029/knowledge/Claims/correlation-trading.md, AI-26-AI-34,
+# DQ-005), price/bar-based (no DOM subscription). disabled by default: this is
+# a brand-new, not-yet-validated signal source -- turn on deliberately, then
+# judge it through the comparison engine (Part 1) like every other algorithm,
+# not by eye.
+correlation_trading:
+  enabled: false
+  trail_ticks: 3                   # AI-31 "very tight trailing stop", see correlation_trail.py

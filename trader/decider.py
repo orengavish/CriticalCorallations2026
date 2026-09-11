@@ -39,6 +39,7 @@ from lib.critical_lines import get_armed_lines
 from lib.session_clock import (is_entry_cutoff, is_forced_exit_time, is_before_open,
                                 seconds_until_open, is_before_trading_start,
                                 seconds_until_trading_start, _FUTURES_SYMBOLS)
+from trader.correlation_signal import check_correlation_signal
 
 log = get_logger("decider")
 
@@ -72,23 +73,14 @@ def get_current_price(symbol: str, ibc=None) -> float | None:
     return None
 
 
-def generate_commands(symbol: str, date_str: str, current_price: float,
-                      cfg, db_path) -> int:
+def _generate_commands_for_lines(lines: list, symbol: str, current_price: float,
+                                 cfg, db_path, in_flight: set) -> tuple[int, int]:
     """
-    Generate PENDING commands for all armed critical lines for symbol+date.
-    Creates commands in BOTH directions (BUY + SELL) for each line,
-    for each active bracket size.
-    Returns number of commands inserted.
-
-    No new entries within 30 minutes of symbol's own market close (session_clock.py) --
-    mirrors the backtest's entry-cutoff rule (backtest/simulate_trades.py). Each symbol
-    is checked against its OWN close time/timezone (futures: CT; stocks: ET), not a
-    single shared clock.
+    Shared per-line command-insertion body for generate_commands() and
+    generate_commands_for_new_lines() -- both directions x each active bracket
+    size, skipping (line, direction, bracket) combos already in `in_flight`.
+    Returns (count_generated, count_skipped).
     """
-    if is_entry_cutoff(symbol):
-        log.info(f"{symbol}: within entry cutoff of close -- not generating new commands")
-        return 0
-
     tick   = get_tick_size(symbol)
     qty    = cfg.orders.quantity
     brackets_real = cfg.orders.active_brackets
@@ -96,30 +88,6 @@ def generate_commands(symbol: str, date_str: str, current_price: float,
     # the real-vs-control comparison holds at the line level, this just cuts control's
     # order volume to a third with no loss of what's being tested (user decision).
     brackets_control = getattr(cfg.orders, "control_active_brackets", None) or brackets_real[:1]
-
-    with get_db(db_path) as con:
-        lines = get_armed_lines(con, symbol, date_str)
-
-    if not lines:
-        log.warning(f"No armed lines for {symbol} {date_str} — nothing to generate")
-        return 0
-
-    # Dedup guard: skip (line, direction, bracket) combos that already have an
-    # unresolved command in flight. Without this, every run_session_start() call
-    # (e.g. each time a session is restarted) re-generates a full fresh batch on
-    # top of whatever's still unfilled from the last one, with no cap — this is
-    # exactly how MES accumulated 425 stale resting orders across repeated
-    # restarts in one day (2026-07-17 incident). CLOSED/CANCELLED/ERROR/FILLED
-    # commands don't block regeneration — only ones still actively working do.
-    with get_db(db_path) as con:
-        in_flight = {
-            (r["critical_line_id"], r["direction"], r["bracket_size"])
-            for r in con.execute(
-                "SELECT critical_line_id, direction, bracket_size FROM commands"
-                " WHERE symbol=? AND status IN ('PENDING','SUBMITTING','SUBMITTED')",
-                (symbol,)
-            ).fetchall()
-        }
 
     count = 0
     skipped = 0
@@ -164,10 +132,100 @@ def generate_commands(symbol: str, date_str: str, current_price: float,
                     f"line={line_price} bracket={bracket_size} "
                     f"entry={prices['entry_price']} TP={prices['tp_price']} SL={prices['sl_price']}"
                 )
+    return count, skipped
 
+
+def generate_commands(symbol: str, date_str: str, current_price: float,
+                      cfg, db_path) -> int:
+    """
+    Generate PENDING commands for all armed critical lines for symbol+date.
+    Creates commands in BOTH directions (BUY + SELL) for each line,
+    for each active bracket size.
+    Returns number of commands inserted.
+
+    No new entries within 30 minutes of symbol's own market close (session_clock.py) --
+    mirrors the backtest's entry-cutoff rule (backtest/simulate_trades.py). Each symbol
+    is checked against its OWN close time/timezone (futures: CT; stocks: ET), not a
+    single shared clock.
+    """
+    if is_entry_cutoff(symbol):
+        log.info(f"{symbol}: within entry cutoff of close -- not generating new commands")
+        return 0
+
+    with get_db(db_path) as con:
+        lines = get_armed_lines(con, symbol, date_str)
+
+    if not lines:
+        log.warning(f"No armed lines for {symbol} {date_str} — nothing to generate")
+        return 0
+
+    # Dedup guard: skip (line, direction, bracket) combos that already have an
+    # unresolved command in flight. Without this, every run_session_start() call
+    # (e.g. each time a session is restarted) re-generates a full fresh batch on
+    # top of whatever's still unfilled from the last one, with no cap — this is
+    # exactly how MES accumulated 425 stale resting orders across repeated
+    # restarts in one day (2026-07-17 incident). CLOSED/CANCELLED/ERROR/FILLED
+    # commands don't block regeneration — only ones still actively working do.
+    with get_db(db_path) as con:
+        in_flight = {
+            (r["critical_line_id"], r["direction"], r["bracket_size"])
+            for r in con.execute(
+                "SELECT critical_line_id, direction, bracket_size FROM commands"
+                " WHERE symbol=? AND status IN ('PENDING','SUBMITTING','SUBMITTED')",
+                (symbol,)
+            ).fetchall()
+        }
+
+    count, skipped = _generate_commands_for_lines(
+        lines, symbol, current_price, cfg, db_path, in_flight
+    )
     log.info(f"Generated {count} commands for {symbol} {date_str} "
-             f"({len(lines)} lines x {len(brackets)} brackets x 2 directions, "
-             f"{skipped} skipped as already in flight)")
+             f"({len(lines)} lines, {skipped} skipped as already in flight)")
+    return count
+
+
+def generate_commands_for_new_lines(symbol: str, date_str: str, current_price: float,
+                                    cfg, db_path) -> int:
+    """
+    Catches critical_lines armed AFTER session start -- generate_commands() only
+    runs once, at run_session_start(); a signal source that arms a line mid-
+    session (e.g. the correlation algorithm reacting to an intraday break) would
+    otherwise sit un-acted-on until the next session restart. Called from the
+    replenishment loop each poll cycle, alongside replenish().
+
+    Scoped to lines with ZERO commands ever generated for them (any status,
+    not just in-flight) -- deliberately NOT a call to generate_commands() over
+    the full armed-line set: once a line's commands all resolve (FILLED, then
+    handed off to replenish()'s ongoing replacement cycle, or CLOSED/CANCELLED),
+    they drop out of "in flight" and a naive re-scan would generate a second,
+    duplicate round of commands on top of what replenish() is already doing for
+    that same line. Lines that have never had a single command can't hit that
+    gap, so this is safe to run every poll cycle unconditionally.
+    """
+    if is_entry_cutoff(symbol):
+        return 0
+
+    with get_db(db_path) as con:
+        lines = [dict(r) for r in con.execute("""
+            SELECT cl.* FROM critical_lines cl
+            WHERE cl.symbol=? AND cl.date=? AND cl.armed=1
+              AND NOT EXISTS (
+                  SELECT 1 FROM commands c WHERE c.critical_line_id = cl.id
+              )
+        """, (symbol, date_str)).fetchall()]
+
+    if not lines:
+        return 0
+
+    # Every line here has zero commands by construction -- in_flight is
+    # necessarily empty, but _generate_commands_for_lines still takes the
+    # parameter for interface parity with generate_commands().
+    count, _ = _generate_commands_for_lines(
+        lines, symbol, current_price, cfg, db_path, in_flight=set()
+    )
+    if count:
+        log.info(f"generate_commands_for_new_lines: {count} commands for "
+                 f"{len(lines)} newly-armed {symbol} line(s)")
     return count
 
 
@@ -443,6 +501,7 @@ def run_replenishment_loop(ibc, cfg, db_path, date_str: str = None):
                 time.sleep(poll_seconds)
                 continue
 
+        prices_this_cycle = {}
         for symbol in cfg.symbols:
             if is_forced_exit_time(symbol):
                 force_close_symbol(symbol, db_path, ibc)  # logs its own outcome
@@ -452,9 +511,22 @@ def run_replenishment_loop(ibc, cfg, db_path, date_str: str = None):
             if price is None:
                 log.warning(f"No price for {symbol} — skipping replenishment")
                 continue
+            prices_this_cycle[symbol] = price
             n = replenish(symbol, date_str, price, cfg, db_path)
             if n:
                 log.info(f"Replenished {n} command(s) for {symbol}")
+            generate_commands_for_new_lines(symbol, date_str, price, cfg, db_path)
+
+        # Correlation algorithm (Part 2): one check per full poll cycle, over
+        # whichever symbols got a live price this round -- needs all 4 to detect
+        # a shared break, but degrades gracefully (just can't fire) if one
+        # symbol's price was unavailable this cycle rather than blocking the
+        # whole loop on it.
+        if getattr(getattr(cfg, "correlation_trading", None), "enabled", False):
+            try:
+                check_correlation_signal(prices_this_cycle, cfg, db_path)
+            except Exception as e:
+                log.error(f"Error in check_correlation_signal: {e}")
 
         # ibc.live.sleep() instead of time.sleep(): services ib_insync's event loop
         # during this idle wait, which is what keeps get_price()'s persistent ticker
@@ -578,6 +650,48 @@ def self_test() -> bool:
                 ).fetchall()
             assert {r["bracket_size"] for r in control_rows} == set(control_brackets), \
                 f"Control commands used wrong brackets: {sorted({r['bracket_size'] for r in control_rows})}"
+
+            # 1f. generate_commands_for_new_lines(): a line armed AFTER
+            # generate_commands() already ran (e.g. a correlation signal firing
+            # mid-session) must get picked up on the very next call, without
+            # waiting for a session restart.
+            with get_db(db_path) as con:
+                cur = con.execute(
+                    "INSERT INTO critical_lines (symbol, date, line_type, price,"
+                    " strength, armed, source) VALUES ('MES', ?, 'SUPPORT', 6470.00,"
+                    " 1, 1, 'correlation')", (today,)
+                )
+                new_line_id = cur.lastrowid
+            n_new = generate_commands_for_new_lines("MES", today, current_price, cfg, db_path)
+            assert n_new == len(brackets) * 2, \
+                f"Expected {len(brackets)*2} commands for the new line, got {n_new}"
+            with get_db(db_path) as con:
+                new_line_cmds = con.execute(
+                    "SELECT * FROM commands WHERE critical_line_id=?", (new_line_id,)
+                ).fetchall()
+            assert len(new_line_cmds) == n_new
+
+            # Re-calling immediately is a no-op -- the line now has commands, so
+            # it no longer matches the "zero commands ever" filter.
+            n_new_again = generate_commands_for_new_lines("MES", today, current_price, cfg, db_path)
+            assert n_new_again == 0, \
+                f"Re-call should generate 0 (line already has commands), got {n_new_again}"
+
+            # Critical: even after ALL of the new line's commands resolve past
+            # "in flight" (FILLED, then CLOSED -- the exact state replenish()
+            # hands off to), generate_commands_for_new_lines() must still be a
+            # no-op for it -- this is the gap a naive generate_commands()-reuse
+            # would NOT have closed (see the function's own docstring).
+            with get_db(db_path) as con:
+                for c in new_line_cmds:
+                    update_command_status(con, c["id"], "CLOSED",
+                                          exit_time=_now_utc(), exit_reason="TP")
+            n_new_after_resolve = generate_commands_for_new_lines(
+                "MES", today, current_price, cfg, db_path
+            )
+            assert n_new_after_resolve == 0, \
+                ("Must stay a no-op once the line's commands resolve to CLOSED -- "
+                 f"got {n_new_after_resolve} (would be duplicate generation)")
 
             # 2. Replenishment test
             # Mark one command as FILLED

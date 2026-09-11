@@ -34,6 +34,7 @@ from lib.logger import get_logger
 from lib.db import get_db, init_db, get_pending_commands, update_command_status, get_system_state, record_completed_trade, spawn_replenishment, update_price_cache, get_cached_price, flag_needs_review, clear_needs_review, compute_side_resting
 from lib.ib_client import IBClient
 from lib.order_builder import build_bracket, place_bracket, round_tick, get_tick_size
+from trader.correlation_trail import trail_correlation_positions, TRAIL_TICKS
 
 log = get_logger("broker")
 
@@ -1038,6 +1039,14 @@ def run_broker(db_path=None, dry_run: bool = False):
                         log.info(f"Rebased TP/SL brackets for {rb} command(s)")
                 except Exception as e:
                     log.error(f"Error in _drain_rebase_queue: {e}")
+                try:
+                    trail_ticks = getattr(getattr(cfg, "correlation_trading", None),
+                                          "trail_ticks", None) or TRAIL_TICKS
+                    tr = trail_correlation_positions(ibc, db_path, trail_ticks=trail_ticks)
+                    if tr:
+                        log.info(f"Trailed SL for {tr} correlation position(s)")
+                except Exception as e:
+                    log.error(f"Error in trail_correlation_positions: {e}")
                 try:
                     c = poll_tp_sl_fills(ibc, db_path)
                     if c:

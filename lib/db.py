@@ -449,6 +449,32 @@ CREATE TABLE IF NOT EXISTS price_profile (
     UNIQUE(symbol, date, price)
 );
 CREATE INDEX IF NOT EXISTS idx_price_profile_sd ON price_profile(symbol, date);
+
+-- Correlation algorithm (Part 2): price/bar-based state machine tracking, per
+-- (symbol, critical_line_id), whether that level has been broken, retested, and
+-- either failed to reclaim (real signal) or reclaimed (false break, resets to
+-- WATCHING). See trader/correlation_signal.py.
+CREATE TABLE IF NOT EXISTS correlation_watch (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol              TEXT    NOT NULL,
+    date                TEXT    NOT NULL,   -- YYYY-MM-DD, copied from the watched line
+    critical_line_id    INTEGER NOT NULL REFERENCES critical_lines(id),
+    line_price          REAL    NOT NULL,
+    line_type           TEXT    NOT NULL,   -- SUPPORT | RESISTANCE
+    last_price          REAL    NOT NULL,
+    last_side           TEXT    NOT NULL,   -- ABOVE | BELOW (relative to line_price)
+    status              TEXT    NOT NULL DEFAULT 'WATCHING',
+                                 -- WATCHING -> BROKEN -> RETESTED -> FAILED_RECLAIM (terminal,
+                                 --   the real signal) | RECLAIMED (terminal, false break)
+    break_direction     TEXT,   -- UP | DOWN, set once BROKEN
+    broken_at           TEXT,
+    retested_at         TEXT,
+    resolved_at         TEXT,   -- set once FAILED_RECLAIM or RECLAIMED
+    triggered_line_id   INTEGER, -- the correlation critical_lines row this armed, if any
+    updated_at          TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+    UNIQUE(symbol, critical_line_id)
+);
+CREATE INDEX IF NOT EXISTS idx_corr_watch_status ON correlation_watch(status, break_direction);
 """
 
 
@@ -712,6 +738,19 @@ def _migrate(path: Path = None):
         )""",
         "CREATE INDEX IF NOT EXISTS idx_price_profile_sd ON price_profile(symbol, date)",
         "CREATE INDEX IF NOT EXISTS idx_commands_source_algo ON commands(source, algo_type)",
+        """CREATE TABLE IF NOT EXISTS correlation_watch (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol TEXT NOT NULL, date TEXT NOT NULL,
+            critical_line_id INTEGER NOT NULL REFERENCES critical_lines(id),
+            line_price REAL NOT NULL, line_type TEXT NOT NULL,
+            last_price REAL NOT NULL, last_side TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'WATCHING',
+            break_direction TEXT, broken_at TEXT, retested_at TEXT, resolved_at TEXT,
+            triggered_line_id INTEGER,
+            updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+            UNIQUE(symbol, critical_line_id)
+        )""",
+        "CREATE INDEX IF NOT EXISTS idx_corr_watch_status ON correlation_watch(status, break_direction)",
         # 2026-09-10: cleanup must archive, never DELETE outright -- an earlier "keep only
         # verified-good rows" pass deleted every real trade record on 6 dates along with
         # the noise it meant to remove (see MES Trade History Audit's "Known gaps"
@@ -1090,7 +1129,7 @@ def self_test() -> bool:
             expected = {"commands", "positions", "ib_events", "system_state",
                         "critical_lines", "release_notes", "fetch_log", "completed_trades",
                         "cl_algo_sim_results", "cl_algo_combo_scores",
-                        "cl_algo_reason_scores",
+                        "cl_algo_reason_scores", "correlation_watch",
                         "cl_algo_score_history", "cl_algo_learner_runs",
                         "cl_algo_day_params", "cl_algo_fd_results",
                         "price_profile"}
