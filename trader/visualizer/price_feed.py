@@ -58,7 +58,13 @@ def _poll_loop(cfg, symbols: list, interval: int):
                     log.debug(f"Price poll error ({sym}): {e}")
         except Exception as e:
             log.debug(f"Price feed connection error: {e}")
-        time.sleep(interval)
+        # ibc.live.sleep() instead of time.sleep(): services ib_insync's event loop
+        # during this idle wait, which is what keeps get_price()'s persistent ticker
+        # subscriptions (2026-09-11) actually updating in the background.
+        if ibc.live and ibc.live.isConnected():
+            ibc.live.sleep(interval)
+        else:
+            time.sleep(interval)
 
 
 def start(cfg, symbols=None, interval: int = 5):

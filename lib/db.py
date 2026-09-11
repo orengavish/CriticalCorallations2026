@@ -752,6 +752,11 @@ def archive_and_delete_commands(con, ids: list[int], reason: str) -> int:
             " VALUES (?,?,?,?,?,?)",
             (d["id"], d.get("symbol"), d.get("source"), d.get("status"), reason, json.dumps(d)),
         )
+    # positions/completed_trades FK onto commands.id with no archive table of their own --
+    # the parent command's full row is already preserved above, so these child rows (pure
+    # lifecycle tracking, not their own source of truth) are dropped along with it.
+    con.execute(f"DELETE FROM positions WHERE command_id IN ({placeholders})", ids)
+    con.execute(f"DELETE FROM completed_trades WHERE command_id IN ({placeholders})", ids)
     con.execute(f"DELETE FROM commands WHERE id IN ({placeholders})", ids)
     return len(rows)
 
@@ -867,6 +872,41 @@ def spawn_replenishment(con, parent_cmd, price: float, tick: float) -> int:
         parent_cmd["logical_trade_id"],
     ))
     return con.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+
+def compute_side_resting(con, symbol: str, direction: str) -> int:
+    """
+    Real IB-facing exposure on one symbol/side: same-direction entries (SUBMITTED or
+    unresolved FILLED) plus 2x opposite-direction entries -- a bracket rests its TP+SL
+    on the OPPOSITE side the instant it's submitted, so each opposite-direction entry
+    already contributes 2 resting legs to THIS side.
+
+    Lives here (not in broker.py, where this logic originated) so trading_dashboard.py
+    can reuse the exact same admission-cap math for its "at cap" reporting without
+    importing broker.py -- which pulls in lib.ib_client -> ib_insync at module level,
+    and ib_insync's eventkit dependency crashes on first import from a Flask request
+    thread ("no current event loop in thread ...", the same class of bug fixed earlier
+    for IBClient.connect() itself, but this time at import time, confirmed live
+    2026-09-11). A pure-DB helper has no business dragging that dependency chain in.
+
+    The dashboard previously had its OWN same-side-only approximation here that
+    silently disagreed with broker.py's real gate, showing "none held back" while
+    commands were actually being held back on every cycle (confirmed live: M2K/MYM
+    SELL commands stuck PENDING at ~11 resting, dashboard reported 0) -- broker.py now
+    imports this instead of keeping its own copy, so the two can't drift apart again.
+    """
+    opposite = "SELL" if direction == "BUY" else "BUY"
+    same_side_entries = con.execute(
+        "SELECT COUNT(*) FROM commands WHERE symbol=? AND direction=?"
+        " AND (status='SUBMITTED' OR (status='FILLED' AND needs_review=0))",
+        (symbol, direction)
+    ).fetchone()[0]
+    opposite_side_legs = con.execute(
+        "SELECT COUNT(*) FROM commands WHERE symbol=? AND direction=?"
+        " AND (status='SUBMITTED' OR (status='FILLED' AND needs_review=0))",
+        (symbol, opposite)
+    ).fetchone()[0]
+    return same_side_entries + opposite_side_legs * 2
 
 
 def get_pending_commands(con, symbol: str = None) -> list:

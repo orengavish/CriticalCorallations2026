@@ -21,7 +21,7 @@ import argparse
 import threading
 from datetime import datetime, timezone
 
-from ib_insync import IB, Future, Stock, util
+from ib_insync import IB, Future, Stock, Ticker, util
 
 from lib.config_loader import get_config
 from lib.logger import get_logger
@@ -69,6 +69,7 @@ class IBClient:
         self._paper_client_id: int | None = None
 
         self._contract_cache: dict[str, Future | Stock] = {}
+        self._ticker_cache: dict[str, Ticker] = {}
 
         self._lock = threading.Lock()
         atexit.register(self.disconnect)
@@ -118,6 +119,9 @@ class IBClient:
             if self.live and self.live.isConnected():
                 return
             ib = IB()
+            # A genuinely new connection means any previously cached Tickers are tied
+            # to a now-dead IB instance -- must be dropped, not carried over.
+            self._ticker_cache = {}
             cid = self._try_connect(ib, self._live_host, self._live_port,
                                     self._live_ids, "LIVE")
             # Use delayed market data (type 3) — no subscription required.
@@ -181,15 +185,31 @@ class IBClient:
         Fetch last price for symbol from LIVE connection.
         Returns mid-point if last is unavailable.
         Raises if not connected or no price data.
+
+        2026-09-11: previously did a fresh reqMktData + 1.5s sleep + cancelMktData on
+        EVERY call -- fine for an occasional one-off, very expensive for repeated calls
+        on the same symbol within a short window (broker.py was re-fetching the same
+        symbol's price once per PENDING COMMAND rather than once per cycle; decider.py's
+        replenishment loop re-fetches all 34 symbols every cycle). Now keeps one
+        persistent streaming subscription per symbol (self._ticker_cache) -- ib_insync
+        keeps updating .last/.bid/.ask in the background for as long as the subscription
+        stays open and something services the event loop (callers with a polling loop
+        should use ibc.live.sleep(...) instead of time.sleep(...) between iterations for
+        exactly this reason). Only the FIRST call for a given symbol pays the 1.5s wait,
+        to let its first tick arrive; every call after that reads the already-live
+        ticker synchronously.
         """
         if not self.live or not self.live.isConnected():
             raise ConnectionError("LIVE connection is not active")
 
         con = contract or self.get_contract(symbol)
 
-        # Try streaming snapshot first (1.5s wait)
-        ticker = self.live.reqMktData(con, "", False, False)
-        self.live.sleep(1.5)
+        ticker = self._ticker_cache.get(symbol)
+        first_subscribe = ticker is None
+        if first_subscribe:
+            ticker = self.live.reqMktData(con, "", False, False)
+            self._ticker_cache[symbol] = ticker
+            self.live.sleep(1.5)  # let the first tick arrive -- paid once per symbol
 
         price = ticker.last
         if price is None or price != price:  # nan check
@@ -198,13 +218,10 @@ class IBClient:
             if bid > 0 and ask > 0:
                 price = (bid + ask) / 2
 
-        try:
-            self.live.cancelMktData(con)
-        except Exception:
-            pass  # IB may have already dropped the ticker (e.g. after error 354)
-
-        # Fallback: last close from reqHistoricalData (always available)
-        if price is None or price != price or price <= 0:
+        # Historical fallback -- only worth the extra round trip on a genuinely fresh
+        # subscription with no tick at all yet; a symbol that's been ticking fine for a
+        # while returning a momentary None/nan is more likely a transient gap.
+        if (price is None or price != price or price <= 0) and first_subscribe:
             log.debug(f"reqMktData returned no price for {symbol} — trying historical fallback")
             bars = self.live.reqHistoricalData(
                 con,
@@ -219,8 +236,9 @@ class IBClient:
             if bars:
                 price = bars[-1].close
                 log.info(f"Price for {symbol} (historical fallback): {price}")
-            else:
-                raise ValueError(f"No price available for {symbol} via mktData or historical")
+
+        if price is None or price != price or price <= 0:
+            raise ValueError(f"No valid price available for {symbol}")
 
         log.info(f"Price for {symbol}: {price}")
         return price
@@ -342,6 +360,7 @@ class IBClient:
                         log.warning(f"LIVE disconnect error: {e}")
                 self.live = None
                 self._live_client_id = None
+                self._ticker_cache = {}
             if self.paper:
                 if self.paper.isConnected():
                     log.info(f"Disconnecting PAPER (clientId={self._paper_client_id})")
@@ -407,11 +426,26 @@ def self_test() -> bool:
         assert s["live_client_id"]  is not None
         assert s["paper_client_id"] is not None
 
-        # 4. Price fetch from LIVE
+        # 4. Price fetch from LIVE -- and confirm the persistent ticker cache (2026-09-11)
+        # is actually used: first call subscribes (slow), second call must be near-free.
         try:
+            import time as _time
+            t0 = _time.perf_counter()
             price = ibc.get_price("MES")
+            first_call_s = _time.perf_counter() - t0
             assert price > 0, f"Invalid price: {price}"
-            log.info(f"[self-test] MES price={price}")
+            assert "MES" in ibc._ticker_cache, "get_price() did not populate the ticker cache"
+
+            t1 = _time.perf_counter()
+            price2 = ibc.get_price("MES")
+            second_call_s = _time.perf_counter() - t1
+            assert price2 > 0, f"Invalid cached price: {price2}"
+            assert second_call_s < 1.0, (
+                f"Second get_price() call took {second_call_s:.2f}s -- expected near-instant "
+                f"from the ticker cache (first call took {first_call_s:.2f}s)"
+            )
+            log.info(f"[self-test] MES price={price} (first={first_call_s:.2f}s, "
+                     f"cached={second_call_s:.2f}s)")
         except Exception as e:
             log.warning(f"[self-test] Price fetch failed (non-fatal): {e}")
 

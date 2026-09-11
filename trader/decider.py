@@ -38,7 +38,7 @@ from lib.order_builder import determine_entry_type, calc_bracket_prices, round_t
 from lib.critical_lines import get_armed_lines
 from lib.session_clock import (is_entry_cutoff, is_forced_exit_time, is_before_open,
                                 seconds_until_open, is_before_trading_start,
-                                seconds_until_trading_start)
+                                seconds_until_trading_start, _FUTURES_SYMBOLS)
 
 log = get_logger("decider")
 
@@ -340,31 +340,10 @@ def force_close_symbol(symbol: str, db_path, ibc) -> int:
     return len(filled)
 
 
-def run_session_start(ibc, cfg, db_path, date_str: str = None):
-    """
-    Session start: read critical lines already in DB (entered via GUI),
-    fetch price, generate all commands.
-    Called once at the beginning of a trading session.
-    """
-    date_str = date_str or date.today().strftime("%Y-%m-%d")
-
-    # Don't generate a single command before the regular session actually opens --
-    # pre-market prices are thin/unreliable and would seed brackets off a bad reference
-    # price. All symbols in this system open at the same UTC instant (8:30 CT futures ==
-    # 9:30 ET stocks), so waiting on the whole list together is correct, not just per-symbol.
-    #
-    # 2026-09-10: on top of the open itself, trading intentionally starts
-    # `trading_start_delay_minutes` after the open (30 min -> 17:00 IL, not the 16:30 IL
-    # open) -- explicit user decision until pre-market trading is added; 0 restores the
-    # old at-the-open behavior.
-    delay_min = getattr(cfg.session, "trading_start_delay_minutes", 0)
-    wait_s = max((seconds_until_trading_start(s, delay_minutes=delay_min) for s in cfg.symbols), default=0)
-    if wait_s > 0:
-        log.info(f"Not trading yet -- waiting {wait_s:.0f}s (open + {delay_min}min delay)")
-        while any(is_before_trading_start(s, delay_minutes=delay_min) for s in cfg.symbols):
-            time.sleep(min(30, max(1, seconds_until_trading_start(cfg.symbols[0], delay_minutes=delay_min))))
-
-    for symbol in cfg.symbols:
+def _generate_for_symbols(symbols, date_str, cfg, db_path, ibc):
+    """Per-symbol session-start body: count armed lines, fetch price, generate commands.
+    Shared by the futures (no-wait) and stock (gated) halves of run_session_start()."""
+    for symbol in symbols:
         # Lines come from DB (entered via /lines GUI) — just count them
         with get_db(db_path) as con:
             n = con.execute(
@@ -381,6 +360,50 @@ def run_session_start(ibc, cfg, db_path, date_str: str = None):
         # Generate commands
         count = generate_commands(symbol, date_str, price, cfg, db_path)
         log.info(f"Session start: {count} commands generated for {symbol}")
+
+
+def run_session_start(ibc, cfg, db_path, date_str: str = None):
+    """
+    Session start: read critical lines already in DB (entered via GUI),
+    fetch price, generate all commands.
+    Called once at the beginning of a trading session.
+    """
+    date_str = date_str or date.today().strftime("%Y-%m-%d")
+
+    futures_symbols = [s for s in cfg.symbols if s in _FUTURES_SYMBOLS]
+    stock_symbols   = [s for s in cfg.symbols if s not in _FUTURES_SYMBOLS]
+
+    # 2026-09-11: futures markets are already open essentially the whole time decider
+    # runs -- no reason to make them wait on the stock-session gate below. Generate for
+    # them immediately; this closes the gap where decider restarts at 8AM IL and then
+    # sits idle for ~9h doing nothing for futures until the shared 17:00 IL gate cleared.
+    _generate_for_symbols(futures_symbols, date_str, cfg, db_path, ibc)
+
+    # Stocks: don't generate a single command before the regular session actually opens --
+    # pre-market prices are thin/unreliable and would seed brackets off a bad reference
+    # price.
+    #
+    # 2026-09-10: on top of the open itself, trading intentionally starts
+    # `trading_start_delay_minutes` after the open (30 min -> 17:00 IL, not the 16:30 IL
+    # open) -- explicit user decision until pre-market trading is added; 0 restores the
+    # old at-the-open behavior.
+    #
+    # Day Start panel's "Force All Symbols Now" button sets this system_state flag
+    # (dated, so it only applies today) to skip this wait entirely on demand.
+    with get_db(db_path) as con:
+        force_all = get_system_state(con, "FORCE_ALL_SYMBOLS_DATE") == date_str
+
+    if stock_symbols and not force_all:
+        delay_min = getattr(cfg.session, "trading_start_delay_minutes", 0)
+        wait_s = max((seconds_until_trading_start(s, delay_minutes=delay_min) for s in stock_symbols), default=0)
+        if wait_s > 0:
+            log.info(f"Not trading stocks yet -- waiting {wait_s:.0f}s (open + {delay_min}min delay)")
+            while any(is_before_trading_start(s, delay_minutes=delay_min) for s in stock_symbols):
+                time.sleep(min(30, max(1, seconds_until_trading_start(stock_symbols[0], delay_minutes=delay_min))))
+    elif force_all:
+        log.info("FORCE_ALL_SYMBOLS_DATE override set for today -- skipping stock-session wait")
+
+    _generate_for_symbols(stock_symbols, date_str, cfg, db_path, ibc)
 
     with get_db(db_path) as con:
         set_system_state(con, "SESSION", "RUNNING")
@@ -433,7 +456,15 @@ def run_replenishment_loop(ibc, cfg, db_path, date_str: str = None):
             if n:
                 log.info(f"Replenished {n} command(s) for {symbol}")
 
-        time.sleep(poll_seconds)
+        # ibc.live.sleep() instead of time.sleep(): services ib_insync's event loop
+        # during this idle wait, which is what keeps get_price()'s persistent ticker
+        # subscriptions (2026-09-11) actually updating in the background. Guarded --
+        # this function tolerates ibc=None elsewhere (see the reconnect check above),
+        # so this must too even though no current caller actually passes None.
+        if ibc:
+            ibc.live.sleep(poll_seconds)
+        else:
+            time.sleep(poll_seconds)
 
 
 # ── Self-test ─────────────────────────────────────────────────────────────────
@@ -517,6 +548,16 @@ def self_test() -> bool:
                 total_after = con.execute("SELECT COUNT(*) FROM commands").fetchone()[0]
             assert total_after == expected, \
                 f"Dedup guard failed -- expected {expected} total commands, got {total_after}"
+
+            # 1e. Futures/stock split (2026-09-11): run_session_start() no longer waits
+            # on the stock-open gate for futures symbols -- confirms the split itself
+            # puts each symbol in the right group, the smallest thing that would break
+            # if _FUTURES_SYMBOLS membership or the list comprehensions were wrong.
+            test_symbols = ["MES", "AAPL", "MNQ", "MSFT"]
+            futures_split = [s for s in test_symbols if s in _FUTURES_SYMBOLS]
+            stock_split   = [s for s in test_symbols if s not in _FUTURES_SYMBOLS]
+            assert futures_split == ["MES", "MNQ"], f"Futures split wrong: {futures_split}"
+            assert stock_split == ["AAPL", "MSFT"], f"Stock split wrong: {stock_split}"
 
             # 1d. Control-group lines fan out to control_active_brackets (1 bracket),
             # not active_brackets (3) -- cuts control volume without touching real lines.

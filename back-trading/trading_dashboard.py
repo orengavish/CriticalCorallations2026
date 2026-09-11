@@ -10,7 +10,6 @@ Usage:
     python back-trading/trading_dashboard.py --port 5003
 """
 
-import os
 import sys
 import ast
 import csv
@@ -29,7 +28,7 @@ if str(_ROOT) not in sys.path:
 
 from flask import Flask, jsonify, request, render_template_string
 
-from lib.db import get_db, get_cached_price, init_db, archive_and_delete_commands
+from lib.db import get_db, get_cached_price, init_db, archive_and_delete_commands, set_system_state, get_system_state
 from lib.price_profile import ensure_profile as _ensure_price_profile, get_price_profile
 from trader.session import get_session_manager
 from lib import algo_lab, algo_pnl, correlation_lab
@@ -543,9 +542,41 @@ def api_session_stop():
 # buttons instead of an ad-hoc script each time. See DAY_SUMMARY_AND_PLAN_2026-09-10.md
 # goal 5.
 
+def _run_ib_dayclean_script(mode: str) -> dict | None:
+    """
+    Runs trader/scripts/ib_dayclean.py's verify/cancel-flatten in its own process --
+    calling IBClient directly in-thread here intermittently threw "no current event
+    loop in thread 'Thread-N (process_request_thread)'" (confirmed live 2026-09-11,
+    same category of problem already worked around for the geva-import route below).
+    Returns the parsed dict, or None on timeout/crash/unparseable output.
+    """
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(_ROOT / "trader" / "scripts" / "ib_dayclean.py"), mode],
+            capture_output=True, text=True, timeout=30,
+        )
+    except subprocess.TimeoutExpired:
+        return None
+    result_line = next((l for l in reversed(proc.stdout.splitlines()) if l.startswith("{")), None)
+    if not result_line:
+        return None
+    try:
+        return ast.literal_eval(result_line)
+    except (ValueError, SyntaxError):
+        return None
+
+
+_FUTURES = ("MES", "MNQ", "MYM", "M2K")
+
+
 @app.route("/api/dayclean/verify")
 def api_dayclean_verify():
-    """Read-only: DB residual counts + IB's real order/position counts, side by side."""
+    """
+    Read-only: DB residual counts + IB's real order/position counts, side by side --
+    PLUS (2026-09-11) the single state source for the whole Day Start panel's button
+    graying and the extraction-coverage summary. A grayed button is meant to be its own
+    answer to "do I need to touch this" -- see `gating` below.
+    """
     today = date.today().isoformat()
     db_path = _resolve_db()
     with get_db(db_path) as con:
@@ -564,25 +595,54 @@ def api_dayclean_verify():
             "SELECT COUNT(*) FROM commands_archive"
         ).fetchone()[0]
 
-    ib = {"connected": False, "resting_orders": None, "open_positions": None, "error": None}
-    try:
-        from lib.ib_client import IBClient
-        from lib.config_loader import get_config
-        cfg = get_config(_ROOT / "trader" / "config.yaml")
-        ibc = IBClient(cfg)
-        ibc.connect(live=False, paper=True)
+        futures_rows = con.execute(
+            "SELECT symbol, COUNT(*) c FROM critical_lines WHERE date=? AND armed=1"
+            " AND symbol IN (?,?,?,?) GROUP BY symbol", (today, *_FUTURES)
+        ).fetchall()
+        futures_lines = {r["symbol"]: r["c"] for r in futures_rows}
+
+        stock_row = con.execute(
+            "SELECT COUNT(DISTINCT symbol) syms, COUNT(*) total FROM critical_lines"
+            " WHERE date=? AND armed=1 AND symbol NOT IN (?,?,?,?)", (today, *_FUTURES)
+        ).fetchone()
+
+        force_all_today = get_system_state(con, "FORCE_ALL_SYMBOLS_DATE") == today
+        extracted_stocks_today = get_system_state(con, "EXTRACT_STOCK_LINES_DATE") == today
+
+        # Futures extraction has no "already done" flag, deliberately: prep_research_lines.py
+        # is deterministic per date (no benefit re-running once done), but
+        # import_geva_manual_lines.py can still find NEW real lines if Geva posts later in
+        # the day -- so this button stays live as long as Geva hasn't posted anything today
+        # yet, derived live from the DB rather than a flag that could drift out of sync.
+        geva_lines_today = con.execute(
+            "SELECT COUNT(*) FROM critical_lines WHERE date=? AND source='geva_manual'",
+            (today,)
+        ).fetchone()[0]
+
         try:
-            ibc.paper.reqAllOpenOrders()
-            ibc.paper.sleep(1.0)
-            ibc.paper.reqPositions()
-            ibc.paper.sleep(1.0)
-            ib["connected"] = True
-            ib["resting_orders"] = len(ibc.paper.openOrders())
-            ib["open_positions"] = len([p for p in ibc.paper.positions() if p.position != 0])
-        finally:
-            ibc.disconnect()
-    except Exception as e:
-        ib["error"] = str(e)
+            from lib.config_loader import get_config
+            from lib.session_clock import is_before_trading_start
+            cfg = get_config(_ROOT / "trader" / "config.yaml")
+            delay_min = getattr(cfg.session, "trading_start_delay_minutes", 0)
+            stocks_already_open = not is_before_trading_start("AAPL", delay_minutes=delay_min)
+            total_symbols = len(cfg.symbols)
+        except Exception:
+            stocks_already_open = False
+            total_symbols = len(_FUTURES) + 30
+
+    # "Force Futures Now" only makes sense when decider isn't already up -- futures
+    # generate unconditionally the moment decider starts (no wait), so once it's alive
+    # they're already handled; SESSION=RUNNING is NOT a usable proxy for this; it's only
+    # set at the very END of run_session_start(), after the stock-gate wait, so it can
+    # stay stamped "yesterday" all day even though futures already ran today (confirmed
+    # live 2026-09-11).
+    from trader.scripts.restart_decider_daily import _current_decider_pid
+    decider_alive = _current_decider_pid(_ROOT / "trader") is not None
+
+    ib = _run_ib_dayclean_script("verify") or {
+        "connected": False, "resting_orders": None, "open_positions": None,
+        "error": "ib_dayclean.py script failed -- see server log",
+    }
 
     return jsonify({
         "db": {
@@ -592,6 +652,22 @@ def api_dayclean_verify():
             "already_archived": archived_total,
         },
         "ib": ib,
+        "gating": {
+            "can_clean": stale_cancelled > 0,
+            "can_cancel_flatten": (ib.get("resting_orders") or 0) > 0
+                                  or (ib.get("open_positions") or 0) > 0,
+            "can_force_futures": not decider_alive,
+            "can_force_all": not (force_all_today or stocks_already_open),
+            "can_extract_futures": geva_lines_today == 0,
+            "can_extract_stocks": not extracted_stocks_today,
+        },
+        "extraction": {
+            "futures": {"symbols_with_lines": len(futures_lines), "of": len(_FUTURES),
+                        "per_symbol": futures_lines},
+            "stocks": {"symbols_with_lines": stock_row["syms"] or 0,
+                       "of": total_symbols - len(_FUTURES),
+                       "total_lines": stock_row["total"] or 0},
+        },
     })
 
 
@@ -623,53 +699,13 @@ def api_dayclean_cancel_flatten():
     Ported from visualizer/app.py's /api/cancel-all (legacy port-5001 dashboard) so this
     is reachable from the one dashboard instead of two.
     """
-    from lib.ib_client import IBClient
-    from lib.config_loader import get_config
-    from ib_insync import MarketOrder
-
     now = datetime.now(timezone.utc).isoformat()
-    result = {"ib_cancel": "skipped", "ib_flatten": 0,
-              "db_cancelled": 0, "db_flattened": 0, "errors": []}
-    ibc = None
-    try:
-        cfg = get_config(_ROOT / "trader" / "config.yaml")
-        ibc = IBClient(cfg)
-        ibc.connect(live=True, paper=True)
-
-        for label, ib_conn in [("LIVE", ibc.live), ("PAPER", ibc.paper)]:
-            if ib_conn and ib_conn.isConnected():
-                try:
-                    ib_conn.reqGlobalCancel()
-                    print(f"[dayclean cancel-flatten] reqGlobalCancel -> {label}")
-                except Exception as e:
-                    result["errors"].append(f"reqGlobalCancel {label}: {e}")
-        result["ib_cancel"] = "ok"
-
-        if ibc.paper and ibc.paper.isConnected():
-            try:
-                ibc.paper.reqPositions()
-                ibc.paper.sleep(1.5)
-                for pos in ibc.paper.positions():
-                    qty = pos.position
-                    if qty == 0:
-                        continue
-                    action = "SELL" if qty > 0 else "BUY"
-                    try:
-                        ibc.place_order(pos.contract, MarketOrder(action, abs(qty)))
-                        result["ib_flatten"] += 1
-                    except Exception as e:
-                        result["errors"].append(f"close {pos.contract.symbol}: {e}")
-            except Exception as e:
-                result["errors"].append(f"positions: {e}")
-    except Exception as e:
-        result["errors"].append(f"IB connect: {e}")
-        result["ib_cancel"] = "failed"
-    finally:
-        if ibc:
-            try:
-                ibc.disconnect()
-            except Exception:
-                pass
+    result = _run_ib_dayclean_script("cancel-flatten") or {
+        "ib_cancel": "failed", "ib_flatten": 0,
+        "errors": ["ib_dayclean.py script failed -- see server log"],
+    }
+    result.setdefault("db_cancelled", 0)
+    result.setdefault("db_flattened", 0)
 
     try:
         with get_db(_resolve_db()) as con:
@@ -688,6 +724,67 @@ def api_dayclean_cancel_flatten():
         result["errors"].append(f"DB: {e}")
 
     return jsonify(result)
+
+
+@app.route("/api/dayclean/force-futures-start", methods=["POST"])
+def api_dayclean_force_futures_start():
+    """
+    Restarts decider now. Futures no longer wait on any gate (2026-09-11 -- see
+    decider.py's run_session_start), so any restart makes them start generating
+    immediately -- this button is for "I added new lines, pick them up now" instead of
+    waiting for the next natural restart (crash-recovery or the daily 08:00 IL
+    DeciderDailyRestart task).
+    """
+    return jsonify({"restarted": _restart_decider_process()})
+
+
+@app.route("/api/dayclean/force-all-start", methods=["POST"])
+def api_dayclean_force_all_start():
+    """
+    Same as force-futures-start, but also skips the stock-session wait gate for today
+    only (system_state FORCE_ALL_SYMBOLS_DATE == today, read by decider.py's
+    run_session_start) before restarting -- stocks join immediately too instead of
+    waiting for the ~17:00 IL gate.
+    """
+    today = date.today().isoformat()
+    with get_db(_resolve_db()) as con:
+        set_system_state(con, "FORCE_ALL_SYMBOLS_DATE", today)
+    return jsonify({"restarted": _restart_decider_process(), "override_date": today})
+
+
+@app.route("/api/dayclean/extract-futures-lines", methods=["POST"])
+def api_dayclean_extract_futures_lines():
+    """
+    Runs both futures line sources for today: Geva's real lines (import_geva_manual_lines.py,
+    re-checkable all day -- see the geva_lines_today gating note in api_dayclean_verify) and
+    the Algo 1/2 research lines (prep_research_lines.py, deterministic per date). Both as
+    subprocesses -- neither needs it for IB, but this matches the established pattern for
+    every other Day Start action in this file.
+    """
+    today = date.today().isoformat()
+    geva = subprocess.run(
+        [sys.executable, str(_ROOT / "trader" / "scripts" / "import_geva_manual_lines.py"),
+         "--date", today], capture_output=True, text=True, timeout=60)
+    research = subprocess.run(
+        [sys.executable, str(_ROOT / "trader" / "scripts" / "prep_research_lines.py"),
+         "--date", today], capture_output=True, text=True, timeout=60)
+    return jsonify({"geva_stdout": geva.stdout, "research_stdout": research.stdout})
+
+
+@app.route("/api/dayclean/extract-stock-lines", methods=["POST"])
+def api_dayclean_extract_stock_lines():
+    """
+    Runs the stock Algo 1/2 research lines for today (prep_research_lines_stocks.py) --
+    deterministic per date, so once run today there's nothing new to find by re-running;
+    EXTRACT_STOCK_LINES_DATE records that for api_dayclean_verify's gating.
+    """
+    today = date.today().isoformat()
+    proc = subprocess.run(
+        [sys.executable, str(_ROOT / "trader" / "scripts" / "prep_research_lines_stocks.py"),
+         "--date", today], capture_output=True, text=True, timeout=120)
+    with get_db(_resolve_db()) as con:
+        set_system_state(con, "EXTRACT_STOCK_LINES_DATE", today)
+    return jsonify({"stdout": proc.stdout})
 
 
 @app.route("/api/geva/import-manual-lines", methods=["POST"])
@@ -745,31 +842,28 @@ def api_geva_import_manual_lines():
 
 def _restart_decider_process() -> bool:
     """
-    Kills decider.py's current OS process (found via its singleton lock file's PID) so
-    session.py's monitor loop -- now fixed (2026-09-10) to recognize an externally
-    supervised component and restart it properly on real death -- respawns it fresh,
-    picking up any critical_lines rows added since it last ran run_session_start().
-    Returns False (no-op, not an error) if decider isn't currently running at all.
+    Kills decider.py's current OS process (if running) and spawns it fresh, picking up
+    any critical_lines rows added since it last ran run_session_start().
+
+    2026-09-11, two bugs fixed here:
+    1. Previously read decider.lock's content directly for the PID -- Windows enforces
+       that lock file's byte-range lock as MANDATORY, so a plain read while decider.py
+       holds it (i.e. always, in production) fails with a permission error, silently
+       treated as "not running" -- this returned False on every call regardless of
+       whether decider was actually up (confirmed live).
+    2. This previously only killed decider and relied on session.py's monitor loop to
+       notice and respawn it. Confirmed live: no session.py process is actually running
+       in this environment -- a bare kill would leave command-generation dead with
+       nothing bringing it back. Reuses restart_decider_daily.py's own kill+respawn
+       function instead (the same self-sufficient, supervisor-independent mechanism
+       already used safely by the scheduled 08:00 IL daily restart).
+
+    Returns True once a decider process is confirmed running afterward (whether or not
+    one was already running before the call), False only if the respawn itself failed.
     """
-    lock_path = _ROOT / "trader" / "logs" / "decider.lock"
-    if not lock_path.exists():
-        return False
-    try:
-        from lib.singleton_lock import _pid_alive
-        pid = int(lock_path.read_text().strip())
-    except (OSError, ValueError):
-        return False
-    if not _pid_alive(pid):
-        return False
-    try:
-        if sys.platform == "win32":
-            subprocess.run(["taskkill", "/F", "/PID", str(pid)],
-                            capture_output=True, timeout=10)
-        else:
-            os.kill(pid, 9)
-        return True
-    except Exception:
-        return False
+    from trader.scripts.restart_decider_daily import restart_decider
+    result = restart_decider(trader_dir=_ROOT / "trader")
+    return result.get("new_pid") is not None
 
 
 @app.route("/api/lines/create", methods=["POST"])
@@ -1469,6 +1563,28 @@ def api_broker_queue():
         submitted = rows(con, "SUBMITTED")
         filled    = rows(con, "FILLED")
 
+        for f in filled:
+            f["held_reason"] = "open position"
+
+        # Submitted rows: show the actual live-price gap to entry -- "resting at IB,
+        # waiting for fill" alone doesn't answer "how close is it". Ephemeral fetch
+        # (same helper Algo Lab already uses) rather than a new persistent connection
+        # just for this -- only a handful of distinct symbols typically have SUBMITTED
+        # orders at once, so the one-shot connect+fetch cost here is small.
+        live_prices = _fetch_live_prices(list({s["symbol"] for s in submitted})) if submitted else {}
+        for s in submitted:
+            live = live_prices.get(s["symbol"])
+            if live is None:
+                s["held_reason"] = "resting at IB, waiting for fill (live price unavailable)"
+                continue
+            gap = s["entry_price"] - live
+            if abs(gap) < 0.001:
+                s["held_reason"] = f"at entry ({live:.2f}) -- should fill imminently"
+            elif gap > 0:
+                s["held_reason"] = f"price {live:.2f}, needs to rise {gap:.2f} to entry {s['entry_price']:.2f}"
+            else:
+                s["held_reason"] = f"price {live:.2f}, needs to fall {-gap:.2f} to entry {s['entry_price']:.2f}"
+
         # Real totals, not len(pending) etc. -- those lists are capped at 300 for display,
         # so their length silently freezes at 300 once a bucket exceeds it (caught live,
         # 2026-09-09: PENDING sat at exactly 300 while the true count was 322 and climbing).
@@ -1491,10 +1607,31 @@ def api_broker_queue():
             cap = getattr(get_config().orders, "max_resting_per_side", 10)
         except Exception:
             cap = 10
-        held_back = [dict(r) for r in con.execute(
-            "SELECT symbol, direction, COUNT(*) c FROM commands WHERE status='SUBMITTED'"
-            " GROUP BY symbol, direction HAVING c >= ?", (cap,)
-        ).fetchall()]
+
+        # 2026-09-11: was its own same-side-only approximation here (COUNT of SUBMITTED
+        # on the same side >= cap) which silently disagreed with broker.py's real
+        # admission-cap gate (same-side entries + 2x OPPOSITE-side entries) -- confirmed
+        # live showing "none held back" while commands were held back every cycle.
+        # Reuses broker.py's own gate function so this can't drift out of sync again.
+        from lib.db import compute_side_resting
+        pending_sides = {(p["symbol"], p["direction"]) for p in pending}
+        held_back = []
+        for symbol, direction in pending_sides:
+            resting = compute_side_resting(con, symbol, direction)
+            if resting >= cap:
+                held_back.append({"symbol": symbol, "direction": direction, "c": resting})
+
+        # Annotate each pending row with why it hasn't submitted yet -- the smallest
+        # useful answer to "is it waiting for price or something": today it's always
+        # the admission cap (Gate 1) or simply "next in queue" (Gate 2's stale-price
+        # check only ever CANCELS a command, it never leaves one sitting PENDING).
+        resting_by_side = {(h["symbol"], h["direction"]): h["c"] for h in held_back}
+        for p in pending:
+            side = (p["symbol"], p["direction"])
+            if side in resting_by_side:
+                p["held_reason"] = f"at cap ({resting_by_side[side]}/{cap} resting)"
+            else:
+                p["held_reason"] = "queued"
 
         recent_stale = [dict(r) for r in con.execute(
             "SELECT id, symbol, direction, error_message, updated_at FROM commands"
@@ -1754,31 +1891,27 @@ def api_sandbox_profile(symbol: str, date_str: str):
 
 def _fetch_live_prices(symbols: list) -> dict:
     """
-    Ephemeral IB LIVE-data-only connection (paper=False -- data only, no order
-    capability) to snapshot current prices for the requested symbols. Connects,
-    fetches, disconnects -- never held open between requests, unlike broker.py/
-    decider.py's long-lived connections. Uses the same live_client_ids pool;
-    IBClient's connect-retry already shuffles through free IDs so this can't
-    collide with an ID broker/decider currently holds.
+    LIVE-data-only price snapshot for the requested symbols, run as its own process
+    via trader/scripts/ib_dayclean.py's prices() -- this used to call IBClient directly
+    in-thread here, which silently returned "unavailable" for every symbol (ib_insync's
+    event-loop requirement doesn't reliably hold up in a Flask request thread, the same
+    class of bug already fixed for the Day Start panel's verify/cancel-flatten routes;
+    confirmed live 2026-09-11 that this route had the identical, previously-unnoticed,
+    silently-swallowed failure).
     """
     prices = {s: None for s in symbols}
     try:
-        from lib.ib_client import IBClient
-        from lib.config_loader import get_config
-        cfg_path = _ROOT / "trader" / "config.yaml"
-        ibc = IBClient(get_config(cfg_path))
-        ibc.connect(live=True, paper=False)
-        try:
-            for sym in symbols:
-                try:
-                    prices[sym] = ibc.get_price(sym)
-                except Exception:
-                    prices[sym] = None
-        finally:
-            ibc.disconnect()
+        proc = subprocess.run(
+            [sys.executable, str(_ROOT / "trader" / "scripts" / "ib_dayclean.py"),
+             "prices", "--symbols", ",".join(symbols)],
+            capture_output=True, text=True, timeout=30,
+        )
+        result_line = next((l for l in reversed(proc.stdout.splitlines()) if l.startswith("{")), None)
+        if result_line:
+            parsed = ast.literal_eval(result_line)
+            prices.update(parsed)
     except Exception as e:
-        log_msg = f"Algo Lab: live price fetch unavailable ({e})"
-        print(log_msg)
+        print(f"Live price fetch unavailable ({e})")
     return prices
 
 
@@ -2133,9 +2266,11 @@ body:not(.busy-wait) .busy-strip{background:var(--gl-border)}
   padding:12px 14px;cursor:pointer;transition:border-color .15s,box-shadow .15s}
 .cmp-card:hover{border-color:var(--gl-accent)}
 .cmp-card.active{border-color:var(--gl-accent);box-shadow:0 0 0 1px var(--gl-accent) inset}
-.cmp-card h6{font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--gl-muted);
-  font-weight:700;margin-bottom:8px}
-.cmp-overall{font-family:var(--gl-mono);font-variant-numeric:tabular-nums;font-size:19px;margin-bottom:2px}
+.cmp-head{display:flex;justify-content:space-between;align-items:baseline;gap:8px;margin-bottom:4px}
+.cmp-name{font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--gl-muted);font-weight:700}
+.cmp-overall{font-family:var(--gl-mono);font-variant-numeric:tabular-nums;font-size:17px;white-space:nowrap}
+.cmp-desc{font-size:11px;color:var(--gl-muted);margin-bottom:8px;overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap}
 .cmp-sub{font-size:11px;color:var(--gl-muted);margin-bottom:10px}
 .cmp-et-row{display:flex;justify-content:space-between;font-family:var(--gl-mono);
   font-variant-numeric:tabular-nums;font-size:11.5px;padding:4px 0;border-top:1px solid var(--gl-border)}
@@ -2176,7 +2311,7 @@ body:not(.busy-wait) .busy-strip{background:var(--gl-border)}
     <!-- Header -->
     <div class="app-header">
       <span class="brand">Galao</span>
-      <span class="verchip">v5.03</span>
+      <span class="verchip">v5.05</span>
       <span class="gl-pill" id="session-broker-badge" style="color:var(--gl-muted)">Broker: —</span>
       <span class="gl-pill" id="session-decider-badge" style="color:var(--gl-muted)">Decider: —</span>
       <span class="text-muted" id="session-uptime" style="font-size:.7rem;min-width:3.5em"></span>
@@ -2776,11 +2911,16 @@ body:not(.busy-wait) .busy-strip{background:var(--gl-border)}
 <div class="tab-pane fade" id="tab-broker">
   <div class="dayclean-bar">
     <b class="small">Day Start</b>
-    <button class="btn btn-sm btn-outline-secondary" onclick="dcVerify()">Verify</button>
-    <button class="btn btn-sm btn-outline-warning" onclick="dcClean()">Clean DB noise</button>
-    <button class="btn btn-sm btn-outline-danger" onclick="dcCancelFlatten()">Cancel &amp; Flatten IB</button>
+    <button class="btn btn-sm btn-outline-secondary" id="dc-btn-verify" onclick="dcVerify()">Verify</button>
+    <button class="btn btn-sm btn-outline-warning" id="dc-btn-clean" onclick="dcClean()">Clean DB noise</button>
+    <button class="btn btn-sm btn-outline-danger" id="dc-btn-cancelflatten" onclick="dcCancelFlatten()">Cancel &amp; Flatten IB</button>
+    <button class="btn btn-sm btn-outline-primary" id="dc-btn-forcefutures" onclick="dcForceFutures()">Force Futures Now</button>
+    <button class="btn btn-sm btn-outline-primary" id="dc-btn-forceall" onclick="dcForceAll()">Force All Symbols Now</button>
+    <button class="btn btn-sm btn-outline-info" id="dc-btn-extractfutures" onclick="dcExtractFutures()">Extract Futures Lines</button>
+    <button class="btn btn-sm btn-outline-info" id="dc-btn-extractstocks" onclick="dcExtractStocks()">Extract Stock Lines</button>
     <span class="small text-muted" id="dc-status"></span>
   </div>
+  <div class="small text-muted" id="dc-summary" style="margin:-4px 0 10px 2px"></div>
   <div class="broker-stats">
     <div class="broker-stat"><div class="k">Pending</div><div class="v" id="bk-c-pending">—</div></div>
     <div class="broker-stat"><div class="k">Submitted</div><div class="v" id="bk-c-submitted">—</div></div>
@@ -4079,11 +4219,13 @@ function _bkRow(r,bucket){
             (r.sl_price!=null?`<span class="dir-sell">${fmt(r.sl_price)}</span>`:'')+
             (r.needs_review?'<span class="rev">&#9888; review</span>':'');
   }
+  const status = r.held_reason ? `<span class="src" title="status">${r.held_reason}</span>` : '';
   return `<div class="broker-row${justArrived}" data-id="${bucket}:${r.id}">`+
          `<span class="sym">${r.symbol}</span>`+
          `<span class="${dirCls}">${r.direction}</span>`+
          `<span class="src">${r.source||''}</span>`+
          extra+
+         status+
          `<span class="age">${age}</span>`+
          `</div>`;
 }
@@ -4101,6 +4243,21 @@ function _dcSetStatus(msg, isErr){
   el.innerHTML = msg;
   el.style.color = isErr ? 'var(--gl-bad)' : 'var(--gl-muted)';
 }
+function _dcApplyGating(g){
+  document.getElementById('dc-btn-clean').disabled = !g.can_clean;
+  document.getElementById('dc-btn-cancelflatten').disabled = !g.can_cancel_flatten;
+  document.getElementById('dc-btn-forcefutures').disabled = !g.can_force_futures;
+  document.getElementById('dc-btn-forceall').disabled = !g.can_force_all;
+  document.getElementById('dc-btn-extractfutures').disabled = !g.can_extract_futures;
+  document.getElementById('dc-btn-extractstocks').disabled = !g.can_extract_stocks;
+}
+function _dcRenderSummary(ex){
+  const fx = ex.futures, st = ex.stocks;
+  const perSym = Object.entries(fx.per_symbol).map(([s,n])=>`${s}:${n}`).join(', ') || 'none';
+  document.getElementById('dc-summary').textContent =
+    `Futures lines: ${fx.symbols_with_lines}/${fx.of} symbols (${perSym}) `+
+    `· Stock lines: ${st.symbols_with_lines}/${st.of} symbols, ${st.total_lines} lines total`;
+}
 async function dcVerify(){
   _dcSetStatus('checking...');
   try{
@@ -4112,6 +4269,8 @@ async function dcVerify(){
       `${d.db.stale_pending_from_past_days} stale PENDING/SUBMITTED (needs manual look), `+
       `${d.db.needs_review} flagged needs_review, ${d.db.already_archived} already archived `+
       `&middot; ${ib}`);
+    _dcApplyGating(d.gating);
+    _dcRenderSummary(d.extraction);
   }catch(e){ _dcSetStatus('verify failed: '+e, true); }
 }
 async function dcClean(){
@@ -4121,6 +4280,7 @@ async function dcClean(){
     const d = await (await fetch('/api/dayclean/clean',{method:'POST'})).json();
     _dcSetStatus(`Archived ${d.archived} old CANCELLED rows to commands_archive.`);
   }catch(e){ _dcSetStatus('clean failed: '+e, true); }
+  dcVerify();
 }
 async function dcCancelFlatten(){
   if(!confirm('Cancel ALL resting IB orders and flatten ALL open positions (LIVE+PAPER)? This is immediate and affects the real account.')) return;
@@ -4131,6 +4291,44 @@ async function dcCancelFlatten(){
       `&middot; DB: ${d.db_cancelled} cancelled, ${d.db_flattened} closed`+
       (d.errors.length ? ` &middot; errors: ${d.errors.join('; ')}` : ''), d.errors.length>0);
   }catch(e){ _dcSetStatus('cancel/flatten failed: '+e, true); }
+  dcVerify();
+}
+async function dcForceFutures(){
+  if(!confirm('Restart decider now so futures pick up any new lines immediately?')) return;
+  _dcSetStatus('restarting decider (futures)...');
+  try{
+    const d = await (await fetch('/api/dayclean/force-futures-start',{method:'POST'})).json();
+    _dcSetStatus(d.restarted ? 'Decider restarted -- futures generating now.' : 'Restart failed -- see server log.');
+  }catch(e){ _dcSetStatus('force futures failed: '+e, true); }
+  dcVerify();
+}
+async function dcForceAll(){
+  if(!confirm('Restart decider now AND skip the stock-market wait gate for today -- all 34 symbols start immediately?')) return;
+  _dcSetStatus('restarting decider (all symbols)...');
+  try{
+    const d = await (await fetch('/api/dayclean/force-all-start',{method:'POST'})).json();
+    _dcSetStatus(d.restarted ? 'Decider restarted -- all symbols generating now (gate overridden for today).' : 'Restart failed -- see server log.');
+  }catch(e){ _dcSetStatus('force all failed: '+e, true); }
+  dcVerify();
+}
+async function dcExtractFutures(){
+  _dcSetStatus('extracting futures lines (Geva + Algo 1/2)...');
+  try{
+    const d = await (await fetch('/api/dayclean/extract-futures-lines',{method:'POST'})).json();
+    const gevaLast = (d.geva_stdout||'').trim().split('\n').pop() || '(no output)';
+    const researchLast = (d.research_stdout||'').trim().split('\n').pop() || '(no output)';
+    _dcSetStatus(`Geva: ${gevaLast} &middot; Research: ${researchLast}`);
+  }catch(e){ _dcSetStatus('extract futures lines failed: '+e, true); }
+  dcVerify();
+}
+async function dcExtractStocks(){
+  _dcSetStatus('extracting stock lines (Algo 1/2, 30 symbols)...');
+  try{
+    const d = await (await fetch('/api/dayclean/extract-stock-lines',{method:'POST'})).json();
+    const last = (d.stdout||'').trim().split('\n').pop() || '(no output)';
+    _dcSetStatus(`Stock lines: ${last}`);
+  }catch(e){ _dcSetStatus('extract stock lines failed: '+e, true); }
+  dcVerify();
 }
 
 let _bkRange = 'today';
@@ -4173,16 +4371,21 @@ async function loadBroker(){
   }catch(e){}
 }
 
+let _dcTimer=null;
+
 document.getElementById('btn-broker-tab').addEventListener('click',()=>{
   loadBroker();
   clearInterval(_bkTimer);
   _bkTimer=setInterval(loadBroker,5000);   // matches broker.py's own command_poll_seconds
+  dcVerify();
+  clearInterval(_dcTimer);
+  _dcTimer=setInterval(dcVerify,15000);    // Day Start gating/summary change far less often
 });
 
 // Leaving the Broker tab stops its poll and restores the normal tab title --
 // any other top-tab button click does it.
 document.querySelectorAll('#mainTab .top-tab:not(#btn-broker-tab)').forEach(b=>{
-  b.addEventListener('click',()=>{ clearInterval(_bkTimer); document.title='Galao'; });
+  b.addEventListener('click',()=>{ clearInterval(_bkTimer); clearInterval(_dcTimer); document.title='Galao'; });
 });
 
 // Keyboard shortcuts: 'b' -> Broker, Escape -> Overview. Ignored while typing in a field.
@@ -4190,7 +4393,7 @@ document.addEventListener('keydown', e=>{
   const tag=(e.target.tagName||'').toLowerCase();
   if(tag==='input'||tag==='textarea'||tag==='select') return;
   if(e.key==='b'||e.key==='B'){ selectGroupTab('trading','tab-broker'); document.getElementById('btn-broker-tab').click(); }
-  else if(e.key==='Escape'){ clearInterval(_bkTimer); selectGroupTab('overview','tab-overview'); }
+  else if(e.key==='Escape'){ clearInterval(_bkTimer); clearInterval(_dcTimer); selectGroupTab('overview','tab-overview'); }
 });
 
 // ── Stats screen ─────────────────────────────────────────────────────────────
@@ -4259,6 +4462,22 @@ const ST_BUCKET_HELP = {
   'Critical Line': 'Legacy/orphaned commands with no critical_line_id reference at all -- pre-fix leftovers, not a real algorithm type.',
   'Algo Lab': 'Algo Lab parameter-grid submissions (strategy x tp x sl x direction x strength combos).',
   'Other': "Everything else, including GevaExtract's own automated MNQ noise (Geva never posts MNQ -- any geva_extract row on a non-MES symbol lands here).",
+};
+
+// One-line versions of the help text above, for on-card display (2026-09-11 -- the full
+// text was only reachable as a hover tooltip, which nobody was finding; "what does
+// Critical Line mean?" kept coming up).
+const ST_BUCKET_SHORT = {
+  'All': 'Every closed trade, any source.',
+  'GevaExtract': 'Real Geva Facebook signal, hand-entered MES lines.',
+  'Algo 1 (Real)': 'Previous-day-low breakout lines.',
+  'Algo 1 (Control)': 'Random control matched to Algo 1 (Real).',
+  'Algo 2 (Real)': 'Previous-day-high + pivot confluence lines.',
+  'Algo 2 (Control)': 'Random control matched to Algo 2 (Real).',
+  'Control': "GevaExtract's own random control line (separate from Algo 1/2).",
+  'Critical Line': 'Legacy/orphaned trades -- not a real algorithm.',
+  'Algo Lab': 'Parameter-grid strategy testing.',
+  'Other': "GevaExtract's own MNQ noise + uncategorized.",
 };
 
 function _stSelectBucket(bucket){
@@ -4333,9 +4552,12 @@ function _stRender(){
           <span>n=${v.n}</span><span>${v.win_pct}%</span>
           <span style="color:${v.usd>=0?'var(--gl-good)':'var(--gl-bad)'}">${v.usd>=0?'+':''}$${fmt(v.usd)}</span>
         </div>`).join('');
-      return `<div class="cmp-card ${b===_stBucket?'active':''}" data-bucket="${b}">
-        <h6 title="${ST_BUCKET_HELP[b]||''}">${b}</h6>
-        <div class="cmp-overall" style="color:${o.usd>=0?'var(--gl-good)':'var(--gl-bad)'}">${o.usd>=0?'+':''}$${fmt(o.usd)}</div>
+      return `<div class="cmp-card ${b===_stBucket?'active':''}" data-bucket="${b}" title="${ST_BUCKET_HELP[b]||''}">
+        <div class="cmp-head">
+          <span class="cmp-name">${b}</span>
+          <span class="cmp-overall" style="color:${o.usd>=0?'var(--gl-good)':'var(--gl-bad)'}">${o.usd>=0?'+':''}$${fmt(o.usd)}</span>
+        </div>
+        <div class="cmp-desc">${ST_BUCKET_SHORT[b]||''}</div>
         <div class="cmp-sub">n=${o.n} &middot; ${o.win_pct}% win &middot; PF ${_pf(o.profit_factor)}</div>
         ${etRows || '<div class="cmp-empty">no entry-type breakdown</div>'}
       </div>`;
@@ -5289,6 +5511,64 @@ document.addEventListener('shown.bs.tab',function(e){
 # ── Release notes ─────────────────────────────────────────────────────────────
 
 _RELEASE_NOTES = [
+    ("v5.05", "Day Start: two line-extraction buttons; every button now grays out when there's "
+              "nothing for it to do; new extraction-coverage summary line",
+              "Added 'Extract Futures Lines' (POST /api/dayclean/extract-futures-lines -- runs "
+              "import_geva_manual_lines.py + prep_research_lines.py) and 'Extract Stock Lines' "
+              "(POST /api/dayclean/extract-stock-lines -- runs prep_research_lines_stocks.py), "
+              "prompted by this morning's incident where futures line extraction silently produced "
+              "lines for only 2 of 4 symbols (root cause traced to a dead Fetcher2026 bar-fetch "
+              "pipeline, a separate issue -- but nothing on this panel would have surfaced the gap "
+              "without a manual DB query).\n\n"
+              "Every one of the 7 Day Start buttons is now disabled server-side via a new `gating` "
+              "block in /api/dayclean/verify's response, computed once and shared by the whole "
+              "panel: Clean DB noise grays out when there's no stale CANCELLED noise; Cancel & "
+              "Flatten grays out when IB shows no resting orders/positions; Force Futures Now grays "
+              "out once today's session has already started; Force All Symbols Now grays out once "
+              "already forced today or the stock gate has naturally passed; Extract Stock Lines "
+              "grays out once run today (deterministic per date, a new EXTRACT_STOCK_LINES_DATE "
+              "system_state flag records it); Extract Futures Lines deliberately does NOT use an "
+              "equivalent flag -- it stays live as long as Geva hasn't posted real lines yet today "
+              "(derived live from critical_lines, not a flag, since Geva can post later in the day "
+              "unlike the deterministic algo-line half), only graying out once Geva's real lines "
+              "actually land.\n\n"
+              "New #dc-summary line shows extraction coverage at a glance: how many of the 4 "
+              "futures (with a per-symbol line count) and how many of the 30 stocks (aggregate "
+              "count only) actually have a critical line today. Auto-refreshes every 15s while the "
+              "Broker tab is open (same start/stop lifecycle as the existing 5s broker-queue poll), "
+              "not just after a manual Verify click, so a gap like this morning's shows up "
+              "immediately instead of needing a click to notice."),
+    ("v5.04", "Day Start: two force-start buttons; fixed a silent admission-cap reporting bug and a "
+              "silently-failing live-price fetch; Broker screen rows now show why they're stuck",
+              "Day Start panel: added 'Force Futures Now' (POST /api/dayclean/force-futures-start) and "
+              "'Force All Symbols Now' (POST /api/dayclean/force-all-start, sets a "
+              "FORCE_ALL_SYMBOLS_DATE system_state flag decider.py's run_session_start reads to skip "
+              "the stock-open wait for today only). Both restart decider.py -- which surfaced that "
+              "_restart_decider_process() was silently broken in two ways: it read decider.lock's PID "
+              "via a plain file read, which fails under Windows' mandatory byte-range lock while "
+              "decider actually holds it (i.e. always in production), so it always reported 'not "
+              "running'; and even after that's fixed, it only ever killed the process, relying on a "
+              "session.py supervisor to respawn it that isn't actually running in this environment. "
+              "Now reuses restart_decider_daily.py's self-sufficient kill+respawn (the same mechanism "
+              "the scheduled 08:00 IL daily restart already uses safely) instead of a kill-only helper.\n\n"
+              "Broker screen: the 'At cap (held back)' stat had its own same-side-only approximation "
+              "(COUNT of SUBMITTED on the same side >= cap) that silently disagreed with broker.py's "
+              "real admission-cap gate (same-side entries + 2x OPPOSITE-side entries) -- confirmed "
+              "live showing 'none held back' while M2K/MYM SELL commands were actually held back at "
+              "~11/10 resting every single cycle. Extracted the real gate math into "
+              "lib.db.compute_side_resting() (not trader.broker, which imports lib.ib_client -> "
+              "ib_insync at module level and crashes on first import from a Flask thread) so both "
+              "broker.py's real gate and this stat now call the identical function.\n\n"
+              "Every Pending/Submitted/Filled row now carries a held_reason field, rendered as a "
+              "status column: Pending shows 'at cap (N/cap resting)' or 'queued'; Submitted shows the "
+              "live price gap to entry ('price X, needs to rise/fall Y to entry Z'); Filled shows "
+              "'open position'. The Submitted price gap needed a genuine live quote per symbol, which "
+              "exposed the same in-thread IB event-loop crash already fixed once this session for the "
+              "Day Start routes -- _fetch_live_prices() was silently returning None for every symbol "
+              "(the exception was swallowed per-symbol, never logged), so Algo Lab's price chips have "
+              "likely been silently broken by this too. Fixed the same way: added a 'prices' mode to "
+              "trader/scripts/ib_dayclean.py and _fetch_live_prices() now shells out to it instead of "
+              "calling IBClient in-thread."),
     ("v5.03", "Charts: Graph is now the default; All tab capped at 2 weeks, overlay mode removed; "
               "Geva Extract moved into the rail menu; Lines gets deep algo tooltips",
               "Nav: Geva Extract was a rail-item styled/positioned as a standalone link (after the "

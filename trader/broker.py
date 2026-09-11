@@ -31,7 +31,7 @@ import sys; sys.path.insert(0, str(_ROOT)) if str(_ROOT) not in sys.path else No
 
 from lib.config_loader import get_config
 from lib.logger import get_logger
-from lib.db import get_db, init_db, get_pending_commands, update_command_status, get_system_state, record_completed_trade, spawn_replenishment, update_price_cache, get_cached_price, flag_needs_review, clear_needs_review
+from lib.db import get_db, init_db, get_pending_commands, update_command_status, get_system_state, record_completed_trade, spawn_replenishment, update_price_cache, get_cached_price, flag_needs_review, clear_needs_review, compute_side_resting
 from lib.ib_client import IBClient
 from lib.order_builder import build_bracket, place_bracket, round_tick, get_tick_size
 
@@ -301,19 +301,8 @@ def process_pending_commands(ibc: IBClient, db_path, cfg) -> int:
         # incident, not a hypothetical. geva_manual still gets first crack at whatever
         # capacity exists each cycle via the priority sort above, it's just no longer
         # unbounded.
-        opposite = "SELL" if cmd["direction"] == "BUY" else "BUY"
         with get_db(db_path) as con:
-            same_side_entries = con.execute(
-                "SELECT COUNT(*) FROM commands WHERE symbol=? AND direction=?"
-                " AND (status='SUBMITTED' OR (status='FILLED' AND needs_review=0))",
-                (cmd["symbol"], cmd["direction"])
-            ).fetchone()[0]
-            opposite_side_legs = con.execute(
-                "SELECT COUNT(*) FROM commands WHERE symbol=? AND direction=?"
-                " AND (status='SUBMITTED' OR (status='FILLED' AND needs_review=0))",
-                (cmd["symbol"], opposite)
-            ).fetchone()[0]
-        resting = same_side_entries + opposite_side_legs * 2
+            resting = compute_side_resting(con, cmd["symbol"], cmd["direction"])
         if resting >= max_per_side:
             log.warning(f"Command {cid} ({cmd['symbol']} {cmd['direction']}) held back — "
                         f"~{resting} resting on that side (entries + opposite TP/SL legs), "
@@ -1073,7 +1062,10 @@ def run_broker(db_path=None, dry_run: bool = False):
                     log.error(f"Error in reconcile_naked_positions: {e}")
                 last_ib_poll = now
 
-            time.sleep(poll_seconds)
+            # ibc.live.sleep() instead of time.sleep(): services ib_insync's event loop
+            # during this idle wait, which is what keeps get_price()'s persistent ticker
+            # subscriptions (2026-09-11) actually updating in the background.
+            ibc.live.sleep(poll_seconds)
 
     except KeyboardInterrupt:
         log.info("Broker interrupted")

@@ -82,6 +82,39 @@ try {
     Write-Host "FAILED: CC2026RandomBaseline - $_" -ForegroundColor Red
 }
 
+# --- Task: Decider daily restart (2026-09-11 -- previously registered out-of-band,
+#     not via this script, and failing every day with ERROR_FILE_NOT_FOUND: a bare
+#     python.exe with no resolvable PATH/working directory in the task's own run
+#     context -- the same class of bug as Fetcher2026's 19-day outage, see the
+#     Principal comment above. decider.py only re-scans critical_lines and picks up a
+#     new day's date once, at process startup -- this restart is what makes that
+#     happen daily. Timing: 08:00 IL, well before the ~17:00 IL stock-open gate; see
+#     trader/scripts/restart_decider_daily.py's own docstring for why any
+#     early-morning time works. -Force overwrites the existing broken registration. ---
+$DeciderRestartAction = New-ScheduledTaskAction -Execute $Python `
+    -Argument "`"$ProjectRoot\trader\scripts\restart_decider_daily.py`"" `
+    -WorkingDirectory $ProjectRoot
+
+$DeciderRestartTrigger = New-ScheduledTaskTrigger -Daily -At "08:00"
+
+$DeciderRestartSettings = New-ScheduledTaskSettingsSet `
+    -MultipleInstances IgnoreNew `
+    -ExecutionTimeLimit (New-TimeSpan -Minutes 2) `
+    -StartWhenAvailable
+
+try {
+    Register-ScheduledTask -TaskName "DeciderDailyRestart" `
+        -Action $DeciderRestartAction -Trigger $DeciderRestartTrigger -Settings $DeciderRestartSettings `
+        -Principal $Principal -Force -ErrorAction Stop | Out-Null
+    if (Get-ScheduledTask -TaskName "DeciderDailyRestart" -ErrorAction SilentlyContinue) {
+        Write-Host "OK: DeciderDailyRestart (restarts decider.py daily at 08:00 IL)"
+    } else {
+        Write-Host "FAILED: DeciderDailyRestart registration did not stick." -ForegroundColor Red
+    }
+} catch {
+    Write-Host "FAILED: DeciderDailyRestart - $_" -ForegroundColor Red
+}
+
 # --- Firewall rule for port 5003 ---
 try {
     if (-not (Get-NetFirewallRule -DisplayName "CC2026 Trading Dashboard" -ErrorAction SilentlyContinue)) {
