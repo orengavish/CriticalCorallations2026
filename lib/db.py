@@ -88,6 +88,13 @@ CREATE TABLE IF NOT EXISTS commands (
                                               -- additive-only -- NULL for historical rows written before
                                               -- this field existed.
     parent_command_id   INTEGER,            -- set when this command was auto-replenished from another
+    spread_group_id     TEXT,               -- links the two legs of a source='spread' hedged pair
+                                              -- (trader/spread_manager.py). Nullable, additive-only --
+                                              -- NULL for every other source. tp_price/sl_price on a
+                                              -- spread leg are set equal to entry_price (an inert
+                                              -- zero-distance sentinel, not a real bracket -- AI-35
+                                              -- legs carry no TP or SL order at all; avoids a NOT NULL
+                                              -- schema change to those two long-standing columns).
     critical_line_id    INTEGER REFERENCES critical_lines(id),  -- origin line when source=critical_line
     algo_type           TEXT,               -- trade strategy when source=algo_lab: BOUNCE|BREAKOUT|DIRECTIONAL|FADE|BOTH
     params_json         TEXT,               -- full param combo (JSON) when source=algo_lab, for P&L attribution
@@ -475,6 +482,33 @@ CREATE TABLE IF NOT EXISTS correlation_watch (
     UNIQUE(symbol, critical_line_id)
 );
 CREATE INDEX IF NOT EXISTS idx_corr_watch_status ON correlation_watch(status, break_direction);
+
+-- Spread algorithm (Part 3): one row per open/closed hedged pair. See
+-- trader/spread_manager.py. spread_group_id here matches commands.spread_group_id
+-- for both legs.
+CREATE TABLE IF NOT EXISTS spread_positions (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    spread_group_id     TEXT    NOT NULL UNIQUE,
+    sym_a               TEXT    NOT NULL,
+    sym_b               TEXT    NOT NULL,
+    qty_a               INTEGER NOT NULL,
+    qty_b               INTEGER NOT NULL,
+    action_a            TEXT    NOT NULL,   -- BUY | SELL
+    action_b            TEXT    NOT NULL,
+    source              TEXT    NOT NULL,   -- 'spread' (literal AI-35a direction) |
+                                             -- 'spread_control' (reversed/mean-reversion reading)
+    entry_diff          REAL    NOT NULL,
+    extreme_diff        REAL    NOT NULL,   -- furthest the diff has moved in the OPENING
+                                             -- (against-position) direction since entry
+    point1_diff         REAL,               -- AI-35e "point 1": the level of the first
+                                             -- turn back toward closing, once observed
+    status              TEXT    NOT NULL DEFAULT 'OPEN',   -- OPEN | CLOSED
+    opened_at           TEXT    NOT NULL,
+    closed_at           TEXT,
+    close_reason        TEXT,   -- GAP_CLOSED | ADVERSE_BREAK | KILL_SWITCH
+    updated_at          TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+);
+CREATE INDEX IF NOT EXISTS idx_spread_pos_status ON spread_positions(status, sym_a, sym_b);
 """
 
 
@@ -572,6 +606,7 @@ def _migrate(path: Path = None):
     alter_stmts = [
         "ALTER TABLE commands ADD COLUMN source TEXT",
         "ALTER TABLE commands ADD COLUMN parent_command_id INTEGER",
+        "ALTER TABLE commands ADD COLUMN spread_group_id TEXT",
         "ALTER TABLE commands ADD COLUMN critical_line_id INTEGER REFERENCES critical_lines(id)",
         "ALTER TABLE commands ADD COLUMN algo_type TEXT",
         "ALTER TABLE commands ADD COLUMN params_json TEXT",
@@ -751,6 +786,19 @@ def _migrate(path: Path = None):
             UNIQUE(symbol, critical_line_id)
         )""",
         "CREATE INDEX IF NOT EXISTS idx_corr_watch_status ON correlation_watch(status, break_direction)",
+        """CREATE TABLE IF NOT EXISTS spread_positions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            spread_group_id TEXT NOT NULL UNIQUE,
+            sym_a TEXT NOT NULL, sym_b TEXT NOT NULL,
+            qty_a INTEGER NOT NULL, qty_b INTEGER NOT NULL,
+            action_a TEXT NOT NULL, action_b TEXT NOT NULL,
+            source TEXT NOT NULL,
+            entry_diff REAL NOT NULL, extreme_diff REAL NOT NULL, point1_diff REAL,
+            status TEXT NOT NULL DEFAULT 'OPEN',
+            opened_at TEXT NOT NULL, closed_at TEXT, close_reason TEXT,
+            updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+        )""",
+        "CREATE INDEX IF NOT EXISTS idx_spread_pos_status ON spread_positions(status, sym_a, sym_b)",
         # 2026-09-10: cleanup must archive, never DELETE outright -- an earlier "keep only
         # verified-good rows" pass deleted every real trade record on 6 dates along with
         # the noise it meant to remove (see MES Trade History Audit's "Known gaps"
@@ -1129,7 +1177,7 @@ def self_test() -> bool:
             expected = {"commands", "positions", "ib_events", "system_state",
                         "critical_lines", "release_notes", "fetch_log", "completed_trades",
                         "cl_algo_sim_results", "cl_algo_combo_scores",
-                        "cl_algo_reason_scores", "correlation_watch",
+                        "cl_algo_reason_scores", "correlation_watch", "spread_positions",
                         "cl_algo_score_history", "cl_algo_learner_runs",
                         "cl_algo_day_params", "cl_algo_fd_results",
                         "price_profile"}

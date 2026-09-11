@@ -35,6 +35,7 @@ from lib.db import get_db, init_db, get_pending_commands, update_command_status,
 from lib.ib_client import IBClient
 from lib.order_builder import build_bracket, place_bracket, round_tick, get_tick_size
 from trader.correlation_trail import trail_correlation_positions, TRAIL_TICKS
+from trader.spread_manager import check_spread_signals, check_spread_exit, check_portfolio_kill_switch
 
 log = get_logger("broker")
 
@@ -534,7 +535,18 @@ def poll_tp_sl_fills(ibc: IBClient, db_path) -> int:
     known_oids = {t.order.orderId for t in trades}
 
     with get_db(db_path) as con:
-        filled_cmds = con.execute("SELECT * FROM commands WHERE status='FILLED' AND needs_review=0").fetchall()
+        # source NOT IN ('spread','spread_control'): those commands are FILLED by
+        # design with no TP/SL order ids at all (AI-35 -- no per-leg stop, closed
+        # only by trader/spread_manager.py's own DIFF-pattern logic). They currently
+        # also have NULL fill_price/fill_time, which happens to make both loops
+        # below skip them already -- but that's an incidental side effect of what
+        # open_spread_position() does or doesn't set, not a real guard. Excluding
+        # them here explicitly means this stays correct even if a later change adds
+        # a real fill_price/fill_time to spread commands for other reasons.
+        filled_cmds = con.execute(
+            "SELECT * FROM commands WHERE status='FILLED' AND needs_review=0 "
+            "AND (source IS NULL OR source NOT IN ('spread','spread_control'))"
+        ).fetchall()
 
     if not filled_cmds:
         return 0
@@ -884,7 +896,7 @@ def reconcile_stuck_commands(ibc: IBClient, db_path) -> int:
     return resolved
 
 
-def reconcile_naked_positions(ibc: IBClient, cfg) -> None:
+def reconcile_naked_positions(ibc: IBClient, cfg, db_path=None) -> None:
     """
     Startup-only safety check (2026-07-20 incident): if broker was offline
     while a position's TP/SL got cancelled or otherwise dropped, there is
@@ -899,6 +911,19 @@ def reconcile_naked_positions(ibc: IBClient, cfg) -> None:
     futures (e.g. M2K x5, MNQ x2) and using it directly for an order price
     is exactly the mistake that turned an intended resting stop into an
     instant-fill market order during the 2026-07-20 incident.
+
+    Also runs every ib_poll_seconds in the main loop, not just at startup
+    (despite the name) -- which means the spread algorithm's legs, which are
+    deliberately submitted with NO resting TP or SL at all (AI-35: the hedge
+    itself bounds risk, not a per-leg stop), would otherwise get an emergency
+    stop slapped on them the moment they fill. db_path (when given) lets this
+    check for an open source='spread' FILLED command on the symbol and skip
+    it -- a live spread leg is not naked, it's meant to be unprotected. This
+    is a per-SYMBOL skip, not per-position: a symbol that's simultaneously
+    carrying both a spread leg and an unrelated genuinely-naked position
+    (same symbol, different source) would not get auto-protected either --
+    a narrow, accepted gap rather than the more invasive quantity-reconciling
+    check that would be needed to close it.
     """
     try:
         positions = [p for p in ibc.get_positions() if p.position != 0]
@@ -914,11 +939,23 @@ def reconcile_naked_positions(ibc: IBClient, cfg) -> None:
         log.error(f"reconcile_naked_positions: could not fetch open orders: {e}")
         return
 
+    spread_symbols = set()
+    if db_path:
+        try:
+            with get_db(db_path) as con:
+                spread_symbols = {r["symbol"] for r in con.execute(
+                    "SELECT DISTINCT symbol FROM commands WHERE source='spread' AND status='FILLED'"
+                ).fetchall()}
+        except Exception as e:
+            log.error(f"reconcile_naked_positions: could not check spread legs: {e}")
+
     bracket_pts = cfg.orders.active_brackets[0]
 
     for pos in positions:
         sym = pos.contract.symbol
         if sym in protected_symbols:
+            continue
+        if sym in spread_symbols:
             continue
 
         qty = abs(pos.position)
@@ -985,7 +1022,7 @@ def run_broker(db_path=None, dry_run: bool = False):
     register_ib_events(ibc, db_path)
 
     try:
-        reconcile_naked_positions(ibc, cfg)
+        reconcile_naked_positions(ibc, cfg, db_path)
     except Exception as e:
         log.error(f"reconcile_naked_positions failed (continuing startup): {e}")
 
@@ -1066,9 +1103,29 @@ def run_broker(db_path=None, dry_run: bool = False):
                 except Exception as e:
                     log.error(f"Error in reconcile_stuck_commands: {e}")
                 try:
-                    reconcile_naked_positions(ibc, cfg)
+                    reconcile_naked_positions(ibc, cfg, db_path)
                 except Exception as e:
                     log.error(f"Error in reconcile_naked_positions: {e}")
+                if getattr(getattr(cfg, "spread", None), "enabled", False):
+                    # Risk management (exit, kill-switch) before opening anything new.
+                    try:
+                        sk = check_portfolio_kill_switch(ibc, db_path, cfg)
+                        if sk:
+                            log.info(f"Kill-switch flattened {sk} spread position(s)")
+                    except Exception as e:
+                        log.error(f"Error in check_portfolio_kill_switch: {e}")
+                    try:
+                        se = check_spread_exit(ibc, db_path)
+                        if se:
+                            log.info(f"Closed {se} spread position(s) on exit signal")
+                    except Exception as e:
+                        log.error(f"Error in check_spread_exit: {e}")
+                    try:
+                        so = check_spread_signals(ibc, db_path, cfg)
+                        if so:
+                            log.info(f"Opened {so} new spread pair(s)")
+                    except Exception as e:
+                        log.error(f"Error in check_spread_signals: {e}")
                 last_ib_poll = now
 
             # ibc.live.sleep() instead of time.sleep(): services ib_insync's event loop
@@ -1153,19 +1210,26 @@ class _FakePosition:
         self.position = position
 
 class _FakePaper:
-    def __init__(self, trades): self._trades = trades
+    def __init__(self, trades, open_trades=None):
+        self._trades = trades
+        self._open_trades = open_trades if open_trades is not None else trades
+        self.orders_placed = []
     def trades(self): return self._trades
+    def openTrades(self): return self._open_trades
+    def placeOrder(self, contract, order):
+        self.orders_placed.append((contract, order))
+        return _FakeTrade(order_id=getattr(order, "orderId", 0), status="Submitted")
 
 class _FakeIBClient:
     """Minimal stand-in for IBClient's paper-account surface -- no real IB needed."""
-    def __init__(self, trades=None, positions=None, price=None):
-        self.paper = _FakePaper(trades or [])
+    def __init__(self, trades=None, positions=None, price=None, open_trades=None):
+        self.paper = _FakePaper(trades or [], open_trades)
         self._positions = positions or []
         self._price = price
     def is_paper_connected(self): return True
     def get_positions(self): return self._positions
-    def get_price(self, symbol): return self._price
-    def get_contract(self, symbol): return object()
+    def get_price(self, symbol, contract=None): return self._price
+    def get_contract(self, symbol): return _FakeContract(symbol)
 
 
 def self_test() -> bool:
@@ -1277,6 +1341,25 @@ def self_test() -> bool:
             assert r_stale["status"] == "FILLED", f"stale FILLED case status changed: {r_stale['status']}"
             assert r_stale["needs_review"] == 1, f"stale FILLED case: needs_review={r_stale['needs_review']}"
 
+            # 6b. Same staleness shape, but source='spread' -- must NOT get flagged.
+            # Spread legs are FILLED by design with no TP/SL order ids at all (AI-35:
+            # no per-leg stop); explicitly excluded in poll_tp_sl_fills's query, not
+            # relying on incidentally-NULL fill_price/fill_time.
+            # symbol='MYM' -- deliberately not MES/MNQ, which the later
+            # reconcile_naked_positions test (7b) uses to check the opposite
+            # case (a symbol that SHOULD get protected); sharing a symbol here
+            # would leak this fixture's source='spread' row into that check.
+            id_spread = _insert_cmd(symbol='MYM', status='FILLED', needs_review=0,
+                                    fill_price=0, fill_time=old_fill_time, source='spread',
+                                    ib_order_id=9020, ib_tp_order_id=None, ib_sl_order_id=None)
+            poll_tp_sl_fills(fake_ibc_2, db_path)
+            with get_db(db_path) as con:
+                r_spread = con.execute(
+                    "SELECT status, needs_review FROM commands WHERE id=?", (id_spread,)
+                ).fetchone()
+            assert r_spread["needs_review"] == 0, \
+                f"spread command must never be flagged needs_review, got {r_spread['needs_review']}"
+
             # 7. reconcile_stuck_commands case 2 (bug 5): flat position -> CLOSED
             #    (+ needs_review cleared), open position -> left alone with warning
             #    (needs_review stays 1)
@@ -1297,6 +1380,35 @@ def self_test() -> bool:
                 f"flat-position case: {dict(r_flat)}"
             assert r_open["status"] == "FILLED" and r_open["needs_review"] == 1, \
                 f"open-position case should stay untouched: {dict(r_open)}"
+
+            # 7b. reconcile_naked_positions: a symbol with an open position and
+            # zero resting orders normally gets an emergency protective stop --
+            # this is the exact safety net the spread algorithm's TP/SL-less legs
+            # (AI-35: hedge bounds risk, not a per-leg stop) need to be exempted
+            # from, or every spread fill would get an unwanted stop slapped on it
+            # the very next poll cycle. Two symbols, same "naked" shape: MES has
+            # no spread command -- must still get protected. MNQ has an open
+            # source='spread' FILLED command -- must NOT.
+            with get_db(db_path) as con:
+                con.execute("""
+                    INSERT INTO commands
+                        (symbol, line_price, line_type, line_strength, direction,
+                         entry_type, entry_price, tp_price, sl_price, bracket_size,
+                         source, quantity, logical_trade_id, status)
+                    VALUES ('MNQ', 20000, 'SUPPORT', 1, 'BUY', 'MKT', 20000, 20000, 20000, 0,
+                            'spread', 1, 'lt-spread-1', 'FILLED')
+                """)
+            fake_ibc_naked = _FakeIBClient(
+                positions=[_FakePosition("MES", 1), _FakePosition("MNQ", 1)],
+                price=6500.0,
+            )
+            reconcile_naked_positions(fake_ibc_naked, cfg, db_path)
+            assert len(fake_ibc_naked.paper.orders_placed) == 1, \
+                (f"Expected exactly 1 emergency stop (MES only, MNQ exempted as a "
+                 f"spread leg), got {len(fake_ibc_naked.paper.orders_placed)}")
+            protected_symbol = fake_ibc_naked.paper.orders_placed[0][0].symbol
+            assert protected_symbol == "MES", \
+                f"The emergency stop should have gone to MES, not {protected_symbol}"
 
             # 8. IB connection attempt
             ibc = IBClient(cfg)

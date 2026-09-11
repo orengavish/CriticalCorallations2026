@@ -206,3 +206,23 @@ correlation:
 correlation_trading:
   enabled: false
   trail_ticks: 3                   # AI-31 "very tight trailing stop", see correlation_trail.py
+
+# ── Spread Trading (Part 3 of the comparison-engine build cycle) ───────────────
+# Geva's DIFF method (Galgo2029/knowledge/Claims/spread-diff-trading.md, AI-35-
+# AI-35g): 1 long + 1 short leg, hedged, NO per-leg stop-loss -- the hedge
+# itself bounds risk (trader/spread_manager.py, lib/spread_diff.py,
+# lib/order_builder_spread.py). disabled by default, same posture as
+# correlation_trading above -- a brand-new, not-yet-validated signal source.
+#
+# AI-35a's leg-direction text ("the instrument that moved MORE -> LONG it")
+# reads ambiguous against plain mean-reversion logic without the source lesson
+# to resolve it -- 2026-09-11 decision: run BOTH readings simultaneously,
+# tagged separately (source='spread' = literal AI-35a text, 'spread_control' =
+# the reversed/mean-reversion reading), and let the comparison engine (Part 1)
+# judge which one is actually right, instead of guessing.
+spread:
+  enabled: false
+  kill_switch_usd: 500             # portfolio kill-switch: flattens both legs of a
+                                    # spread_group_id if its combined open loss crosses this
+  gap_multiplier: 1.75             # AI-35c's "1.5-2x average daily gap swing" entry trigger
+  max_contract_ratio_denominator: 6  # AI-35d contract-ratio simplification bound
