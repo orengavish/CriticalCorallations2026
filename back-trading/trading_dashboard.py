@@ -4687,16 +4687,6 @@ function _stRender(){
     <span class="big" style="color:${o.usd>=0?'var(--gl-good)':'var(--gl-bad)'}">${o.usd>=0?'+':''}$${fmt(o.usd)}</span>
     <span>PF ${_pf(o.profit_factor)}</span>`;
 
-  // Algo 1 vs Algo 2 vs their own Controls -- always both, regardless of selected bucket.
-  // Replaces the old single blended "Real vs Control" line (2026-09-10, goal 2/4).
-  document.getElementById('st-rvc-line').innerHTML = ['Algo 1','Algo 2'].map(algo=>{
-    const p = d.algo_vs_control[algo];
-    const r = p.real, c = p.control, edge = r.usd - c.usd;
-    return `${algo}: <b style="color:${r.usd>=0?'var(--gl-good)':'var(--gl-bad)'}">${r.usd>=0?'+':''}$${fmt(r.usd)}</b> (n=${r.n})`+
-      ` vs Ctrl <b style="color:${c.usd>=0?'var(--gl-good)':'var(--gl-bad)'}">${c.usd>=0?'+':''}$${fmt(c.usd)}</b> (n=${c.n})`+
-      ` &middot; edge ${edge>=0?'+':''}$${fmt(edge)}`;
-  }).join('<br>');
-
   // Bucket-vs-bucket comparison, Stop/Limit broken out inside each -- only groups with
   // any trades today are shown, so GevaExtract/Control/Critical Line (today's actual
   // activity) surface without empty Algo Lab/Other cards cluttering the compare.
