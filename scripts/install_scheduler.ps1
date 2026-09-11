@@ -12,9 +12,19 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltinRole]::Administra
 
 $ProjectRoot = "C:\Projects\CriticalCorallations2026"
 $Python      = (Get-Command python -ErrorAction Stop).Source
+# pythonw (not python) for every scheduled task below -- python.exe always opens a
+# visible console for the life of the process; with CC2026Dashboard firing every 5
+# minutes forever (this trigger has no RepetitionDuration cap) that's a black window
+# flashing up indefinitely, all day, every day -- the same class of bug already found
+# and fixed in Fetcher2026's GalgoFetcher2026 task (2026-09-11). random_gen.py already
+# logs everything real through lib.logger (trader/logs/), and trading_dashboard.py's
+# few startup print()s (which port, early-exit-if-already-bound) are cosmetic -- losing
+# them under pythonw is an acceptable trade for not spawning a visible window on every
+# trigger.
+$PythonW     = Join-Path (Split-Path $Python) "pythonw.exe"
 
 # --- Task: Trading Dashboard (every 5 min, exits immediately if port 5003 already bound) ---
-$Action = New-ScheduledTaskAction -Execute $Python `
+$Action = New-ScheduledTaskAction -Execute $PythonW `
             -Argument "`"$ProjectRoot\back-trading\trading_dashboard.py`"" `
             -WorkingDirectory $ProjectRoot
 
@@ -54,7 +64,7 @@ try {
 #     not competing for the same slots). --count 20 is a placeholder volume, not a
 #     precise match to GevaExtract's per-run count (which varies with how many
 #     scraped lines pass filtering) -- adjust if a closer volume match matters later. ---
-$RandomAction = New-ScheduledTaskAction -Execute $Python `
+$RandomAction = New-ScheduledTaskAction -Execute $PythonW `
     -Argument "`"$ProjectRoot\trader\random_gen.py`" --symbol MYM --count 20" `
     -WorkingDirectory $ProjectRoot
 
@@ -91,7 +101,7 @@ try {
 #     happen daily. Timing: 08:00 IL, well before the ~17:00 IL stock-open gate; see
 #     trader/scripts/restart_decider_daily.py's own docstring for why any
 #     early-morning time works. -Force overwrites the existing broken registration. ---
-$DeciderRestartAction = New-ScheduledTaskAction -Execute $Python `
+$DeciderRestartAction = New-ScheduledTaskAction -Execute $PythonW `
     -Argument "`"$ProjectRoot\trader\scripts\restart_decider_daily.py`"" `
     -WorkingDirectory $ProjectRoot
 
