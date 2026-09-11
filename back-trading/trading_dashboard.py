@@ -1770,12 +1770,6 @@ def api_closed_stats():
         r["bucket"] = _bucket_for(r["true_source"], r["symbol"], r["line_note"])
         r["usd"] = r["pnl_points"] * algo_pnl.SYMBOL_MULTIPLIERS.get(r["symbol"], 1.0)
 
-    algo_vs_control = {
-        algo: {"real": _summarize([r for r in rows if r["bucket"] == f"{algo} (Real)"]),
-               "control": _summarize([r for r in rows if r["bucket"] == f"{algo} (Control)"])}
-        for algo in ("Algo 1", "Algo 2")
-    }
-
     # Bracket is a global filter, not a comparison dimension -- 2026-09-09 finding that
     # the same real line fans out across multiple bracket sizes means mixing brackets
     # into a bucket-vs-bucket comparison would dilute it with near-duplicate entries.
@@ -1816,7 +1810,16 @@ def api_closed_stats():
             },
         }
 
-    bucket_rows = filtered_rows if bucket == "All" else [r for r in filtered_rows if r["bucket"] == bucket]
+    # 2026-09-11: the Results screen merged each Algo N's separate Real/Control
+    # buttons into one -- "Algo 1" here means either "Algo 1 (Real)" or
+    # "Algo 1 (Control)", not an exact bucket match. Every other bucket name
+    # (GevaExtract, Control, Critical Line, Algo Lab, Other) has no Real/Control
+    # split to begin with, so exact match still covers them.
+    if bucket == "All":
+        bucket_rows = filtered_rows
+    else:
+        bucket_rows = [r for r in filtered_rows
+                       if r["bucket"] == bucket or r["bucket"].startswith(bucket + " (")]
 
     # Individual trades, not aggregated -- summary tables kept hiding that "n=12" could
     # mean 2 real events fanned out across brackets (2026-09-09 finding). One row per
@@ -1840,7 +1843,6 @@ def api_closed_stats():
         "entry_type": entry_type, "exit_reason": exit_reason_f,
         "bucket_counts": {"All": len(rows),
                           **{b: len([r for r in rows if r["bucket"] == b]) for b in _BUCKET_ORDER}},
-        "algo_vs_control": algo_vs_control,
         "overall": _summarize(bucket_rows),
         "brackets_available": brackets_available,
         "exit_reasons_available": exit_reasons_available,
@@ -2317,8 +2319,6 @@ body:not(.busy-wait) .busy-strip{background:var(--gl-border)}
 
 .st-overall{font-family:var(--gl-mono);font-size:13px;display:flex;gap:16px;align-items:baseline}
 .st-overall .big{font-size:18px;font-weight:600}
-.st-rvc-line{font-size:11.5px;color:var(--gl-muted);margin-left:auto;text-align:right}
-.st-rvc-line b{color:var(--gl-ink)}
 
 /* 2026-09-10: comparison capped to its own content height instead of claiming 2/3 of
    the page -- the trade table below is the thing people actually scroll through, it
@@ -2348,6 +2348,13 @@ body:not(.busy-wait) .busy-strip{background:var(--gl-border)}
   font-variant-numeric:tabular-nums;font-size:11.5px;padding:4px 0;border-top:1px solid var(--gl-border)}
 .cmp-et-row .et-label{color:var(--gl-muted);font-family:'IBM Plex Sans',sans-serif}
 .cmp-empty{color:var(--gl-faint);font-size:11px;font-style:italic}
+.cmp-rvc-row{display:flex;gap:10px;margin-bottom:8px}
+.cmp-rvc-side{flex:1;min-width:0;background:var(--gl-bg);border-radius:6px;padding:6px 8px}
+.cmp-rvc-label{font-size:9.5px;text-transform:uppercase;letter-spacing:.05em;color:var(--gl-muted)}
+.cmp-rvc-val{font-family:var(--gl-mono);font-variant-numeric:tabular-nums;font-size:14px;
+  display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.cmp-rvc-sub{font-size:10px;color:var(--gl-muted)}
+.cmp-edge{font-size:11px;color:var(--gl-muted);font-family:var(--gl-mono)}
 #st-matrix-table{margin:0;font-family:var(--gl-mono);font-variant-numeric:tabular-nums}
 #st-matrix-table thead th{position:sticky;top:37px;background:var(--gl-panel-2);z-index:2;
   border-bottom:1px solid var(--gl-border);font-family:'SF Mono',ui-monospace,monospace;
@@ -2383,7 +2390,7 @@ body:not(.busy-wait) .busy-strip{background:var(--gl-border)}
     <!-- Header -->
     <div class="app-header">
       <span class="brand">Galao</span>
-      <span class="verchip">v5.08</span>
+      <span class="verchip">v5.09</span>
       <span class="gl-pill" id="session-broker-badge" style="color:var(--gl-muted)">Broker: —</span>
       <span class="gl-pill" id="session-decider-badge" style="color:var(--gl-muted)">Decider: —</span>
       <span class="text-muted" id="session-uptime" style="font-size:.7rem;min-width:3.5em"></span>
@@ -2945,7 +2952,6 @@ body:not(.busy-wait) .busy-strip{background:var(--gl-border)}
     </div>
     <div class="st-topbar-row">
       <div class="st-overall" id="st-overall"></div>
-      <div class="st-rvc-line" id="st-rvc-line"></div>
     </div>
   </div>
 
@@ -4509,6 +4515,23 @@ document.addEventListener('keydown', e=>{
 
 // ── Stats screen ─────────────────────────────────────────────────────────────
 const ST_BUCKETS = ['All','GevaExtract','Algo 1 (Real)','Algo 1 (Control)','Algo 2 (Real)','Algo 2 (Control)','Algo 3 (Real)','Algo 3 (Control)','Algo 4 (Real)','Algo 4 (Control)','Algo 5 (Real)','Algo 5 (Control)','Control','Critical Line','Algo Lab','Other'];
+// 2026-09-11: display/selection layer over ST_BUCKETS -- one button per Algo N
+// instead of separate Real/Control buttons (half the buttons; the backend
+// already accepts a bare "Algo N" bucket param as a Real+Control prefix
+// match, see api_closed_stats()). GevaExtract/Control/Critical Line/Algo Lab/
+// Other have no Real/Control split to merge, so they pass through unchanged.
+const ST_BUCKET_GROUPS = ['All','GevaExtract','Algo 1','Algo 2','Algo 3','Algo 4','Algo 5','Control','Critical Line','Algo Lab','Other'];
+const ST_PAIRED_ALGOS = new Set(['Algo 1','Algo 2','Algo 3','Algo 4','Algo 5']);
+function _stGroupMembers(group){
+  return ST_PAIRED_ALGOS.has(group) ? [`${group} (Real)`, `${group} (Control)`] : [group];
+}
+function _stGroupCount(group, counts){
+  return _stGroupMembers(group).reduce((sum,b)=>sum+(counts[b]||0), 0);
+}
+function _stGroupHelp(group, map){
+  if(!ST_PAIRED_ALGOS.has(group)) return map[group] || '';
+  return `Real: ${map[`${group} (Real)`]||''} | Control: ${map[`${group} (Control)`]||''}`;
+}
 // 2026-09-11: Algo 3/4/5 (FIVE_DAY_HIGH+PIVOT_CONFLUENCE, FIVE_DAY_LOW,
 // PREVIOUS_DAY_LOW+PIVOT_CONFLUENCE) were reinstated after being excluded 2026-09-07 for
 // not holding up as consistently as Algo 1/2 in that backtest sweep -- flagged visibly
@@ -4624,10 +4647,11 @@ function _stSelectBucket(bucket){
 function _stRender(){
   const d=_stLastData; if(!d) return;
 
-  // Single-select bucket bar (rebuilt each load so counts stay current)
-  document.getElementById('st-bucket-select').innerHTML = ST_BUCKETS.map(b=>
-    `<div class="st-bucket-opt ${b===_stBucket?'active':''}" data-bucket="${b}" title="${ST_BUCKET_HELP[b]||''}">${b}${_stUnreliableBadge(b)}`+
-    `<span class="n">${d.bucket_counts[b]}</span></div>`
+  // Single-select bucket bar (rebuilt each load so counts stay current) -- one
+  // button per Algo N (Real+Control combined), not two.
+  document.getElementById('st-bucket-select').innerHTML = ST_BUCKET_GROUPS.map(b=>
+    `<div class="st-bucket-opt ${b===_stBucket?'active':''}" data-bucket="${b}" title="${_stGroupHelp(b, ST_BUCKET_HELP)}">${b}${_stUnreliableBadge(b)}`+
+    `<span class="n">${b==='All' ? d.bucket_counts['All'] : _stGroupCount(b, d.bucket_counts)}</span></div>`
   ).join('');
   document.querySelectorAll('.st-bucket-opt').forEach(el=>{
     el.addEventListener('click',()=>_stSelectBucket(el.dataset.bucket));
@@ -4673,28 +4697,57 @@ function _stRender(){
       ` &middot; edge ${edge>=0?'+':''}$${fmt(edge)}`;
   }).join('<br>');
 
-  // Bucket-vs-bucket comparison, Stop/Limit broken out inside each -- only buckets with
+  // Bucket-vs-bucket comparison, Stop/Limit broken out inside each -- only groups with
   // any trades today are shown, so GevaExtract/Control/Critical Line (today's actual
-  // activity) surface without empty Real/Algo Lab/Other cards cluttering the compare.
-  document.getElementById('st-comparison').innerHTML = ST_BUCKETS
-    .filter(b => b!=='All' && d.comparison[b] && d.comparison[b].overall.n > 0)
+  // activity) surface without empty Algo Lab/Other cards cluttering the compare.
+  // 2026-09-11: one card per Algo N (Real+Control together, not two separate cards) --
+  // same merge as the button bar above.
+  function _etRows(c){
+    return Object.entries(c.by_entry_type).map(([et, v]) => `
+      <div class="cmp-et-row">
+        <span class="et-label">${et}</span>
+        <span>n=${v.n}</span><span>${v.win_pct}%</span>
+        <span style="color:${v.usd>=0?'var(--gl-good)':'var(--gl-bad)'}">${v.usd>=0?'+':''}$${fmt(v.usd)}</span>
+      </div>`).join('');
+  }
+  document.getElementById('st-comparison').innerHTML = ST_BUCKET_GROUPS
+    .filter(b => b!=='All')
+    .filter(b => _stGroupMembers(b).some(m => d.comparison[m] && d.comparison[m].overall.n > 0))
     .map(b => {
-      const c = d.comparison[b];
-      const o = c.overall;
-      const etRows = Object.entries(c.by_entry_type).map(([et, v]) => `
-        <div class="cmp-et-row">
-          <span class="et-label">${et}</span>
-          <span>n=${v.n}</span><span>${v.win_pct}%</span>
-          <span style="color:${v.usd>=0?'var(--gl-good)':'var(--gl-bad)'}">${v.usd>=0?'+':''}$${fmt(v.usd)}</span>
-        </div>`).join('');
-      return `<div class="cmp-card ${b===_stBucket?'active':''}" data-bucket="${b}" title="${ST_BUCKET_HELP[b]||''}">
+      if(!ST_PAIRED_ALGOS.has(b)){
+        const c = d.comparison[b], o = c.overall;
+        return `<div class="cmp-card ${b===_stBucket?'active':''}" data-bucket="${b}" title="${ST_BUCKET_HELP[b]||''}">
+          <div class="cmp-head">
+            <span class="cmp-name">${b}</span>
+            <span class="cmp-overall" style="color:${o.usd>=0?'var(--gl-good)':'var(--gl-bad)'}">${o.usd>=0?'+':''}$${fmt(o.usd)}</span>
+          </div>
+          <div class="cmp-desc">${ST_BUCKET_SHORT[b]||''}</div>
+          <div class="cmp-sub">n=${o.n} &middot; ${o.win_pct}% win &middot; PF ${_pf(o.profit_factor)}</div>
+          ${_etRows(c) || '<div class="cmp-empty">no entry-type breakdown</div>'}
+        </div>`;
+      }
+      // Paired Algo N: real + control shown together in one card, plus their edge.
+      const real = d.comparison[`${b} (Real)`], ctrl = d.comparison[`${b} (Control)`];
+      const ro = real.overall, co = ctrl.overall;
+      const edge = ro.usd - co.usd;
+      return `<div class="cmp-card ${b===_stBucket?'active':''}" data-bucket="${b}" title="${_stGroupHelp(b, ST_BUCKET_HELP)}">
         <div class="cmp-head">
           <span class="cmp-name">${b}${_stUnreliableBadge(b)}</span>
-          <span class="cmp-overall" style="color:${o.usd>=0?'var(--gl-good)':'var(--gl-bad)'}">${o.usd>=0?'+':''}$${fmt(o.usd)}</span>
+          <span class="cmp-edge">edge ${edge>=0?'+':''}$${fmt(edge)}</span>
         </div>
-        <div class="cmp-desc">${ST_BUCKET_SHORT[b]||''}</div>
-        <div class="cmp-sub">n=${o.n} &middot; ${o.win_pct}% win &middot; PF ${_pf(o.profit_factor)}</div>
-        ${etRows || '<div class="cmp-empty">no entry-type breakdown</div>'}
+        <div class="cmp-desc">${ST_BUCKET_SHORT[`${b} (Real)`]||''}</div>
+        <div class="cmp-rvc-row">
+          <div class="cmp-rvc-side">
+            <span class="cmp-rvc-label">Real</span>
+            <span class="cmp-rvc-val" style="color:${ro.usd>=0?'var(--gl-good)':'var(--gl-bad)'}">${ro.usd>=0?'+':''}$${fmt(ro.usd)}</span>
+            <span class="cmp-rvc-sub">n=${ro.n} &middot; ${ro.win_pct}% &middot; PF ${_pf(ro.profit_factor)}</span>
+          </div>
+          <div class="cmp-rvc-side">
+            <span class="cmp-rvc-label">Control</span>
+            <span class="cmp-rvc-val" style="color:${co.usd>=0?'var(--gl-good)':'var(--gl-bad)'}">${co.usd>=0?'+':''}$${fmt(co.usd)}</span>
+            <span class="cmp-rvc-sub">n=${co.n} &middot; ${co.win_pct}% &middot; PF ${_pf(co.profit_factor)}</span>
+          </div>
+        </div>
       </div>`;
     }).join('') || '<div class="cmp-empty">No closed trades yet for the selected bracket/range.</div>';
   document.querySelectorAll('.cmp-card').forEach(el=>{
@@ -5717,6 +5770,19 @@ document.addEventListener('shown.bs.tab',function(e){
 # ── Release notes ─────────────────────────────────────────────────────────────
 
 _RELEASE_NOTES = [
+    ("v5.09", "Results screen: merge each Algo N's Real/Control buttons into one",
+              "User request: 10 separate 'Algo N (Real)'/'Algo N (Control)' buttons in "
+              "the bucket-select bar and comparison-card grid cut down to 5 'Algo N' "
+              "buttons -- clicking one now shows both Real and Control together (the "
+              "trade table below includes both sources; the comparison card shows Real "
+              "and Control numbers side by side with their edge), instead of picking "
+              "one source at a time. GevaExtract/Control/Critical Line/Algo Lab/Other "
+              "have no Real/Control split and are unaffected. Backend: /api/closed-stats "
+              "now treats a bare 'Algo N' bucket param as matching both '(Real)' and "
+              "'(Control)' rows (prefix match), rather than requiring an exact bucket "
+              "name. Removed the old Algo-1/2-only 'Real vs Control' summary strip "
+              "(algo_vs_control) -- the new per-algo cards cover all 5 algos, "
+              "superseding it."),
     ("v5.08", "New Compare tab: comparison engine for algorithms and line-detection rules",
               "Part 1 of the next build cycle -- replaces by-eye decisions (like today's "
               "Algo 3/4/5 reinstatement) with real, out-of-sample-aware ranking. New "
