@@ -4687,9 +4687,14 @@ function _stRender(){
     <span class="big" style="color:${o.usd>=0?'var(--gl-good)':'var(--gl-bad)'}">${o.usd>=0?'+':''}$${fmt(o.usd)}</span>
     <span>PF ${_pf(o.profit_factor)}</span>`;
 
-  // Bucket-vs-bucket comparison, Stop/Limit broken out inside each -- only groups with
-  // any trades today are shown, so GevaExtract/Control/Critical Line (today's actual
-  // activity) surface without empty Algo Lab/Other cards cluttering the compare.
+  // Bucket-vs-bucket comparison, Stop/Limit broken out inside each. 2026-09-11 (user
+  // report): this used to always show every group with any trades today, completely
+  // ignoring which button was selected -- clicking "Algo 1" left the middle section
+  // showing whichever groups happened to have data (e.g. always "Algo 2, Algo 5"),
+  // not Algo 1's own Real-vs-Control. Now it follows the selected button: pick one
+  // group, see just that group's card (Real vs Control for the merged Algo N ones);
+  // "All" keeps the previous overview -- every group with any trades today, side by
+  // side -- since there's no single "vs control" comparison to narrow to there.
   // 2026-09-11: one card per Algo N (Real+Control together, not two separate cards) --
   // same merge as the button bar above.
   function _etRows(c){
@@ -4700,9 +4705,11 @@ function _stRender(){
         <span style="color:${v.usd>=0?'var(--gl-good)':'var(--gl-bad)'}">${v.usd>=0?'+':''}$${fmt(v.usd)}</span>
       </div>`).join('');
   }
-  document.getElementById('st-comparison').innerHTML = ST_BUCKET_GROUPS
-    .filter(b => b!=='All')
-    .filter(b => _stGroupMembers(b).some(m => d.comparison[m] && d.comparison[m].overall.n > 0))
+  const _cmpGroups = _stBucket === 'All'
+    ? ST_BUCKET_GROUPS.filter(b => b!=='All' &&
+        _stGroupMembers(b).some(m => d.comparison[m] && d.comparison[m].overall.n > 0))
+    : [_stBucket];
+  document.getElementById('st-comparison').innerHTML = _cmpGroups
     .map(b => {
       if(!ST_PAIRED_ALGOS.has(b)){
         const c = d.comparison[b], o = c.overall;
