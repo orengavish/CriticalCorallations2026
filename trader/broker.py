@@ -943,8 +943,15 @@ def reconcile_naked_positions(ibc: IBClient, cfg, db_path=None) -> None:
     if db_path:
         try:
             with get_db(db_path) as con:
+                # 2026-09-12: was source='spread' only -- spread_manager.py opens BOTH
+                # the literal and reversed-leg-direction control reading simultaneously
+                # for every signal (source='spread' and 'spread_control'), and
+                # poll_tp_sl_fills() elsewhere in this file already correctly exempts
+                # both. This one lagged behind, so a filled spread_control leg (no
+                # resting TP/SL by design, same as its 'spread' sibling) would get an
+                # unwanted emergency stop the moment it filled -- fixed to match.
                 spread_symbols = {r["symbol"] for r in con.execute(
-                    "SELECT DISTINCT symbol FROM commands WHERE source='spread' AND status='FILLED'"
+                    "SELECT DISTINCT symbol FROM commands WHERE source IN ('spread', 'spread_control') AND status='FILLED'"
                 ).fetchall()}
         except Exception as e:
             log.error(f"reconcile_naked_positions: could not check spread legs: {e}")
@@ -1045,6 +1052,16 @@ def run_broker(db_path=None, dry_run: bool = False):
                 ok = ibc.reconnect(max_attempts=_MAX_RECONNECT_ATTEMPTS)
                 if ok:
                     register_ib_events(ibc, db_path)
+                    # 2026-09-12: force the periodic ib_poll_seconds block below (poll_fills,
+                    # reconcile_stuck_commands, reconcile_naked_positions, etc.) to run THIS
+                    # same pass instead of waiting up to ib_poll_seconds (30s) for its own
+                    # gate to elapse -- a dropped bracket/naked position during the outage
+                    # should get caught the instant the connection is back, not up to 30s
+                    # later. Same safety calls the pre-loop startup check already makes
+                    # unconditionally (see reconcile_naked_positions() call just above this
+                    # loop) -- this just re-triggers that same coverage after a mid-session
+                    # reconnect, which previously had no equivalent.
+                    last_ib_poll = 0.0
                 if not ok:
                     log.error("Reconnect failed after max attempts — aborting broker")
                     # R-ERR-05: abort means trigger shutdown then exit
@@ -1386,9 +1403,12 @@ def self_test() -> bool:
             # this is the exact safety net the spread algorithm's TP/SL-less legs
             # (AI-35: hedge bounds risk, not a per-leg stop) need to be exempted
             # from, or every spread fill would get an unwanted stop slapped on it
-            # the very next poll cycle. Two symbols, same "naked" shape: MES has
+            # the very next poll cycle. Three symbols, same "naked" shape: MES has
             # no spread command -- must still get protected. MNQ has an open
-            # source='spread' FILLED command -- must NOT.
+            # source='spread' FILLED command -- must NOT. M2K has an open
+            # source='spread_control' FILLED command (the reversed-leg-direction
+            # reading spread_manager.py runs simultaneously with every signal) --
+            # must ALSO not (2026-09-12 fix: this one used to only exempt 'spread').
             with get_db(db_path) as con:
                 con.execute("""
                     INSERT INTO commands
@@ -1398,14 +1418,22 @@ def self_test() -> bool:
                     VALUES ('MNQ', 20000, 'SUPPORT', 1, 'BUY', 'MKT', 20000, 20000, 20000, 0,
                             'spread', 1, 'lt-spread-1', 'FILLED')
                 """)
+                con.execute("""
+                    INSERT INTO commands
+                        (symbol, line_price, line_type, line_strength, direction,
+                         entry_type, entry_price, tp_price, sl_price, bracket_size,
+                         source, quantity, logical_trade_id, status)
+                    VALUES ('M2K', 2000, 'SUPPORT', 1, 'SELL', 'MKT', 2000, 2000, 2000, 0,
+                            'spread_control', 1, 'lt-spread-2', 'FILLED')
+                """)
             fake_ibc_naked = _FakeIBClient(
-                positions=[_FakePosition("MES", 1), _FakePosition("MNQ", 1)],
+                positions=[_FakePosition("MES", 1), _FakePosition("MNQ", 1), _FakePosition("M2K", 1)],
                 price=6500.0,
             )
             reconcile_naked_positions(fake_ibc_naked, cfg, db_path)
             assert len(fake_ibc_naked.paper.orders_placed) == 1, \
-                (f"Expected exactly 1 emergency stop (MES only, MNQ exempted as a "
-                 f"spread leg), got {len(fake_ibc_naked.paper.orders_placed)}")
+                (f"Expected exactly 1 emergency stop (MES only, MNQ/M2K exempted as "
+                 f"spread/spread_control legs), got {len(fake_ibc_naked.paper.orders_placed)}")
             protected_symbol = fake_ibc_naked.paper.orders_placed[0][0].symbol
             assert protected_symbol == "MES", \
                 f"The emergency stop should have gone to MES, not {protected_symbol}"
