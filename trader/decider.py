@@ -33,7 +33,7 @@ import sys; sys.path.insert(0, str(_ROOT)) if str(_ROOT) not in sys.path else No
 
 from lib.config_loader import get_config
 from lib.logger import get_logger
-from lib.db import get_db, init_db, get_filled_commands, get_system_state, set_system_state, update_command_status
+from lib.db import get_db, init_db, get_filled_commands, get_system_state, set_system_state, update_command_status, update_price_cache
 from lib.order_builder import determine_entry_type, calc_bracket_prices, round_tick, get_tick_size
 from lib.critical_lines import get_armed_lines
 from lib.session_clock import (is_entry_cutoff, is_forced_exit_time, is_before_open,
@@ -410,10 +410,20 @@ def _generate_for_symbols(symbols, date_str, cfg, db_path, ibc):
             ).fetchone()[0]
         log.info(f"Found {n} armed critical lines in DB for {symbol} {date_str}")
 
-        # Get current price
+        # Get current price. 2026-09-12: used to raise and abort the WHOLE
+        # session start (crashing decider.py entirely) the moment even one
+        # symbol had no price -- e.g. market closed, or IB delayed-data not
+        # flowing yet. Live incident: this took decider down for the rest of
+        # the session over a single missing MES price. Skip just this symbol
+        # instead, same tolerant pattern run_replenishment_loop() already
+        # uses for the identical case -- other symbols with a real price
+        # still get their commands generated.
         price = get_current_price(symbol, ibc)
         if price is None:
-            raise ValueError(f"Cannot get current price for {symbol} — abort session start")
+            log.warning(f"{symbol}: no price available — skipping session-start "
+                       f"generation for this symbol (market closed or data not "
+                       f"flowing yet; other symbols continue)")
+            continue
 
         # Generate commands
         count = generate_commands(symbol, date_str, price, cfg, db_path)
@@ -512,6 +522,16 @@ def run_replenishment_loop(ibc, cfg, db_path, date_str: str = None):
                 log.warning(f"No price for {symbol} — skipping replenishment")
                 continue
             prices_this_cycle[symbol] = price
+            # 2026-09-12: this is genuinely live data (fetched fresh every poll
+            # cycle regardless of fills), unlike price_cache's original
+            # fill-only writers (broker.py) -- source='live_poll' distinguishes
+            # it. Feeds the dashboard's price ticker + market-data-freshness
+            # indicator, which previously had nothing to show for a symbol
+            # that simply hadn't filled recently (MYM/M2K, mostly held back at
+            # the admission cap) even though decider was fetching a real price
+            # for it every ~90s the whole time.
+            with get_db(db_path) as con:
+                update_price_cache(con, symbol, price, _now_utc(), source="live_poll")
             n = replenish(symbol, date_str, price, cfg, db_path)
             if n:
                 log.info(f"Replenished {n} command(s) for {symbol}")
@@ -692,6 +712,35 @@ def self_test() -> bool:
             assert n_new_after_resolve == 0, \
                 ("Must stay a no-op once the line's commands resolve to CLOSED -- "
                  f"got {n_new_after_resolve} (would be duplicate generation)")
+
+            # 1g. _generate_for_symbols crash-resilience (2026-09-12 live incident):
+            # a symbol with no available price must be skipped, not crash the
+            # whole session start -- other symbols with a real price still
+            # generate normally in the same call.
+            with get_db(db_path) as con:
+                con.execute(
+                    "INSERT INTO critical_lines (symbol, date, line_type, price,"
+                    " strength, armed) VALUES ('MNQ', ?, 'SUPPORT', 19000.00, 1, 1)",
+                    (today,)
+                )
+            original_get_current_price = mod.get_current_price
+            mod.get_current_price = lambda symbol, ibc=None: (
+                None if symbol == "MES" else 19000.0
+            )
+            try:
+                with get_db(db_path) as con:
+                    mnq_before = con.execute(
+                        "SELECT COUNT(*) FROM commands WHERE symbol='MNQ'"
+                    ).fetchone()[0]
+                _generate_for_symbols(["MES", "MNQ"], today, cfg, db_path, ibc=None)
+                with get_db(db_path) as con:
+                    mnq_after = con.execute(
+                        "SELECT COUNT(*) FROM commands WHERE symbol='MNQ'"
+                    ).fetchone()[0]
+                assert mnq_after > mnq_before, \
+                    "MNQ (real price) must still generate commands when MES (no price) is skipped"
+            finally:
+                mod.get_current_price = original_get_current_price
 
             # 2. Replenishment test
             # Mark one command as FILLED

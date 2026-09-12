@@ -510,12 +510,33 @@ def index():
     return render_template_string(HTML)
 
 
+_PRICE_STALE_SECONDS = 180  # matches decider's 90s replenishment poll with 2x margin
+
 @app.route("/api/prices")
 def api_prices():
+    """
+    price_cache.updated_at used to only move on a real FILL (broker.py) -- for
+    a symbol admission-capped out most of the time (MYM/M2K, "held back" is
+    ~every other broker.py log line most sessions), that's a stale timestamp
+    masquerading as "current price". decider.py's replenishment loop now also
+    writes here (source='live_poll') on every successful price fetch, ~90s
+    regardless of fills -- updated_at is a real "last time this symbol's price
+    was actually fetched" signal now, which is what freshness/staleness here
+    is checked against.
+    """
     out = {}
     with get_db(_resolve_db()) as con:
         for sym in ALL_SYMBOLS:
-            out[sym] = get_cached_price(con, sym)
+            row = con.execute(
+                "SELECT last_price, updated_at FROM price_cache WHERE symbol=?", (sym,)
+            ).fetchone()
+            if row is None:
+                out[sym] = {"price": None, "updated_at": None, "fresh": False}
+                continue
+            age = (datetime.now(timezone.utc)
+                   - datetime.fromisoformat(row["updated_at"].replace("Z", "+00:00"))).total_seconds()
+            out[sym] = {"price": row["last_price"], "updated_at": row["updated_at"],
+                       "fresh": age < _PRICE_STALE_SECONDS}
     return jsonify(out)
 
 
@@ -2371,10 +2392,21 @@ body{background:var(--gl-bg)!important}
    SessionManager's own bookkeeping believes. */
 @keyframes gl-pill-dead-flash{0%,100%{background:#dc3545;color:#fff}50%{background:#7a1420;color:#ffb3ba}}
 .gl-pill-dead{animation:gl-pill-dead-flash 1s step-start infinite;font-weight:700}
-.gl-ticker{display:flex;gap:12px;margin-left:4px}
-.gl-tick{display:flex;flex-direction:column;align-items:flex-end;line-height:1.1;font-family:var(--gl-mono)}
-.gl-tick .sym{font-size:8.5px;color:var(--gl-faint);letter-spacing:.04em}
-.gl-tick .px{font-size:11.5px;font-variant-numeric:tabular-nums;color:var(--gl-ink)}
+/* 2026-09-12: "market data unavailable" -- solid red, deliberately NOT the
+   flashing animation above (user request: distinct from the broker/decider
+   dead alert, which needs to grab attention harder than "market's closed,
+   as expected" does). */
+.gl-pill-red-static{background:#dc3545;color:#fff;font-weight:700}
+.gl-pill-green{background:#198754;color:#fff}
+.gl-ticker{display:flex;align-items:center;gap:14px;margin-left:4px}
+.gl-tick{display:flex;flex-direction:column;align-items:flex-end;line-height:1.15;font-family:var(--gl-mono)}
+/* 2026-09-12: was 8.5px + --gl-faint -- user report: unreadable. Bigger, bold,
+   full-brightness ink instead of the faint/muted tone every other label uses. */
+.gl-tick .sym{font-size:11px;font-weight:700;color:var(--gl-ink);letter-spacing:.04em}
+.gl-tick .px{font-size:12.5px;font-variant-numeric:tabular-nums;color:var(--gl-muted);transition:color .2s}
+.gl-tick .px.fresh{color:#3ddc84}
+.gl-tick .px.stale{color:#ff6b6b}
+.gl-tick-ts{font-size:9.5px;color:var(--gl-faint);font-family:var(--gl-mono);align-self:flex-end;margin-left:2px}
 .app-header-spacer{flex:1}
 
 /* Busy strip — unified hourglass (replaces full-screen #busy-overlay) */
@@ -2568,15 +2600,17 @@ body:not(.busy-wait) .busy-strip{background:var(--gl-border)}
     <!-- Header -->
     <div class="app-header">
       <span class="brand">Galao</span>
-      <span class="verchip">v5.13</span>
+      <span class="verchip">v5.14</span>
       <span class="gl-pill" id="session-broker-badge" style="color:var(--gl-muted)">Broker: —</span>
       <span class="gl-pill" id="session-decider-badge" style="color:var(--gl-muted)">Decider: —</span>
+      <span class="gl-pill" id="market-data-badge" style="color:var(--gl-muted)">Market Data: —</span>
       <span class="text-muted" id="session-uptime" style="font-size:.7rem;min-width:3.5em"></span>
       <div class="gl-ticker">
         <div class="gl-tick"><span class="sym">MES</span><span class="px" id="chip-MES">—</span></div>
         <div class="gl-tick"><span class="sym">MNQ</span><span class="px" id="chip-MNQ">—</span></div>
         <div class="gl-tick"><span class="sym">MYM</span><span class="px" id="chip-MYM">—</span></div>
         <div class="gl-tick"><span class="sym">M2K</span><span class="px" id="chip-M2K">—</span></div>
+        <span class="gl-tick-ts" id="ticker-ts"></span>
       </div>
       <div class="app-header-spacer"></div>
       <button class="nav-link top-tab icon-tab" onclick="toggleCrossMenu(event)" title="Other dashboards" style="color:var(--gl-muted)">&#128279;</button>
@@ -3458,17 +3492,34 @@ const STATUS_CLS={PENDING:'secondary',SUBMITTED:'primary',SUBMITTING:'info',
 
 // ── Price polling ─────────────────────────────────────────────────────────────
 let _lastPrices={};
+// 2026-09-12: rewritten for /api/prices' new {price, updated_at, fresh} shape
+// (was a flat price -- fresh was previously undeterminable, since price_cache
+// only moved on a real FILL; decider.py now also writes it on every live poll,
+// ~90s, so "fresh" is a real signal). Green/red-by-freshness replaces the old
+// up/down-tick flash coloring -- same two color classes, different meaning,
+// user asked for freshness specifically.
 async function pollPrices(){
   try{
     const d=await (await fetch('/api/prices')).json();
-    for(const [s,p] of Object.entries(d)){
+    let latestTs=null, anyFresh=false;
+    for(const [s,info] of Object.entries(d)){
       const el=document.getElementById('chip-'+s);
       if(!el) continue;
-      el.textContent=p!=null?p.toFixed(2):'—';
-      const prev=_lastPrices[s];
-      el.classList.remove('text-success','text-danger');
-      if(p!=null && prev!=null && p!==prev) el.classList.add(p>prev?'text-success':'text-danger');
-      if(p!=null) _lastPrices[s]=p;
+      el.textContent=info.price!=null?info.price.toFixed(2):'—';
+      el.classList.remove('fresh','stale');
+      if(info.price!=null) el.classList.add(info.fresh?'fresh':'stale');
+      if(info.fresh) anyFresh=true;
+      if(info.updated_at && (!latestTs || info.updated_at>latestTs)) latestTs=info.updated_at;
+    }
+    const tsEl=document.getElementById('ticker-ts');
+    if(tsEl) tsEl.textContent = latestTs ? new Date(latestTs).toISOString().slice(11,19)+' UTC' : 'no data yet';
+
+    const mdBadge=document.getElementById('market-data-badge');
+    if(mdBadge){
+      mdBadge.classList.toggle('gl-pill-red-static', !anyFresh);
+      mdBadge.classList.toggle('gl-pill-green', anyFresh);
+      mdBadge.textContent='Market Data: '+(anyFresh?'live':'unavailable');
+      mdBadge.style.color='';  // classes above own color/background now, clear the inline default
     }
   }catch(e){}
 }
@@ -3511,39 +3562,57 @@ function _sessionBadgeColor(state){
 }
 // 2026-09-12 fix: SessionManager's own status() only reflects processes IT
 // itself launched (via /api/session/start) -- stale or flatly wrong the
-// moment broker.py/decider.py are started any other way (manual terminal,
-// a scheduled task, this session's own direct launches), which is how they
+// moment broker.py/decider.py are started any other way (manual terminal, a
+// scheduled task, this session's own direct launches), which is how they
 // actually get run in practice. Real, ground-truth liveness comes from
 // /api/process-health (lib.singleton_lock.is_locked_by_other, launcher-
-// agnostic) and OVERRIDES the badge to a flashing red .gl-pill-dead whenever
-// a process is confirmed dead, regardless of what SessionManager believes.
+// agnostic). User report: this used to only override the DEAD case, so a
+// genuinely-alive-but-not-SessionManager-launched broker still showed a flat
+// gray "unknown" instead of a clear green "running" -- confusingly looked
+// the same as actually being dead. Priority now: confirmed dead (flashing
+// red) > SessionManager's own "restarting" (only it can know that, trust it)
+// > confirmed alive (green) > health check itself unreachable (fall back to
+// SessionManager's own state/color entirely).
+function _applyProcessBadge(el, smState, alive){
+  el.classList.remove('gl-pill-dead','gl-pill-green');
+  el.style.background=''; el.style.color='';
+  if(alive===false){
+    el.classList.add('gl-pill-dead');
+    el.textContent=el._label+': DEAD';
+  }else if(smState==='restarting'){
+    el.style.background='#fd7e14';
+    el.textContent=el._label+': restarting';
+  }else if(alive===true){
+    el.classList.add('gl-pill-green');
+    el.textContent=el._label+': running';
+  }else{
+    el.style.background=_sessionBadgeColor(smState);
+    el.textContent=el._label+': '+smState;
+  }
+}
 async function pollSessionStatus(){
-  const bB=document.getElementById('session-broker-badge');
-  const bD=document.getElementById('session-decider-badge');
+  const bB=document.getElementById('session-broker-badge');  bB._label='Broker';
+  const bD=document.getElementById('session-decider-badge'); bD._label='Decider';
   let health=null;
   try{ health=await (await fetch('/api/process-health')).json(); }catch(e){}
 
+  let smBroker='unknown', smDecider='unknown';
   try{
     const d=await (await fetch('/api/session/status')).json();
-    bB.textContent='Broker: '+d.broker;   bB.style.background=_sessionBadgeColor(d.broker);
-    bD.textContent='Decider: '+d.decider; bD.style.background=_sessionBadgeColor(d.decider);
+    smBroker=d.broker; smDecider=d.decider;
     const up=d.uptime_seconds||0;
     document.getElementById('session-uptime').textContent=
       up>0?`${Math.floor(up/60)}m ${up%60}s`:'';
     if(!_sessionBusy){
-      const anyAlive=d.broker!=='dead'||d.decider!=='dead';
+      const anyAlive=(health?(health.broker_alive||health.decider_alive):(d.broker!=='dead'||d.decider!=='dead'));
       const btn=document.getElementById('session-toggle-btn');
       btn.textContent=anyAlive?'Stop Session':'Start Session';
       btn.className='btn btn-sm '+(anyAlive?'btn-danger':'btn-success');
     }
   }catch(e){}
 
-  if(health){
-    bB.classList.toggle('gl-pill-dead', health.broker_alive===false);
-    bD.classList.toggle('gl-pill-dead', health.decider_alive===false);
-    if(health.broker_alive===false){ bB.textContent='Broker: DEAD'; bB.style.background=''; }
-    if(health.decider_alive===false){ bD.textContent='Decider: DEAD'; bD.style.background=''; }
-  }
+  _applyProcessBadge(bB, smBroker, health?health.broker_alive:undefined);
+  _applyProcessBadge(bD, smDecider, health?health.decider_alive:undefined);
 }
 async function toggleSession(){
   const btn=document.getElementById('session-toggle-btn');
@@ -6144,6 +6213,35 @@ document.addEventListener('shown.bs.tab',function(e){
 # ── Release notes ─────────────────────────────────────────────────────────────
 
 _RELEASE_NOTES = [
+    ("v5.14", "Third 'Market Data' indicator + broker/decider green-when-alive + readable ticker",
+              "User report, three parts. (1) v5.13's dead-process alert only handled the "
+              "confirmed-dead case -- a genuinely alive-but-not-SessionManager-launched "
+              "process (broker.py right now) still showed a flat gray 'unknown', "
+              "confusingly identical-looking to actually dead. _applyProcessBadge() now "
+              "prioritizes: confirmed dead (flashing red) > SessionManager's own "
+              "'restarting' (trusted, only it can know that) > confirmed alive (solid "
+              "green) > health check unreachable (falls back to SessionManager's state "
+              "entirely). (2) New 'Market Data' badge, solid red (not flashing -- "
+              "deliberately less alarming than a dead process, since 'market's closed' "
+              "is an expected condition) when none of the 4 core futures have a fresh "
+              "price. This surfaces the actual reason decider.py couldn't do its normal "
+              "thing tonight (no MES price, market closed) as its own signal instead of "
+              "conflating it with decider being broken -- which is what motivated fixing "
+              "decider.py itself too: _generate_for_symbols() used to raise and crash "
+              "the WHOLE process the moment even one symbol had no price (tonight's "
+              "actual incident); now it skips just that symbol and logs a warning, "
+              "matching the tolerant pattern run_replenishment_loop() already used for "
+              "the identical case. (3) decider's replenishment loop now also writes "
+              "price_cache on every successful live price fetch (source='live_poll'), "
+              "not just on fills (broker.py's old sole writer) -- MYM/M2K's ticker "
+              "prices were stale-looking because those symbols are 'held back at cap' "
+              "most cycles and rarely actually fill, not because fetching was broken. "
+              "/api/prices now returns {price, updated_at, fresh} per symbol (fresh = "
+              "updated within 180s) instead of a flat number. Ticker redesign: symbol "
+              "names were 8.5px pale gray (user: 'cannot read the symbol name') -- now "
+              "11px bold full-ink; price color now reflects freshness (green/red) "
+              "instead of the old up/down-tick flash; one shared last-fetch timestamp "
+              "added to the right of the ticker."),
     ("v5.13", "Flashing-red dead-process alert + merged Allocation plan/actual",
               "User report: broker.py died at 07:12:57 UTC after an IB PAPER "
               "disconnect (a recurring pattern -- same thing happened multiple times "
