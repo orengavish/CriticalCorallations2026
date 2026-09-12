@@ -2890,7 +2890,7 @@ td.rr-empty{color:var(--gl-faint);font-size:11px;background:var(--gl-panel-2);bo
     <!-- Header -->
     <div class="app-header">
       <span class="brand">Galao</span>
-      <span class="verchip">v5.19</span>
+      <span class="verchip">v5.20</span>
       <span class="gl-pill" id="session-broker-badge" style="color:var(--gl-muted)">Broker: —</span>
       <span class="gl-pill" id="session-decider-badge" style="color:var(--gl-muted)">Decider: —</span>
       <span class="gl-pill" id="market-data-badge" style="color:var(--gl-muted)">Market Data: —</span>
@@ -3830,20 +3830,38 @@ const SOURCE_COLORS={
 // toast only appears if a busy period runs past 500ms -- a normal ~0.2s fetch
 // never flashes anything, a genuinely slow one (the old broker-queue-hang class of
 // bug) gives clear "still working" feedback instead of silence.
-let _busyCount=0,_busyToastTimer=null;
+// 2026-09-12: user report -- the "still working..." toast was stuck showing
+// indefinitely on the Broker tab, long after any real fetch should have finished.
+// _busyCount is a page-lifetime counter; ANY call site that enters busy and then
+// throws before its matching exit (a missing/renamed DOM id, an unexpected null)
+// leaks the counter upward forever -- every future exitBusy() still only
+// decrements by 1, so it never reaches 0 again for the rest of that page's life.
+// Rather than keep hunting for one more unpaired call site by inspection (already
+// found and fixed 3 -- buildLinesDB/createTrades/submitTrades in v5.18), add a
+// hard watchdog: if busy has been continuously "on" for 15s, force it back to
+// idle regardless of the counter. Busy no longer blocks anything on the page
+// (v5.18) -- forcing it idle early is a purely cosmetic correction, never a
+// data-safety issue, so this is a safe unconditional reset.
+let _busyCount=0,_busyToastTimer=null,_busyWatchdog=null;
+function _busyForceIdle(){
+  _busyCount=0;
+  document.getElementById('busy-strip')?.classList.add('idle');
+  clearTimeout(_busyToastTimer);
+  document.getElementById('busy-toast')?.classList.remove('show');
+}
 function _enterBusy(){
   if(++_busyCount===1){
     document.getElementById('busy-strip')?.classList.remove('idle');
     clearTimeout(_busyToastTimer);
     _busyToastTimer=setTimeout(()=>{ document.getElementById('busy-toast')?.classList.add('show'); }, 500);
+    clearTimeout(_busyWatchdog);
+    _busyWatchdog=setTimeout(_busyForceIdle, 15000);
   }
 }
 function _exitBusy(){
   if(--_busyCount<=0){
-    _busyCount=0;
-    document.getElementById('busy-strip')?.classList.add('idle');
-    clearTimeout(_busyToastTimer);
-    document.getElementById('busy-toast')?.classList.remove('show');
+    clearTimeout(_busyWatchdog);
+    _busyForceIdle();
   }
 }
 const STATUS_CLS={PENDING:'secondary',SUBMITTED:'primary',SUBMITTING:'info',
@@ -6930,6 +6948,20 @@ document.addEventListener('shown.bs.tab',function(e){
 # ── Release notes ─────────────────────────────────────────────────────────────
 
 _RELEASE_NOTES = [
+    ("v5.20", "Busy-state watchdog: 'still working...' toast can no longer stick forever",
+              "User screenshot showed the v5.18 toast stuck permanently visible on the Broker "
+              "tab, long after any real fetch should have finished -- direct evidence _busyCount "
+              "(a page-lifetime counter) had leaked upward and never returned to 0. Re-audited "
+              "every _enterBusy() call site in the file: all are now correctly paired with "
+              "try/finally immediately after (the 3 unpaired ones were fixed in v5.18). The "
+              "likely explanation is a leak from browsing before an earlier fix landed, in a tab "
+              "never reloaded since -- the counter doesn't reset on tab switches, only a full "
+              "page reload. Rather than keep hunting blind for a one-off historical leak, added "
+              "a hard watchdog: if busy has been continuously 'on' for 15s, force it back to "
+              "idle regardless of the counter. Busy no longer blocks anything on the page "
+              "(v5.18), so forcing it idle early is purely cosmetic, never a data-safety issue -- "
+              "this symptom class can't persist indefinitely again no matter which future call "
+              "site causes it."),
     ("v5.19", "Fix reproducible 500 on /api/session/status (poisoned config cache)",
               "User provided the exact browser console error: 'GET .../api/session/status 500'. "
               "Root cause, confirmed via a foreground run with a full traceback: "
