@@ -1056,6 +1056,33 @@ def compute_side_resting(con, symbol: str, direction: str) -> int:
     return same_side_entries + opposite_side_legs * 2
 
 
+def compute_family_pool_resting(con, family_sources: set, pool_symbols: list, direction: str) -> int:
+    """
+    2026-09-12, capacity-allocation plan: the same IB-realistic "same-direction entries
+    + 2x opposite-direction entries" formula as compute_side_resting() above, but
+    scoped to one algorithm family's own commands.source values AND one symbol pool
+    (both contracts of a futures pair, e.g. MES+ES, or a single stock) -- lets
+    lib.allocation.check_admission() enforce a family's specific slot allocation on
+    top of (not instead of) the flat per-symbol cap compute_side_resting() already
+    enforces. See lib/allocation.py for the actual per-family/per-pool cap table.
+    """
+    opposite = "SELL" if direction == "BUY" else "BUY"
+    src_placeholders = ",".join("?" for _ in family_sources)
+    sym_placeholders = ",".join("?" for _ in pool_symbols)
+    if not family_sources or not pool_symbols:
+        return 0
+
+    def _count(dir_):
+        return con.execute(
+            f"SELECT COUNT(*) FROM commands WHERE symbol IN ({sym_placeholders})"
+            f" AND direction=? AND source IN ({src_placeholders})"
+            " AND (status='SUBMITTED' OR (status='FILLED' AND needs_review=0))",
+            (*pool_symbols, dir_, *family_sources)
+        ).fetchone()[0]
+
+    return _count(direction) + _count(opposite) * 2
+
+
 def get_pending_commands(con, symbol: str = None) -> list:
     if symbol:
         return con.execute(

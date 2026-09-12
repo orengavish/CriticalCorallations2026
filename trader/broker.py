@@ -32,6 +32,7 @@ import sys; sys.path.insert(0, str(_ROOT)) if str(_ROOT) not in sys.path else No
 from lib.config_loader import get_config
 from lib.logger import get_logger
 from lib.db import get_db, init_db, get_pending_commands, update_command_status, get_system_state, record_completed_trade, spawn_replenishment, update_price_cache, get_cached_price, flag_needs_review, clear_needs_review, compute_side_resting
+from lib.allocation import check_admission, family_for_source
 from lib.ib_client import IBClient
 from lib.order_builder import build_bracket, place_bracket, round_tick, get_tick_size
 from trader.correlation_trail import trail_correlation_positions, TRAIL_TICKS
@@ -309,6 +310,23 @@ def process_pending_commands(ibc: IBClient, db_path, cfg) -> int:
             log.warning(f"Command {cid} ({cmd['symbol']} {cmd['direction']}) held back — "
                         f"~{resting} resting on that side (entries + opposite TP/SL legs), "
                         f"at cap of {max_per_side}")
+            continue
+
+        # Gate 1b: per-family capacity allocation (2026-09-12, approved capacity plan).
+        # Gate 1 above is the flat, real-IB-facing ceiling per symbol/side; this is a
+        # FINER-GRAINED share of that same capacity -- e.g. Critical Line only gets 5 of
+        # MES+ES's ~30 combined slots, even though Gate 1 alone would let it use all ~15
+        # on MES if nothing else were resting. Both gates apply; whichever is stricter
+        # wins. A symbol not covered by the plan (cap=None) is unaffected here -- Gate 1
+        # remains its only real ceiling. See lib/allocation.py for the actual table.
+        with get_db(db_path) as con:
+            fam_allowed, fam_resting, fam_cap = check_admission(
+                con, cmd["symbol"], cmd["direction"], cmd["source"])
+        if not fam_allowed:
+            fam = family_for_source(cmd["source"])
+            log.warning(f"Command {cid} ({cmd['symbol']} {cmd['direction']}, family={fam}) "
+                        f"held back — {fam_resting} resting for this family on this "
+                        f"pool, at its allocated cap of {fam_cap}")
             continue
 
         # Claim lock — atomic status change to SUBMITTING
@@ -1236,6 +1254,18 @@ class _FakePaper:
     def placeOrder(self, contract, order):
         self.orders_placed.append((contract, order))
         return _FakeTrade(order_id=getattr(order, "orderId", 0), status="Submitted")
+    def bracketOrder(self, action, quantity, limitPrice, takeProfitPrice, stopLossPrice):
+        # 2026-09-12: added so a test command can actually reach SUBMITTED end-to-end
+        # (see 8e below) instead of every submission attempt failing with "_FakePaper
+        # has no attribute bracketOrder" -- same minimal shape as lib/order_builder.py's
+        # own _FakeIB.bracketOrder, kept local here so this file's test scaffolding
+        # stays self-contained.
+        from ib_insync import LimitOrder, StopOrder
+        entry = LimitOrder(action, quantity, limitPrice)
+        tp_action = "SELL" if action == "BUY" else "BUY"
+        tp = LimitOrder(tp_action, quantity, takeProfitPrice)
+        sl = StopOrder(tp_action, quantity, stopLossPrice)
+        return [entry, tp, sl]
 
 class _FakeIBClient:
     """Minimal stand-in for IBClient's paper-account surface -- no real IB needed."""
@@ -1542,6 +1572,47 @@ def self_test() -> bool:
             with get_db(db_path) as con:
                 s = con.execute("SELECT status FROM commands WHERE id=?", (id_opposite,)).fetchone()["status"]
             assert s == "PENDING", f"opposite-side TP/SL legs should count toward the cap: {s}"
+
+            #    8e. per-family allocation cap (2026-09-12, capacity-allocation plan):
+            #    Critical Line's own share of the MES+ES pool is 5, well under the flat
+            #    per-symbol cap of 10 -- so a 6th research_ce command on MES must be held
+            #    back by Gate 1b specifically, not Gate 1 (which alone would still allow
+            #    it, 5 < 10). A DIFFERENT family (spread) on the SAME symbol/side, with
+            #    its own separate 5-slot share, must NOT be blocked by Critical Line's
+            #    usage -- proving the two families don't share one budget.
+            for _ in range(5):
+                _insert_cmd(symbol='MES', direction='SELL', source='research_ce',
+                            status='SUBMITTED', needs_review=0)
+            with get_db(db_path) as con:
+                con.execute("""
+                    INSERT INTO commands
+                        (symbol, line_price, line_type, line_strength, source,
+                         direction, entry_type, entry_price, tp_price, sl_price, bracket_size)
+                    VALUES ('MES', 6500.0, 'SUPPORT', 2, 'research_ce',
+                            'SELL', 'LMT', 6500.0, 6498.0, 6502.0, 2.0)
+                """)
+                id_family_capped = con.execute("SELECT last_insert_rowid()").fetchone()[0]
+                con.execute("""
+                    INSERT INTO commands
+                        (symbol, line_price, line_type, line_strength, source,
+                         direction, entry_type, entry_price, tp_price, sl_price, bracket_size)
+                    VALUES ('MES', 6496.0, 'SUPPORT', 2, 'spread',
+                            'SELL', 'LMT', 6496.0, 6494.0, 6500.0, 2.0)
+                """)
+                # entry 4pts from the fake price below (6500.0) -- clears the default
+                # 8-tick (2pt) Gate 2 buffer, so this one reaches SUBMITTED rather than
+                # being cancelled as stale, proving it got PAST both admission gates.
+                id_other_family = con.execute("SELECT last_insert_rowid()").fetchone()[0]
+            process_pending_commands(_FakeIBClient(price=6500.0), db_path, cfg)
+            with get_db(db_path) as con:
+                s_capped = con.execute("SELECT status FROM commands WHERE id=?",
+                                       (id_family_capped,)).fetchone()["status"]
+                s_other = con.execute("SELECT status FROM commands WHERE id=?",
+                                      (id_other_family,)).fetchone()["status"]
+            assert s_capped == "PENDING", \
+                f"Critical Line at its 5-slot MES+ES share should be held back by Gate 1b: {s_capped}"
+            assert s_other == "SUBMITTED", \
+                f"Spread's own separate share on the same symbol should not be blocked by Critical Line: {s_other}"
 
             #    8e. geva_manual is no longer exempt from the cap (2026-09-10 reversal --
             #    the exemption let real exposure quietly compound across days until IB's
