@@ -524,6 +524,27 @@ def api_session_status():
     return jsonify(get_session_manager().status())
 
 
+@app.route("/api/process-health")
+def api_process_health():
+    """
+    Ground-truth broker/decider liveness, independent of SessionManager's own
+    bookkeeping (which only reflects processes IT itself launched via
+    start()/its monitor loop -- stale or flatly wrong the moment either process
+    is started any other way, e.g. a manual terminal run). Reuses
+    lib.singleton_lock.is_locked_by_other -- the same OS-level PID+liveness
+    check broker.py/decider.py's own singleton lock relies on, launcher-
+    agnostic by design (see that module's own docstring: built for exactly
+    this "does something already hold this, regardless of who started it"
+    question). Read-only, doesn't acquire or disturb the lock.
+    """
+    from lib.singleton_lock import is_locked_by_other
+    lock_dir = _ROOT / "trader" / "logs"
+    return jsonify({
+        "broker_alive":  is_locked_by_other("broker", lock_dir),
+        "decider_alive": is_locked_by_other("decider", lock_dir),
+    })
+
+
 @app.route("/api/session/start", methods=["POST"])
 def api_session_start():
     try:
@@ -2087,15 +2108,41 @@ def _alloc_family_for(source):
     return "Other"
 
 
+# 2026-09-12: the agreed capacity plan, as data -- lets the Allocation tab show
+# "allocated/actual" per cell instead of two disconnected static/live tables.
+# Not yet enforced anywhere in broker.py; this is the plan for reference and
+# the live count fills in as trading resumes.
+_ALLOC_PAIRS = [
+    ("MES + ES",  ["MES", "ES"]),
+    ("MNQ + NQ",  ["MNQ", "NQ"]),
+    ("MYM + YM",  ["MYM", "YM"]),
+    ("M2K + RTY", ["M2K", "RTY"]),
+]
+_ALLOC_PAIR_PLAN = {
+    "MES + ES":  {"GevaExtract": 15, "Critical Line": 5, "Spread": 5, "Correlation": 5},
+    "MNQ + NQ":  {"Critical Line": 10, "Spread": 10, "Correlation": 10},
+    "MYM + YM":  {"Critical Line": 10, "Spread": 10, "Correlation": 10},
+    "M2K + RTY": {"Critical Line": 10, "Spread": 10, "Correlation": 10},
+}
+# Top-30 of the real ~100-stock universe (MultiSymbolTrader/mst_data/sp100_symbols.txt),
+# in order -- first 10 each dedicated to one algorithm.
+_ALLOC_STOCK_DEDICATED = {
+    "Critical Line": ["AAPL", "MSFT", "NVDA", "GOOGL", "GOOG", "AMZN", "META", "BRK.B", "AVGO", "TSLA"],
+    "Spread":        ["LLY", "JPM", "V", "XOM", "UNH", "MA", "COST", "HD", "PG", "JNJ"],
+    "Correlation":   ["NFLX", "ABBV", "BAC", "CRM", "WMT", "KO", "CVX", "MRK", "ADBE", "PEP"],
+}
+
+
 @app.route("/api/allocation")
 def api_allocation():
     """
-    Actual (live) half of the Allocation tab: how many commands are currently
-    resting (SUBMITTED, or FILLED with needs_review=0 -- same definition
-    lib.db.compute_side_resting uses for the real admission-cap check), broken
-    out by algorithm family and symbol, alongside the TRUE per-symbol/side
-    total (which sums across every family, not just one) so it's visible
-    whether one family is close to crowding out the others on a given symbol.
+    Combined theoretical+actual for the Allocation tab. "Actual" = count of
+    that family's own commands currently resting (SUBMITTED, or FILLED with
+    needs_review=0), summed across both directions and every symbol in the
+    row -- a simple "how many of its allocated slots is this algorithm using"
+    reading, not the fuller 2x-opposite-direction IB-slot-consumption formula
+    (that fuller number is still shown separately, per-symbol, as true_totals
+    below, since it's what IB's own cap actually enforces).
     """
     db_path = _resolve_db()
     with get_db(db_path) as con:
@@ -2109,6 +2156,30 @@ def api_allocation():
             fam = _alloc_family_for(r["source"])
             key = (fam, r["symbol"], r["direction"])
             same_dir_counts[key] = same_dir_counts.get(key, 0) + 1
+
+        def family_actual(fam, syms):
+            return sum(same_dir_counts.get((fam, sym, d), 0)
+                      for sym in syms for d in ("BUY", "SELL"))
+
+        plan_pairs = []
+        for pair_name, syms in _ALLOC_PAIRS:
+            fam_cells = {}
+            for fam, allocated in _ALLOC_PAIR_PLAN.get(pair_name, {}).items():
+                fam_cells[fam] = {"allocated": allocated, "actual": family_actual(fam, syms)}
+            plan_pairs.append({"pair": pair_name, "families": fam_cells})
+
+        plan_stocks_dedicated = [
+            {"family": fam, "symbols": syms, "allocated": len(syms),
+             "actual": family_actual(fam, syms)}
+            for fam, syms in _ALLOC_STOCK_DEDICATED.items()
+        ]
+
+        dedicated_all = {s for syms in _ALLOC_STOCK_DEDICATED.values() for s in syms}
+        futures_all = {s for _, syms in _ALLOC_PAIRS for s in syms}
+        shared_actual = sum(
+            cnt for (fam, sym, direction), cnt in same_dir_counts.items()
+            if sym not in dedicated_all and sym not in futures_all
+        )
 
         families = ["GevaExtract", "Critical Line", "Spread", "Correlation", "Other"]
         symbols = sorted({r["symbol"] for r in rows})
@@ -2131,7 +2202,13 @@ def api_allocation():
                 if n > 0:
                     true_totals.append({"symbol": sym, "direction": direction, "resting": n})
 
-    return jsonify({"by_family": by_family, "true_totals": true_totals})
+    return jsonify({
+        "plan_pairs": plan_pairs,
+        "plan_stocks_dedicated": plan_stocks_dedicated,
+        "plan_stocks_shared_actual": shared_actual,
+        "by_family": by_family,
+        "true_totals": true_totals,
+    })
 
 
 # ── Sup/Res visualization data (feeds the Graph tab's line overlay) ───────────
@@ -2284,6 +2361,16 @@ body{background:var(--gl-bg)!important}
   background:var(--gl-panel-2);padding:2px 6px;border-radius:4px}
 .gl-pill{font-family:var(--gl-mono);font-size:10.5px;padding:3px 9px;border-radius:20px;
   display:flex;align-items:center;gap:5px;background:var(--gl-panel-2)}
+/* 2026-09-12: dead broker/decider process -- was indistinguishable gray from every
+   other non-running state (SessionManager's own status() only reflects processes
+   IT launched, going stale/wrong the moment broker.py/decider.py are started any
+   other way -- a manual terminal run, this session's own direct launches, a
+   scheduled task). Real, poll-driven liveness check (lib.singleton_lock.
+   is_locked_by_other, OS-level, launcher-agnostic) overrides the badge to this
+   whenever a process is confirmed actually dead, regardless of what
+   SessionManager's own bookkeeping believes. */
+@keyframes gl-pill-dead-flash{0%,100%{background:#dc3545;color:#fff}50%{background:#7a1420;color:#ffb3ba}}
+.gl-pill-dead{animation:gl-pill-dead-flash 1s step-start infinite;font-weight:700}
 .gl-ticker{display:flex;gap:12px;margin-left:4px}
 .gl-tick{display:flex;flex-direction:column;align-items:flex-end;line-height:1.1;font-family:var(--gl-mono)}
 .gl-tick .sym{font-size:8.5px;color:var(--gl-faint);letter-spacing:.04em}
@@ -2481,7 +2568,7 @@ body:not(.busy-wait) .busy-strip{background:var(--gl-border)}
     <!-- Header -->
     <div class="app-header">
       <span class="brand">Galao</span>
-      <span class="verchip">v5.12</span>
+      <span class="verchip">v5.13</span>
       <span class="gl-pill" id="session-broker-badge" style="color:var(--gl-muted)">Broker: —</span>
       <span class="gl-pill" id="session-decider-badge" style="color:var(--gl-muted)">Decider: —</span>
       <span class="text-muted" id="session-uptime" style="font-size:.7rem;min-width:3.5em"></span>
@@ -3129,35 +3216,19 @@ body:not(.busy-wait) .busy-strip{background:var(--gl-border)}
 <div class="tab-pane fade" id="tab-allocation">
  <div class="st-page">
   <div class="cmp-section">
-    <h6 class="text-muted small text-uppercase mb-2">Theoretical allocation (agreed plan, per side)</h6>
-    <div class="alloc-static">
-      <table class="table table-sm table-hover mb-3">
-        <thead class="text-muted small"><tr>
-          <th>Pair</th><th>Total/side</th><th>GevaExtract</th><th>Critical Line</th><th>Spread</th><th>Correlation</th>
-        </tr></thead>
-        <tbody>
-          <tr><td>MES + ES</td><td>~30</td><td>15 (8 ES + 7 MES)</td><td>5</td><td>5</td><td>5</td></tr>
-          <tr><td>MNQ + NQ</td><td>~30</td><td>&mdash;</td><td>10</td><td>10</td><td>10</td></tr>
-          <tr><td>MYM + YM</td><td>~30</td><td>&mdash;</td><td>10</td><td>10</td><td>10</td></tr>
-          <tr><td>M2K + RTY</td><td>~30</td><td>&mdash;</td><td>10</td><td>10</td><td>10</td></tr>
-        </tbody>
-      </table>
-      <table class="table table-sm table-hover mb-0">
-        <thead class="text-muted small"><tr><th>Stock range</th><th>Symbols</th><th>Algorithm</th><th>Mode</th></tr></thead>
-        <tbody>
-          <tr><td>1&ndash;10</td><td>AAPL...TSLA</td><td>Critical Line</td><td>Dedicated</td></tr>
-          <tr><td>11&ndash;20</td><td>LLY...JNJ</td><td>Spread</td><td>Dedicated</td></tr>
-          <tr><td>21&ndash;30</td><td>NFLX...PEP</td><td>Correlation</td><td>Dedicated</td></tr>
-          <tr><td>31&ndash;100</td><td>70 symbols</td><td>All 4 (incl. GevaExtract)</td><td>Shared, cap pushed toward ~14-15/side per symbol</td></tr>
-        </tbody>
-      </table>
+    <div class="d-flex align-items-center mb-2">
+      <h6 class="text-muted small text-uppercase mb-0">Allocation plan &mdash; allocated / actual in use</h6>
+      <button class="btn btn-sm btn-outline-secondary ms-auto" onclick="loadAllocation()">&#8635;</button>
     </div>
+    <div id="alloc-plan-tables"></div>
+    <p class="text-muted small mt-2">"Actual" = this algorithm's own commands currently resting (SUBMITTED, or
+      FILLED with needs_review=0), summed across both directions and every symbol in the row. Fills in as
+      trading resumes -- not yet enforced anywhere in broker.py, this is the agreed plan for reference.</p>
   </div>
 
   <div class="cmp-section mt-4">
     <div class="d-flex align-items-center mb-2">
-      <h6 class="text-muted small text-uppercase mb-0">Actual (live)</h6>
-      <button class="btn btn-sm btn-outline-secondary ms-auto" onclick="loadAllocation()">&#8635;</button>
+      <h6 class="text-muted small text-uppercase mb-0">Actual (live), per symbol</h6>
     </div>
     <div id="alloc-actual-table"></div>
     <p class="text-muted small mt-2">"Resting" = commands currently SUBMITTED or FILLED (with needs_review=0) --
@@ -3438,11 +3509,22 @@ let _sessionBusy=false;
 function _sessionBadgeColor(state){
   return state==='running'?'#198754':state==='restarting'?'#fd7e14':'#6c757d';
 }
+// 2026-09-12 fix: SessionManager's own status() only reflects processes IT
+// itself launched (via /api/session/start) -- stale or flatly wrong the
+// moment broker.py/decider.py are started any other way (manual terminal,
+// a scheduled task, this session's own direct launches), which is how they
+// actually get run in practice. Real, ground-truth liveness comes from
+// /api/process-health (lib.singleton_lock.is_locked_by_other, launcher-
+// agnostic) and OVERRIDES the badge to a flashing red .gl-pill-dead whenever
+// a process is confirmed dead, regardless of what SessionManager believes.
 async function pollSessionStatus(){
+  const bB=document.getElementById('session-broker-badge');
+  const bD=document.getElementById('session-decider-badge');
+  let health=null;
+  try{ health=await (await fetch('/api/process-health')).json(); }catch(e){}
+
   try{
     const d=await (await fetch('/api/session/status')).json();
-    const bB=document.getElementById('session-broker-badge');
-    const bD=document.getElementById('session-decider-badge');
     bB.textContent='Broker: '+d.broker;   bB.style.background=_sessionBadgeColor(d.broker);
     bD.textContent='Decider: '+d.decider; bD.style.background=_sessionBadgeColor(d.decider);
     const up=d.uptime_seconds||0;
@@ -3455,6 +3537,13 @@ async function pollSessionStatus(){
       btn.className='btn btn-sm '+(anyAlive?'btn-danger':'btn-success');
     }
   }catch(e){}
+
+  if(health){
+    bB.classList.toggle('gl-pill-dead', health.broker_alive===false);
+    bD.classList.toggle('gl-pill-dead', health.decider_alive===false);
+    if(health.broker_alive===false){ bB.textContent='Broker: DEAD'; bB.style.background=''; }
+    if(health.decider_alive===false){ bD.textContent='Decider: DEAD'; bD.style.background=''; }
+  }
 }
 async function toggleSession(){
   const btn=document.getElementById('session-toggle-btn');
@@ -5807,6 +5896,36 @@ async function loadAllocation(){
   try{
     const d=await (await fetch('/api/allocation')).json();
 
+    // Plan tables: allocated/actual per cell, per user request 2026-09-12 --
+    // was two disconnected static/live tables before this.
+    const ALLOC_PAIR_FAMS=['GevaExtract','Critical Line','Spread','Correlation'];
+    const pairRows=d.plan_pairs.map(p=>{
+      const cells=ALLOC_PAIR_FAMS.map(fam=>{
+        const c=p.families[fam];
+        return c ? `<td>${c.allocated}/${c.actual}</td>` : '<td class="text-muted">&mdash;</td>';
+      }).join('');
+      return `<tr><td>${p.pair}</td><td>~30</td>${cells}</tr>`;
+    }).join('');
+    const dedicatedRows=d.plan_stocks_dedicated.map(r=>
+      `<tr><td>${r.symbols[0]}...${r.symbols[r.symbols.length-1]}</td><td>${r.family}</td>`+
+      `<td>Dedicated</td><td>${r.allocated}/${r.actual}</td></tr>`
+    ).join('');
+    document.getElementById('alloc-plan-tables').innerHTML = `
+      <table class="table table-sm table-hover mb-3">
+        <thead class="text-muted small"><tr>
+          <th>Pair</th><th>Total/side</th>${ALLOC_PAIR_FAMS.map(f=>`<th>${f}</th>`).join('')}
+        </tr></thead>
+        <tbody>${pairRows}</tbody>
+      </table>
+      <table class="table table-sm table-hover mb-0">
+        <thead class="text-muted small"><tr><th>Stock range</th><th>Algorithm</th><th>Mode</th><th>Allocated/Actual</th></tr></thead>
+        <tbody>
+          ${dedicatedRows}
+          <tr><td>31&ndash;100 (70 symbols)</td><td>All 4 (incl. GevaExtract)</td>
+              <td>Shared, cap toward ~14-15/side</td><td>&mdash;/${d.plan_stocks_shared_actual}</td></tr>
+        </tbody>
+      </table>`;
+
     const trueBySymbol={};
     d.true_totals.forEach(t=>{ (trueBySymbol[t.symbol]=trueBySymbol[t.symbol]||{})[t.direction]=t.resting; });
 
@@ -6025,6 +6144,33 @@ document.addEventListener('shown.bs.tab',function(e){
 # ── Release notes ─────────────────────────────────────────────────────────────
 
 _RELEASE_NOTES = [
+    ("v5.13", "Flashing-red dead-process alert + merged Allocation plan/actual",
+              "User report: broker.py died at 07:12:57 UTC after an IB PAPER "
+              "disconnect (a recurring pattern -- same thing happened multiple times "
+              "09-08 through 09-11) and the dashboard's own Broker/Decider header "
+              "badges stayed a neutral gray instead of flagging it -- SessionManager's "
+              "status() only reflects processes IT itself launched via /api/session/"
+              "start, so it goes stale/wrong the moment either process is started any "
+              "other way (a manual terminal run, a scheduled task, this session's own "
+              "direct launches -- how they actually get run in practice). New "
+              "/api/process-health route does a ground-truth check instead "
+              "(lib.singleton_lock.is_locked_by_other, the same OS-level PID+liveness "
+              "check broker.py/decider.py's own singleton lock already relies on, "
+              "launcher-agnostic by design) and overrides the header badge to a "
+              "flashing red .gl-pill-dead whenever a process is confirmed actually "
+              "dead, regardless of what SessionManager believes. Restarted both "
+              "processes after the user confirmed IB Gateway was back up and a fresh "
+              "connection test succeeded -- broker is running; decider crashed "
+              "immediately on this restart (uncaught ValueError, no live/historical "
+              "MES price available with the market closed -- a separate, pre-existing "
+              "decider.py fragility, not something fixed here, and non-critical per "
+              "the user's own note since the market is closed). "
+              "Also: the Allocation tab's theoretical-plan and actual-usage tables "
+              "were shown separately with no connection between them; merged per user "
+              "request into one 'allocated/actual' figure per cell (e.g. 'Critical "
+              "Line: 5/0'), fed by the same /api/allocation route, now also computing "
+              "per-family actual counts for each pair and dedicated stock range "
+              "directly instead of just a flat per-symbol breakdown."),
     ("v5.12", "Fix v5.11 slowdown regression + move Trading's day-range filter to the top",
               "User report: 'everything very very slow, constant hourglass' since the "
               "v5.11 nav reorder. Root cause found: making Trading/Broker the default "
