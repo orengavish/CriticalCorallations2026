@@ -1651,11 +1651,17 @@ def api_broker_queue():
             closed_date_params
         ).fetchone()[0]
 
-        try:
-            from lib.config_loader import get_config
-            cap = getattr(get_config().orders, "max_resting_per_side", 10)
-        except Exception:
-            cap = 10
+        # 2026-09-12: was a bare get_config() -- lib.config_loader caches globally
+        # PER PROCESS and ignores the path argument on every call after the first
+        # (documented footgun, see _trader_config()'s own docstring above). This
+        # route fires every 5s from the Trading tab (the default landing tab), so
+        # it was almost always the first get_config() call in the process --
+        # caching back-trading/config.yaml's incomplete `session:` block (no
+        # monitor_poll_seconds etc.) before trader/session.py ever got to load the
+        # real trader/config.yaml, permanently breaking /api/session/status with a
+        # 500 for the rest of that process's life. _trader_config() reads the YAML
+        # fresh every call, bypassing the poisoned cache entirely.
+        cap = _trader_config().get("orders", {}).get("max_resting_per_side", 10)
 
         # 2026-09-11: was its own same-side-only approximation here (COUNT of SUBMITTED
         # on the same side >= cap) which silently disagreed with broker.py's real
@@ -2884,7 +2890,7 @@ td.rr-empty{color:var(--gl-faint);font-size:11px;background:var(--gl-panel-2);bo
     <!-- Header -->
     <div class="app-header">
       <span class="brand">Galao</span>
-      <span class="verchip">v5.18</span>
+      <span class="verchip">v5.19</span>
       <span class="gl-pill" id="session-broker-badge" style="color:var(--gl-muted)">Broker: —</span>
       <span class="gl-pill" id="session-decider-badge" style="color:var(--gl-muted)">Decider: —</span>
       <span class="gl-pill" id="market-data-badge" style="color:var(--gl-muted)">Market Data: —</span>
@@ -6924,6 +6930,25 @@ document.addEventListener('shown.bs.tab',function(e){
 # ── Release notes ─────────────────────────────────────────────────────────────
 
 _RELEASE_NOTES = [
+    ("v5.19", "Fix reproducible 500 on /api/session/status (poisoned config cache)",
+              "User provided the exact browser console error: 'GET .../api/session/status 500'. "
+              "Root cause, confirmed via a foreground run with a full traceback: "
+              "lib.config_loader.get_config() caches globally FOR THE WHOLE PROCESS and ignores "
+              "the path argument on every call after the first (a documented footgun already "
+              "worked around elsewhere in this file via _trader_config()). /api/broker-queue -- "
+              "polled every 5s from the Trading tab, the default landing tab -- had a bare "
+              "get_config() call (no path) computing its admission cap, added without using the "
+              "existing safe pattern. Because broker-queue is almost always the first thing to "
+              "fire, it cached back-trading/config.yaml's OWN, incomplete `session:` block "
+              "(no monitor_poll_seconds/max_restarts/etc, a separate file for the backtest engine) "
+              "before trader/session.py ever got to load the real trader/config.yaml -- so "
+              "SessionManager.__init__() reliably AttributeError'd on every dashboard run once "
+              "broker-queue had fired first, which is why it looked so consistent. This was "
+              "NOT the transient/restart-churn issue it was first mistaken for earlier this "
+              "session -- it's been reproducibly broken the whole time. Fixed: that one call site "
+              "now uses _trader_config() (reads the YAML fresh, bypasses the cache entirely), same "
+              "as every other config read in this file already does for exactly this reason. "
+              "Verified live: broker-queue fired first, then session/status -> 200, repeatedly."),
     ("v5.18", "'Better hourglass': busy state no longer freezes the whole page",
               "User asked twice for a better hourglass and kept reporting the dashboard as "
               "'still loading' even after v5.17's dcVerify fix. Root cause: _enterBusy()/"
