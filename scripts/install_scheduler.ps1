@@ -70,6 +70,62 @@ try {
     Write-Host "FAILED: CC2026Dashboard - $_" -ForegroundColor Red
 }
 
+# --- Tasks: broker.py / decider.py watchdogs (2026-09-12 strategic reliability review) ---
+# Real gap found: neither process has ever had any auto-restart coverage. broker.py
+# gives up and exits after 5 failed IB reconnect attempts (~150s); decider.py retries
+# forever but never escalates; trader/session.py's SessionManager has real restart/
+# backoff logic built but isn't actually running in this environment (confirmed live,
+# 2026-09-11 -- see back-trading/trading_dashboard.py's own manual-restart workaround
+# code). This is what turned this week's IB Gateway blips (09-08 through 09-12) into
+# multi-hour silent outages -- a direct loss against this project's only goal (make
+# money in paper trading). Same watchdog shape as CC2026Dashboard above: both scripts
+# already call lib.singleton_lock.acquire_singleton_lock() at startup and exit
+# immediately (harmlessly) if another live instance already holds the lock -- so this
+# task can just try to (re)launch every 2 minutes, unconditionally. If broker/decider
+# are already running, the new attempt exits in well under a second; if either has
+# died, the very next trigger relaunches it. WorkingDirectory is trader/, not the
+# project root -- matches session.py's own SessionManager._spawn() (cwd=trader dir),
+# since both scripts import/resolve paths assuming that CWD.
+$TraderDir = Join-Path $ProjectRoot "trader"
+
+$BrokerAction = New-ScheduledTaskAction -Execute $PythonW `
+    -Argument "broker.py" -WorkingDirectory $TraderDir
+$BrokerTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 2)
+$BrokerSettings = New-ScheduledTaskSettingsSet `
+    -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes 0) `
+    -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -StartWhenAvailable
+
+try {
+    Register-ScheduledTask -TaskName "CC2026Broker" `
+        -Action $BrokerAction -Trigger $BrokerTrigger -Settings $BrokerSettings -Principal $Principal -Force -ErrorAction Stop | Out-Null
+    if (Get-ScheduledTask -TaskName "CC2026Broker" -ErrorAction SilentlyContinue) {
+        Write-Host "OK: CC2026Broker (watchdog, checks/relaunches every 2 min)"
+    } else {
+        Write-Host "FAILED: CC2026Broker registration did not stick." -ForegroundColor Red
+    }
+} catch {
+    Write-Host "FAILED: CC2026Broker - $_" -ForegroundColor Red
+}
+
+$DeciderAction = New-ScheduledTaskAction -Execute $PythonW `
+    -Argument "decider.py --mode session" -WorkingDirectory $TraderDir
+$DeciderTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 2)
+$DeciderSettings = New-ScheduledTaskSettingsSet `
+    -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes 0) `
+    -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -StartWhenAvailable
+
+try {
+    Register-ScheduledTask -TaskName "CC2026Decider" `
+        -Action $DeciderAction -Trigger $DeciderTrigger -Settings $DeciderSettings -Principal $Principal -Force -ErrorAction Stop | Out-Null
+    if (Get-ScheduledTask -TaskName "CC2026Decider" -ErrorAction SilentlyContinue) {
+        Write-Host "OK: CC2026Decider (watchdog, checks/relaunches every 2 min)"
+    } else {
+        Write-Host "FAILED: CC2026Decider registration did not stick." -ForegroundColor Red
+    }
+} catch {
+    Write-Host "FAILED: CC2026Decider - $_" -ForegroundColor Red
+}
+
 # --- Task: Random-baseline control on MYM (mimics GevaExtract's 3x/day cadence
 #     at 18:00/20:30/23:00, but on a symbol GevaExtract doesn't trade -- MES/MNQ --
 #     so the two are a genuine apples-to-apples signal-vs-null-hypothesis comparison,
