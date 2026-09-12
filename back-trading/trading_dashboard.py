@@ -2328,49 +2328,18 @@ def api_algo_compare():
     })
 
 
-# 2026-09-12: which algorithm family a commands.source belongs to, for the
-# Allocation tab -- GevaExtract / Critical Line / Spread / Correlation are the 4
-# the capacity plan is built around; everything else (legacy critical_line,
-# algo_lab, geva_manual_control) collapses to "Other" here so nothing silently
-# drops out of the live total even though it's not one of the 4.
-_ALLOC_FAMILY_SOURCES = {
-    "GevaExtract":    {"geva_extract", "geva_manual"},
-    "Critical Line":  {"research_ce", "research_ce_stock", "research_random", "research_random_stock"},
-    "Spread":         {"spread", "spread_control"},
-    "Correlation":    {"correlation", "correlation_control"},
-}
-
-
-def _alloc_family_for(source):
-    for fam, srcs in _ALLOC_FAMILY_SOURCES.items():
-        if source in srcs:
-            return fam
-    return "Other"
-
-
-# 2026-09-12: the agreed capacity plan, as data -- lets the Allocation tab show
-# "allocated/actual" per cell instead of two disconnected static/live tables.
-# Not yet enforced anywhere in broker.py; this is the plan for reference and
-# the live count fills in as trading resumes.
-_ALLOC_PAIRS = [
-    ("MES + ES",  ["MES", "ES"]),
-    ("MNQ + NQ",  ["MNQ", "NQ"]),
-    ("MYM + YM",  ["MYM", "YM"]),
-    ("M2K + RTY", ["M2K", "RTY"]),
-]
-_ALLOC_PAIR_PLAN = {
-    "MES + ES":  {"GevaExtract": 15, "Critical Line": 5, "Spread": 5, "Correlation": 5},
-    "MNQ + NQ":  {"Critical Line": 10, "Spread": 10, "Correlation": 10},
-    "MYM + YM":  {"Critical Line": 10, "Spread": 10, "Correlation": 10},
-    "M2K + RTY": {"Critical Line": 10, "Spread": 10, "Correlation": 10},
-}
-# Top-30 of the real ~100-stock universe (MultiSymbolTrader/mst_data/sp100_symbols.txt),
-# in order -- first 10 each dedicated to one algorithm.
-_ALLOC_STOCK_DEDICATED = {
-    "Critical Line": ["AAPL", "MSFT", "NVDA", "GOOGL", "GOOG", "AMZN", "META", "BRK.B", "AVGO", "TSLA"],
-    "Spread":        ["LLY", "JPM", "V", "XOM", "UNH", "MA", "COST", "HD", "PG", "JNJ"],
-    "Correlation":   ["NFLX", "ABBV", "BAC", "CRM", "WMT", "KO", "CVX", "MRK", "ADBE", "PEP"],
-}
+# 2026-09-12: moved to lib/allocation.py, which broker.py's real admission-control
+# gate now also imports -- this dashboard used to carry its own separate copy of the
+# same table (display-only, pre-enforcement), exactly the kind of drift risk that
+# module's own docstring warns about. Aliased under the old names so the rest of this
+# file (below) doesn't need touching.
+from lib.allocation import (
+    ALLOC_FAMILY_SOURCES as _ALLOC_FAMILY_SOURCES,
+    family_for_source as _alloc_family_for,
+    ALLOC_PAIRS as _ALLOC_PAIRS,
+    ALLOC_PAIR_PLAN as _ALLOC_PAIR_PLAN,
+    ALLOC_STOCK_DEDICATED as _ALLOC_STOCK_DEDICATED,
+)
 
 
 @app.route("/api/allocation")
@@ -2953,7 +2922,7 @@ td.rr-empty{color:var(--gl-faint);font-size:11px;background:var(--gl-panel-2);bo
     <!-- Header -->
     <div class="app-header">
       <span class="brand">Galao</span>
-      <span class="verchip">v5.21</span>
+      <span class="verchip">v5.22</span>
       <span class="gl-pill" id="session-broker-badge" style="color:var(--gl-muted)">Broker: —</span>
       <span class="gl-pill" id="session-decider-badge" style="color:var(--gl-muted)">Decider: —</span>
       <span class="gl-pill" id="market-data-badge" style="color:var(--gl-muted)">Market Data: —</span>
@@ -7017,6 +6986,15 @@ document.addEventListener('shown.bs.tab',function(e){
 # ── Release notes ─────────────────────────────────────────────────────────────
 
 _RELEASE_NOTES = [
+    ("v5.22", "Allocation tab now shares broker.py's real enforcement table (Tier 2.5 wrap-up)",
+              "This dashboard's Allocation tab display and broker.py's new admission-control "
+              "Gate 1b (per-family capacity allocation, this session's strategic reliability "
+              "review) used to carry two separate copies of the same GevaExtract/Critical "
+              "Line/Spread/Correlation allocation table -- a display-only one here, a real "
+              "enforcement one in the new lib/allocation.py. Swapped this file's own copy for "
+              "an import from that shared module, so the Allocation tab can never silently "
+              "drift from what broker.py actually enforces. No visible behavior change -- "
+              "verified live: /api/allocation still returns the identical plan/actual shape."),
     ("v5.21", "Bring back the v4.12 hourglass as a page-load splash; fix the 5s blank-page load",
               "User specifically remembered and asked for v4.12's full-screen hourglass overlay "
               "back (removed in v5.00 when it was reused as the general per-fetch busy indicator "
