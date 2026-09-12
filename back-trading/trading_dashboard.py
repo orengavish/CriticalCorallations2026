@@ -2876,7 +2876,7 @@ td.rr-empty{color:var(--gl-faint);font-size:11px;background:var(--gl-panel-2);bo
     <!-- Header -->
     <div class="app-header">
       <span class="brand">Galao</span>
-      <span class="verchip">v5.16</span>
+      <span class="verchip">v5.17</span>
       <span class="gl-pill" id="session-broker-badge" style="color:var(--gl-muted)">Broker: —</span>
       <span class="gl-pill" id="session-decider-badge" style="color:var(--gl-muted)">Decider: —</span>
       <span class="gl-pill" id="market-data-badge" style="color:var(--gl-muted)">Market Data: —</span>
@@ -3631,6 +3631,7 @@ td.rr-empty{color:var(--gl-faint);font-size:11px;background:var(--gl-panel-2);bo
     <button class="btn btn-sm btn-outline-secondary bk-range active" data-bkrange="today">Today</button>
     <button class="btn btn-sm btn-outline-secondary bk-range" data-bkrange="yesterday">Yesterday</button>
     <button class="btn btn-sm btn-outline-secondary bk-range" data-bkrange="all">All days</button>
+    <span class="small text-muted">&mdash; only changes Closed &amp; Net P&amp;L below; Pending/Submitted/Filled are always live (right now), not range-filtered</span>
   </div>
   <div class="small text-muted" id="dc-summary" style="margin:-4px 0 10px 2px"></div>
   <div class="broker-stats">
@@ -5131,21 +5132,26 @@ async function loadBroker(){
   }catch(e){}
 }
 
-let _dcTimer=null;
-
+// 2026-09-12 fix: clicking the Broker tab used to arm setInterval(dcVerify,15000) --
+// dcVerify() spawns ib_dayclean.py fresh each call (measured ~3.7s live, up to 30s if
+// IB is slow to answer) to build the Day Start status line. That's the same class of
+// bug already fixed for page-load in v5.12 (which only removed the INIT-time auto-
+// start) -- this click-triggered path was missed, so every direct click on "Broker"
+// quietly started a real subprocess spawning every 15s in the background for as long
+// as the user stayed on the tab, degrading everything (user report: "doing something
+// in the background... huge, very slow" every time they visited Trading). One-shot on
+// click now, same as the button/every dc* action already does on demand.
 document.getElementById('btn-broker-tab').addEventListener('click',()=>{
   loadBroker();
   clearInterval(_bkTimer);
   _bkTimer=setInterval(loadBroker,5000);   // matches broker.py's own command_poll_seconds
   dcVerify();
-  clearInterval(_dcTimer);
-  _dcTimer=setInterval(dcVerify,15000);    // Day Start gating/summary change far less often
 });
 
 // Leaving the Broker tab stops its poll and restores the normal tab title --
 // any other top-tab button click does it.
 document.querySelectorAll('#mainTab .top-tab:not(#btn-broker-tab)').forEach(b=>{
-  b.addEventListener('click',()=>{ clearInterval(_bkTimer); clearInterval(_dcTimer); document.title='Galao'; });
+  b.addEventListener('click',()=>{ clearInterval(_bkTimer); document.title='Galao'; });
 });
 
 // Keyboard shortcuts: 'b' -> Broker, Escape -> Overview. Ignored while typing in a field.
@@ -5153,7 +5159,7 @@ document.addEventListener('keydown', e=>{
   const tag=(e.target.tagName||'').toLowerCase();
   if(tag==='input'||tag==='textarea'||tag==='select') return;
   if(e.key==='b'||e.key==='B'){ selectGroupTab('trading','tab-broker'); document.getElementById('btn-broker-tab').click(); }
-  else if(e.key==='Escape'){ clearInterval(_bkTimer); clearInterval(_dcTimer); selectGroupTab('overview','tab-overview'); }
+  else if(e.key==='Escape'){ clearInterval(_bkTimer); selectGroupTab('overview','tab-overview'); }
 });
 
 // ── Stats screen ─────────────────────────────────────────────────────────────
@@ -6904,6 +6910,22 @@ document.addEventListener('shown.bs.tab',function(e){
 # ── Release notes ─────────────────────────────────────────────────────────────
 
 _RELEASE_NOTES = [
+    ("v5.17", "Fix recurring background dcVerify() poll on Broker tab clicks; clarify Closed-range scope",
+              "User report: 'the trading is doing something in the background while it is loaded... "
+              "every time I'm going there, there is some huge, very slow one' plus a periodically-"
+              "changing 'DB 354...' status message. Root cause: clicking the Broker tab (not just "
+              "page load) armed setInterval(dcVerify, 15000) -- dcVerify() spawns ib_dayclean.py "
+              "fresh each call (measured ~3.7s live) to build the Day Start status line. v5.12 only "
+              "fixed the INIT-time auto-start of this same recurring poll; this click-triggered path "
+              "was missed, so every direct click on 'Broker' quietly started a real subprocess "
+              "spawning every 15s for as long as the user stayed on the tab. Fixed: one-shot dcVerify() "
+              "per click, same as every other dc* action already does on demand -- no recurring timer "
+              "left anywhere. Separately, per the same report ('today yesterday and all days... is "
+              "meaningless not working'): verified live that the Closed-range buttons DO work correctly "
+              "(closed_today counts/net P&L genuinely differ: 0/2/66 across today/yesterday/all) -- the "
+              "real problem was that Pending/Submitted/Filled sit right below the range buttons but are "
+              "never range-filtered (a live snapshot, by design), with nothing on screen saying so. "
+              "Added an inline note next to the range buttons making that scope explicit."),
     ("v5.16", "New 'Results Research' tab: 4-method comparison + per-method parameter matrix",
               "Replaces the old single-symbol Compare tab, per several rounds of design "
               "iteration approved by the user (design pitched and refined as a standalone "
