@@ -1916,6 +1916,213 @@ def api_closed_stats():
     })
 
 
+# ── Results Research: multi-method comparison matrix ───────────────────────────
+# 2026-09-12: replaces the old single-symbol "Compare" tab's job (per the user's
+# own words: "the current display of results is not bad for what it's doing, but
+# what it's doing is just show the results with no good comparison option") --
+# a top-level 4-method (GevaExtract/Critical Lines/Spread/Correlation) live
+# overview, each drilling into its own real parameter matrix (rows x columns,
+# optional facet, color-by metric). Built on the exact commands+critical_lines
+# join api_closed_stats already uses above, reusing _bucket_for/_summarize --
+# not a new data model.
+#
+# Scope decided against the original design mockup (which used illustrative
+# sample fields not all tied to real columns): cl_algo_combo_scores exists but
+# is MES-only right now (4500 rows, one symbol) and its own algo_type axis is a
+# backtest strategy-shape label (BOTH/BOUNCE/BREAKOUT/DIRECTIONAL/FADE), not
+# the live WINNING_REASON "Algo 1-5" labels the Results tab uses -- unifying
+# those two into one matrix is real future work, not attempted here. This ships
+# a live-trade-aggregate matrix instead, over real commands columns (symbol,
+# direction, entry_type, bracket_size) plus, per method: "algo" (Critical
+# Lines' WINNING_REASON -> Algo 1-5, via _bucket_for) and "control" (Spread/
+# Correlation's real-vs-reversed-leg or real-vs-random split, also via
+# _bucket_for). Works today for every method, honestly sparse for Spread/
+# Correlation (both cfg.*.enabled=false right now, zero live commands yet).
+
+_RR_METHODS = ["GevaExtract", "Critical Lines", "Spread", "Correlation"]
+_RR_METHOD_FIELDS = {
+    "GevaExtract":    ["symbol", "direction", "entry_type", "bracket_size"],
+    "Critical Lines": ["symbol", "direction", "entry_type", "bracket_size", "algo"],
+    "Spread":         ["symbol", "direction", "entry_type", "bracket_size", "control"],
+    "Correlation":    ["symbol", "direction", "entry_type", "bracket_size", "control"],
+}
+
+
+def _rr_family_for(bucket: str):
+    if bucket == "GevaExtract":
+        return "GevaExtract"
+    if re.match(r"^Algo \d+ \(", bucket):
+        return "Critical Lines"
+    if bucket.startswith("Spread ("):
+        return "Spread"
+    if bucket.startswith("Correlation ("):
+        return "Correlation"
+    return None
+
+
+def _rr_fmt_bracket(v):
+    return str(int(v)) if v == int(v) else str(v)
+
+
+def _rr_sort_domain(field, values):
+    if field == "bracket_size":
+        return sorted(values, key=lambda x: float(x))
+    if field == "symbol":
+        order = {s: i for i, s in enumerate(ALL_SYMBOLS)}
+        return sorted(values, key=lambda x: order.get(x, 999))
+    if field == "algo":
+        return sorted(values, key=lambda x: int(x.split()[-1]) if x.split()[-1].isdigit() else 999)
+    return sorted(values)
+
+
+def _rr_rows(con, date_from: str, date_to: str) -> list:
+    """Same commands+critical_lines join api_closed_stats uses above, enriched
+    with the family/algo/control fields Results Research groups by."""
+    rows = [dict(r) for r in con.execute(
+        "SELECT c.symbol, c.source AS cmd_source, cl.source AS line_source,"
+        " cl.note AS line_note, c.direction, c.entry_type, c.bracket_size,"
+        " c.pnl_points, c.exit_time"
+        " FROM commands c LEFT JOIN critical_lines cl ON cl.id = c.critical_line_id"
+        " WHERE c.status='CLOSED' AND date(c.exit_time) BETWEEN ? AND ?"
+        " AND c.pnl_points IS NOT NULL",
+        (date_from, date_to)
+    ).fetchall()]
+    for r in rows:
+        true_source = r["line_source"] or r["cmd_source"]
+        bucket = _bucket_for(true_source, r["symbol"], r["line_note"])
+        r["family"] = _rr_family_for(bucket)
+        r["algo"] = bucket.split(" (")[0] if r["family"] == "Critical Lines" else None
+        r["control"] = (
+            ("Real" if bucket.endswith("(Real)") else "Control")
+            if r["family"] in ("Spread", "Correlation") else None
+        )
+        r["usd"] = r["pnl_points"] * algo_pnl.SYMBOL_MULTIPLIERS.get(r["symbol"], 1.0)
+    return rows
+
+
+def _rr_date_range(range_sel: str):
+    if range_sel == "today":
+        d = date.today().isoformat()
+        return "today", d, d
+    if range_sel == "yesterday":
+        d = (date.today() - timedelta(days=1)).isoformat()
+        return "yesterday", d, d
+    return "all", "2000-01-01", date.today().isoformat()
+
+
+def _rr_csv_arg(name: str):
+    raw = request.args.get(name)
+    if not raw:
+        return None
+    return {v for v in raw.split(",") if v}
+
+
+def _rr_passes(r, f_symbol, f_direction, f_entry_type, f_bracket, f_algo, f_control):
+    if f_symbol and r["symbol"] not in f_symbol:
+        return False
+    if f_direction and r["direction"] not in f_direction:
+        return False
+    if f_entry_type and r["entry_type"] not in f_entry_type:
+        return False
+    if f_bracket and (r["bracket_size"] is None or _rr_fmt_bracket(r["bracket_size"]) not in f_bracket):
+        return False
+    if f_algo and r["algo"] not in f_algo:
+        return False
+    if f_control and r["control"] not in f_control:
+        return False
+    return True
+
+
+def _rr_read_filters():
+    return (_rr_csv_arg("symbol"), _rr_csv_arg("direction"), _rr_csv_arg("entry_type"),
+            _rr_csv_arg("bracket"), _rr_csv_arg("algo"), _rr_csv_arg("control"))
+
+
+@app.route("/api/results-research/overview")
+def api_results_research_overview():
+    range_sel, date_from, date_to = _rr_date_range(request.args.get("range", "all"))
+    f_symbol, f_direction, f_entry_type, f_bracket, f_algo, f_control = _rr_read_filters()
+
+    with get_db(_resolve_db()) as con:
+        rows = _rr_rows(con, date_from, date_to)
+        all_time_rows = rows if range_sel == "all" else _rr_rows(con, "2000-01-01", date.today().isoformat())
+
+    scoped = [r for r in rows if r["family"]]
+    filtered_rows = [r for r in scoped
+                      if _rr_passes(r, f_symbol, f_direction, f_entry_type, f_bracket, f_algo, f_control)]
+
+    cards = {}
+    for fam in _RR_METHODS:
+        s = _summarize([r for r in filtered_rows if r["family"] == fam])
+        cards[fam] = {"n": s["n"], "win_pct": s["win_pct"], "profit_factor": s["profit_factor"], "usd": s["usd"]}
+
+    total_by_family = {fam: sum(1 for r in all_time_rows if r["family"] == fam) for fam in _RR_METHODS}
+
+    return jsonify({
+        "range": range_sel, "date_from": date_from, "date_to": date_to,
+        "cards": cards, "total_by_family": total_by_family,
+        "filters_available": {
+            "symbol":     _rr_sort_domain("symbol", {r["symbol"] for r in scoped}),
+            "direction":  sorted({r["direction"] for r in scoped if r["direction"]}),
+            "entry_type": sorted({r["entry_type"] for r in scoped if r["entry_type"]}),
+            "bracket":    _rr_sort_domain("bracket_size",
+                              {_rr_fmt_bracket(r["bracket_size"]) for r in scoped if r["bracket_size"] is not None}),
+            "algo":       _rr_sort_domain("algo", {r["algo"] for r in scoped if r["algo"]}),
+            "control":    sorted({r["control"] for r in scoped if r["control"]}),
+        },
+    })
+
+
+@app.route("/api/results-research/matrix")
+def api_results_research_matrix():
+    method = request.args.get("method", "Critical Lines")
+    if method not in _RR_METHOD_FIELDS:
+        return jsonify({"error": f"unknown method {method}"}), 400
+    allowed = set(_RR_METHOD_FIELDS[method])
+    row_f   = request.args.get("row", "symbol")
+    col_f   = request.args.get("col", "bracket_size" if "bracket_size" in allowed else "direction")
+    facet_f = request.args.get("facet") or None
+    if row_f not in allowed or col_f not in allowed or (facet_f and facet_f not in allowed):
+        return jsonify({"error": "row/col/facet must be one of " + ",".join(sorted(allowed))}), 400
+
+    range_sel, date_from, date_to = _rr_date_range(request.args.get("range", "all"))
+    f_symbol, f_direction, f_entry_type, f_bracket, f_algo, f_control = _rr_read_filters()
+
+    with get_db(_resolve_db()) as con:
+        rows = _rr_rows(con, date_from, date_to)
+
+    fam_rows = [r for r in rows if r["family"] == method]
+    filtered_rows = [r for r in fam_rows
+                      if _rr_passes(r, f_symbol, f_direction, f_entry_type, f_bracket, f_algo, f_control)]
+
+    def field_val(r, f):
+        return _rr_fmt_bracket(r["bracket_size"]) if f == "bracket_size" else r[f]
+
+    cells = {}
+    for r in filtered_rows:
+        fv = field_val(r, facet_f) if facet_f else "_all"
+        rv, cv = field_val(r, row_f), field_val(r, col_f)
+        if rv is None or cv is None:
+            continue
+        cells.setdefault(fv, {}).setdefault(rv, {}).setdefault(cv, []).append(r)
+
+    cell_summaries = {
+        fv: {rv: {cv: _summarize(bucket_rows) for cv, bucket_rows in cols.items()}
+             for rv, cols in rowsd.items()}
+        for fv, rowsd in cells.items()
+    }
+
+    return jsonify({
+        "method": method, "row": row_f, "col": col_f, "facet": facet_f, "range": range_sel,
+        "row_domain":   _rr_sort_domain(row_f, {field_val(r, row_f) for r in fam_rows if field_val(r, row_f) is not None}),
+        "col_domain":   _rr_sort_domain(col_f, {field_val(r, col_f) for r in fam_rows if field_val(r, col_f) is not None}),
+        "facet_domain": (_rr_sort_domain(facet_f, {field_val(r, facet_f) for r in fam_rows if field_val(r, facet_f) is not None})
+                          if facet_f else []),
+        "n_total": len(filtered_rows),
+        "cells": cell_summaries,
+    })
+
+
 @app.route("/api/available_dates")
 def api_available_dates():
     """Dates that have CSV data for at least one requested symbol in the given range."""
@@ -2528,6 +2735,69 @@ body:not(.busy-wait) .busy-strip{background:var(--gl-border)}
 .unreliable-badge{color:var(--gl-bad);font-size:10px;margin-left:4px;font-weight:700;
   text-transform:none;letter-spacing:0}
 
+/* Results Research (2026-09-12): reuses .gl-card/.st-bucket-opt/--gl-* tokens already
+   established elsewhere in this file -- only the heatmap-cell coloring and the card/
+   facet grid layouts are genuinely new, nothing here exists as a reusable class yet. */
+.rr-chip{font-size:11.5px;padding:3px 9px;border-radius:20px;border:1px solid var(--gl-border);
+  background:var(--gl-panel);color:var(--gl-muted);cursor:pointer;user-select:none}
+.rr-chip.active{background:var(--gl-accent);border-color:var(--gl-accent);color:var(--gl-accent-ink);font-weight:600}
+.rr-chipset{display:flex;flex-wrap:wrap;gap:5px}
+.rr-fieldlabel{font-size:10.5px;color:var(--gl-faint);margin:4px 0 2px}
+.rr-cardgrid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}
+@media (max-width:1100px){.rr-cardgrid{grid-template-columns:repeat(2,1fr)}}
+.rr-mcard{padding:14px;cursor:pointer;transition:border-color .12s}
+.rr-mcard:hover{border-color:var(--gl-accent)}
+.rr-mcard .name{font-size:14px;font-weight:700;color:var(--gl-ink)}
+.rr-mcard .sub{font-size:10.5px;color:var(--gl-faint);min-height:2.4em;margin-top:2px}
+.rr-mcard .stats{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-top:8px;font-family:var(--gl-mono)}
+.rr-mcard .stat .k{font-size:9.5px;text-transform:uppercase;letter-spacing:.04em;color:var(--gl-faint)}
+.rr-mcard .stat .v{font-size:14.5px;font-weight:600;color:var(--gl-ink)}
+.rr-mcard .footer{display:flex;align-items:center;justify-content:space-between;margin-top:8px;font-size:10.5px}
+.rr-maturity{font-weight:700;text-transform:uppercase;letter-spacing:.03em;padding:2px 6px;border-radius:4px}
+.rr-maturity.established{background:rgba(63,187,130,.15);color:var(--gl-good)}
+.rr-maturity.building{background:rgba(217,141,43,.15);color:var(--gl-accent)}
+.rr-maturity.early{background:var(--gl-panel-2);color:var(--gl-faint)}
+.rr-layout{display:grid;grid-template-columns:200px 1fr;gap:14px;align-items:start}
+@media (max-width:860px){.rr-layout{grid-template-columns:1fr}}
+.rr-rail{padding:12px;display:flex;flex-direction:column;gap:12px}
+.rr-rail h3{font-size:10.5px;text-transform:uppercase;letter-spacing:.05em;color:var(--gl-faint);font-weight:600;margin:0 0 4px}
+.rr-secgrid{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}
+@media (max-width:1000px){.rr-secgrid{grid-template-columns:repeat(2,1fr)}}
+.rr-axisbar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:10px 14px}
+.rr-axisbar .grp{display:flex;align-items:center;gap:6px;font-size:11px;color:var(--gl-faint)}
+.rr-axisbar select{font-size:12.5px;background:var(--gl-panel-2);color:var(--gl-ink);border:1px solid var(--gl-border);border-radius:6px;padding:4px 7px}
+table.rr-mx{border-collapse:separate;border-spacing:3px;width:100%}
+table.rr-mx th{font-weight:600;font-size:11px;color:var(--gl-muted);text-align:center;padding:2px 4px}
+table.rr-mx th.corner{text-align:right;padding-right:8px;font-size:10px}
+table.rr-mx th.rowhead{text-align:right;padding-right:8px;white-space:nowrap;font-family:var(--gl-mono);font-size:11px}
+td.rr-cell{border-radius:6px;padding:7px 5px;text-align:center;cursor:pointer;min-width:64px;font-family:var(--gl-mono)}
+td.rr-cell .v{font-size:13.5px;font-weight:600;color:#12141a}
+td.rr-cell .sub{font-size:10px;opacity:.75;color:#12141a}
+td.rr-cell.rr-faint{opacity:.4}
+td.rr-empty{color:var(--gl-faint);font-size:11px;background:var(--gl-panel-2);border-radius:6px;text-align:center}
+.rr-facetgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px}
+.rr-facetpanel{border:1px solid var(--gl-border);border-radius:8px;padding:10px}
+.rr-facetpanel-title{font-size:11.5px;font-weight:700;color:var(--gl-ink);margin-bottom:6px;padding-bottom:5px;border-bottom:1px solid var(--gl-border)}
+.rr-sparse{padding:8px 12px;border-radius:6px;background:rgba(217,141,43,.12);color:var(--gl-accent);font-size:12px;margin-bottom:10px}
+.rr-drawer-backdrop{position:fixed;inset:0;background:rgba(0,0,0,.5);display:none;z-index:1040}
+.rr-drawer-backdrop.show{display:block}
+.rr-drawer{position:fixed;top:0;right:0;height:100%;width:min(400px,92vw);background:var(--gl-panel);
+  border-left:1px solid var(--gl-border);z-index:1041;transform:translateX(100%);transition:transform .18s ease;
+  display:flex;flex-direction:column}
+.rr-drawer.show{transform:translateX(0)}
+.rr-drawer-head{padding:14px;border-bottom:1px solid var(--gl-border);display:flex;align-items:flex-start;gap:10px}
+.rr-drawer-body{padding:14px;overflow-y:auto;flex:1;display:flex;flex-direction:column;gap:14px}
+.rr-statgrid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.rr-stattile{background:var(--gl-panel-2);border:1px solid var(--gl-border);border-radius:7px;padding:8px 10px}
+.rr-stattile .k{font-size:10px;text-transform:uppercase;letter-spacing:.04em;color:var(--gl-faint)}
+.rr-stattile .val{font-family:var(--gl-mono);font-size:16px;font-weight:600;color:var(--gl-ink);margin-top:2px}
+.rr-tray-table{width:100%;border-collapse:collapse;font-size:12px}
+.rr-tray-table th{text-align:left;color:var(--gl-faint);font-weight:600;font-size:10.5px;text-transform:uppercase;padding:4px 8px;border-bottom:1px solid var(--gl-border)}
+.rr-tray-table td{padding:5px 8px;border-bottom:1px solid var(--gl-border);font-family:var(--gl-mono);color:var(--gl-ink)}
+.rr-tray-table td.best{color:var(--gl-good);font-weight:700}
+.rr-tray-table .rm{cursor:pointer;color:var(--gl-faint);font-family:inherit}
+.rr-tray-table .rm:hover{color:var(--gl-bad)}
+
 .st-overall{font-family:var(--gl-mono);font-size:13px;display:flex;gap:16px;align-items:baseline}
 .st-overall .big{font-size:18px;font-weight:600}
 
@@ -2606,7 +2876,7 @@ body:not(.busy-wait) .busy-strip{background:var(--gl-border)}
     <!-- Header -->
     <div class="app-header">
       <span class="brand">Galao</span>
-      <span class="verchip">v5.15</span>
+      <span class="verchip">v5.16</span>
       <span class="gl-pill" id="session-broker-badge" style="color:var(--gl-muted)">Broker: —</span>
       <span class="gl-pill" id="session-decider-badge" style="color:var(--gl-muted)">Decider: —</span>
       <span class="gl-pill" id="market-data-badge" style="color:var(--gl-muted)">Market Data: —</span>
@@ -2632,7 +2902,7 @@ body:not(.busy-wait) .busy-strip{background:var(--gl-border)}
         <li class="nav-item" data-group="trading"><button class="nav-link top-tab active" data-bs-toggle="tab" data-bs-target="#tab-broker" id="btn-broker-tab">Broker</button></li>
         <li class="nav-item" data-group="trading"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-submitted" id="btn-sub-tab">Submitted</button></li>
         <li class="nav-item" data-group="results"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-stats" id="btn-stats-tab">Results</button></li>
-        <li class="nav-item" data-group="results"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-compare" id="btn-compare-tab">Compare</button></li>
+        <li class="nav-item" data-group="results"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-compare" id="btn-compare-tab">Results Research</button></li>
         <li class="nav-item" data-group="allocation"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-allocation" id="btn-allocation-tab">Allocation</button></li>
         <li class="nav-item" data-group="overview"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-overview" id="btn-overview-tab">Overview</button></li>
         <li class="nav-item" data-group="levels"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-lines" id="btn-lines-tab">Lines</button></li>
@@ -3208,42 +3478,104 @@ body:not(.busy-wait) .busy-strip{background:var(--gl-border)}
  </div>
 </div>
 
-<!-- ══════════════════════ COMPARE ══════════════════════ -->
-<!-- Comparison engine: which line-detection rule (Algo 1-5) and which entry-style/bracket
-     combo the backtest evidence actually supports, with out-of-sample-aware anti-overfit
-     guards (MC p-value, LOOCV) instead of by-eye judgment. Read-only view over the latest
-     cl_algo_reason_scores / cl_algo_combo_scores / cl_algo_learner_runs rows -- does not
-     trigger a scoring run itself (run_cl_algo_pipeline.py does that, cron/manual). -->
+<!-- ══════════════════════ RESULTS RESEARCH ══════════════════════ -->
+<!-- 2026-09-12: replaces the old single-symbol "Compare" tab (backend below is new;
+     the old /api/algo-compare route + cl_algo_reason_scores/combo_scores tables are
+     untouched, still reachable if ever needed -- this is a UI-level replacement, not
+     a data migration). Two layers, approved over several design iterations with the
+     user: a 4-method (GevaExtract/Critical Lines/Spread/Correlation) live-performance
+     overview, each drilling into its own real parameter matrix (rows x columns,
+     optional facet, color-by metric) -- see /api/results-research/{overview,matrix}. -->
 <div class="tab-pane fade" id="tab-compare">
- <div class="st-page">
-  <div class="st-topbar">
-    <div class="st-topbar-row">
-      <select class="form-select form-select-sm" id="cmp-symbol-select" style="width:auto">
-        <option value="MES">MES</option>
-        <option value="MNQ">MNQ</option>
-        <option value="MYM">MYM</option>
-        <option value="M2K">M2K</option>
-      </select>
-      <span class="text-muted small ms-2" id="cmp-scored-at"></span>
-      <button class="btn btn-sm btn-outline-secondary ms-auto" onclick="loadCompare()">&#8635;</button>
+ <div class="st-page" style="height:auto;overflow-y:auto">
+  <div id="rr-view-overview">
+    <div class="gl-card d-flex align-items-center mb-3" style="padding:10px 14px">
+      <b class="small">Live performance</b>
+      <div class="rr-chipset ms-auto" id="rr-range"></div>
+    </div>
+    <div class="rr-layout mb-3">
+      <div class="gl-card rr-rail">
+        <div class="d-flex align-items-center">
+          <h3 class="mb-0">Main filters</h3>
+          <a href="#" class="small ms-auto" style="color:var(--gl-accent)" onclick="rrResetFilters();return false">reset</a>
+        </div>
+        <div id="rr-rail-main"></div>
+      </div>
+      <div class="rr-cardgrid" id="rr-cards"></div>
+    </div>
+    <div class="gl-card p-3">
+      <h3 style="font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--gl-faint);margin-bottom:8px">More filters &mdash; per-method parameters</h3>
+      <div class="rr-secgrid" id="rr-rail-secondary"></div>
     </div>
   </div>
 
-  <div class="cmp-section">
-    <h6 class="text-muted small text-uppercase mb-2">Line-detection rules (Algo 1-5) — real vs. matched control</h6>
-    <div id="cmp-reason-table"></div>
-  </div>
-
-  <div class="cmp-section mt-4">
-    <h6 class="text-muted small text-uppercase mb-2">Entry-style / bracket combos</h6>
-    <div id="cmp-combo-table"></div>
-  </div>
-
-  <div class="cmp-section mt-4">
-    <h6 class="text-muted small text-uppercase mb-2">Live trades so far (research_ce / research_random)</h6>
-    <div id="cmp-live-table"></div>
+  <div id="rr-view-matrix" style="display:none">
+    <div class="d-flex align-items-center gap-2 mb-3">
+      <button class="btn btn-sm btn-outline-secondary" onclick="rrShowOverview()">&larr; All methods</button>
+      <div>
+        <b id="rr-method-name" style="font-size:15px"></b>
+        <div class="small text-muted" id="rr-method-sub"></div>
+      </div>
+    </div>
+    <div id="rr-sparse-banner" class="rr-sparse" style="display:none"></div>
+    <div class="rr-layout">
+      <div class="gl-card rr-rail">
+        <div id="rr-drill-chipgroups"></div>
+        <div>
+          <h3>Min fills (n)</h3>
+          <input type="range" id="rr-minn" min="0" max="30" value="3" oninput="rrOnMinN(this.value)" style="width:100%">
+          <span class="small text-muted" id="rr-minn-val">&ge; 3 fills</span>
+        </div>
+      </div>
+      <div>
+        <div class="gl-card rr-axisbar mb-2">
+          <div class="grp"><label>Rows</label><select id="rr-axis-y" onchange="rrOnAxisChange()"></select></div>
+          <button class="btn btn-sm btn-outline-secondary" onclick="rrSwapAxes()">&#8644;</button>
+          <div class="grp"><label>Columns</label><select id="rr-axis-x" onchange="rrOnAxisChange()"></select></div>
+          <div class="grp"><label>Facet by</label><select id="rr-axis-facet" onchange="rrOnFacetChange()"></select></div>
+          <div class="grp"><label>Color by</label><select id="rr-axis-color" onchange="rrRenderMatrix()">
+            <option value="win_pct">Win %</option>
+            <option value="profit_factor">Profit factor</option>
+            <option value="usd">Net $</option>
+          </select></div>
+        </div>
+        <div class="gl-card p-3 mb-2">
+          <div class="d-flex align-items-baseline justify-content-between mb-2">
+            <b id="rr-mx-title" style="font-size:13px"></b>
+            <span class="small text-muted" id="rr-mx-n"></span>
+          </div>
+          <div id="rr-matrix-target" style="overflow-x:auto"></div>
+        </div>
+        <div class="gl-card p-3">
+          <div class="d-flex align-items-center mb-2">
+            <b style="font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--gl-faint)">Compare tray</b>
+            <span class="small text-muted ms-2" id="rr-tray-count">0 starred</span>
+          </div>
+          <div id="rr-tray-body"><p class="text-muted small mb-0">Click a cell &rarr; "Add to compare" to line combos up side by side.</p></div>
+        </div>
+      </div>
+    </div>
   </div>
  </div>
+</div>
+
+<div class="rr-drawer-backdrop" id="rr-backdrop" onclick="rrCloseDrawer()"></div>
+<div class="rr-drawer" id="rr-drawer">
+  <div class="rr-drawer-head">
+    <b id="rr-dr-title" style="font-family:var(--gl-mono);font-size:13px"></b>
+    <button class="btn-close btn-close-white ms-auto" onclick="rrCloseDrawer()"></button>
+  </div>
+  <div class="rr-drawer-body">
+    <div class="rr-statgrid" id="rr-dr-stats"></div>
+    <div>
+      <h3 style="font-size:10.5px;text-transform:uppercase;letter-spacing:.05em;color:var(--gl-faint);margin-bottom:6px">Notes</h3>
+      <textarea id="rr-dr-notes" class="form-control form-control-sm" rows="3" placeholder="Your read on this cell..."></textarea>
+    </div>
+    <div class="d-flex gap-2">
+      <button class="btn btn-sm btn-primary" id="rr-dr-star-btn" onclick="rrToggleStar()">&#9734; Add to compare</button>
+      <button class="btn btn-sm btn-outline-secondary" onclick="rrCloseDrawer()">Close</button>
+    </div>
+  </div>
 </div>
 
 <!-- ══════════════════════ ALLOCATION ══════════════════════ -->
@@ -5894,76 +6226,429 @@ async function loadAlgoPnl(){
 document.getElementById('btn-algolab-grid-tab').addEventListener('click',algoLabLoadConfig);
 document.getElementById('btn-algolab-pnl-tab').addEventListener('click',loadAlgoPnl);
 
-// ── Compare (comparison engine) ─────────────────────────────────────────────────
-function _cmpStatusBadge(status){
-  const map={ok:'text-success',low_confidence:'text-warning',unstable:'text-warning',
-             insufficient_data:'text-muted',no_fills:'text-muted'};
-  return `<span class="${map[status]||'text-muted'}">${status}</span>`;
+// ── Results Research (replaces the old single-symbol Compare tab) ──────────────
+// 2026-09-12: approved over several design iterations -- a 4-method live-performance
+// overview (GevaExtract/Critical Lines/Spread/Correlation), each drilling into its
+// own real parameter matrix. Backed by /api/results-research/{overview,matrix},
+// built on the same commands+critical_lines join api_closed_stats uses. The old
+// /api/algo-compare route (cl_algo_combo_scores, MES-only backtest scores) is
+// untouched and still reachable -- this is a UI replacement, not a data migration;
+// see the route's own docstring for why the two weren't unified in this pass.
+const RR_FIELD_LABELS = {symbol:'Symbol', direction:'Buy/Sell', entry_type:'Order type',
+  bracket_size:'Bracket size', algo:'Algorithm', control:'Real/Control'};
+const RR_METHOD_FIELDS = {
+  'GevaExtract':    ['symbol','direction','entry_type','bracket_size'],
+  'Critical Lines': ['symbol','direction','entry_type','bracket_size','algo'],
+  'Spread':         ['symbol','direction','entry_type','bracket_size','control'],
+  'Correlation':    ['symbol','direction','entry_type','bracket_size','control'],
+};
+const RR_METHODS = Object.keys(RR_METHOD_FIELDS);
+const RR_METHOD_SUB = {
+  'GevaExtract':'Scraped signal (Facebook) — live trades by symbol / order-type / bracket',
+  'Critical Lines':'Algo 1–5 line detection — live trades by symbol / algo / bracket',
+  'Spread':'DIFF pair trading — real vs. reversed-leg control',
+  'Correlation':'Break/retest/fail-to-reclaim — real vs. random-baseline control',
+};
+const RR_DEFAULT_AXES = {
+  'GevaExtract':    {row:'symbol', col:'bracket_size', facet:'entry_type'},
+  'Critical Lines': {row:'symbol', col:'bracket_size', facet:'algo'},
+  'Spread':         {row:'symbol', col:'bracket_size', facet:'control'},
+  'Correlation':    {row:'symbol', col:'bracket_size', facet:'control'},
+};
+const RR_OVERVIEW_MAIN = [
+  {title:'Symbol',     note:'GevaExtract · Critical Lines · Correlation', field:'symbol'},
+  {title:'Buy / Sell', note:'GevaExtract · Critical Lines · Correlation', field:'direction'},
+  {title:'Order type', note:'GevaExtract · Critical Lines',               field:'entry_type'},
+];
+const RR_OVERVIEW_SECONDARY = [
+  {title:'Bracket size',               note:'All methods',            field:'bracket'},
+  {title:'Algorithm (Critical Lines)', note:'Critical Lines only',    field:'algo'},
+  {title:'Real / Control',             note:'Spread · Correlation',   field:'control'},
+];
+
+let rrRange='all', rrDomains=null, rrFilters={}, rrCurrentMethod=null, rrTotalsByFamily={};
+const rrMethodState={};
+let rrLastGrids={};
+let rrActiveKey=null;
+
+function rrParamName(field){ return field==='bracket_size' ? 'bracket' : field; }
+function rrDomainFor(field){ return (rrDomains && rrDomains[rrParamName(field)]) || []; }
+function rrFmtUsd(x){ return x==null ? '—' : (x>=0?'+':'-')+'$'+Math.abs(x).toFixed(0); }
+
+function rrRenderRangeBtns(){
+  const el=document.getElementById('rr-range'); if(!el) return; el.innerHTML='';
+  ['today','yesterday','all'].forEach(r=>{
+    const b=document.createElement('div');
+    b.className='rr-chip'+(rrRange===r?' active':'');
+    b.textContent = r==='all'?'All days':r[0].toUpperCase()+r.slice(1);
+    b.onclick=()=>{ rrRange=r; rrRenderRangeBtns(); rrLoadOverviewCards(); };
+    el.appendChild(b);
+  });
 }
-async function loadCompare(){
-  const symbol=document.getElementById('cmp-symbol-select').value;
+
+function rrRangeQS(){
+  const qs=new URLSearchParams(); qs.set('range', rrRange);
+  if(rrDomains){
+    Object.entries(rrFilters).forEach(([f,set])=>{
+      if(set.size < (rrDomains[f]||[]).length) qs.set(f,[...set].join(','));
+    });
+  }
+  return qs.toString();
+}
+
+async function rrLoadDomains(){
   _enterBusy();
   try{
-    const d=await (await fetch('/api/algo-compare?symbol='+symbol)).json();
-
-    document.getElementById('cmp-scored-at').textContent =
-      (d.reason_scored_at||d.combo_scored_at) ?
-        `Last scored: reasons=${d.reason_scored_at||'never'}  combos=${d.combo_scored_at||'never'}` :
-        'No scoring run has been recorded for this symbol yet.';
-
-    const reasonRows = d.reason_scores.map(r=>`<tr>
-      <td>${r.line_detect_reason}</td><td>${r.line_detect_kind}</td>
-      <td>${r.rank??'—'}</td><td>${_cmpStatusBadge(r.data_status)}</td>
-      <td>${r.n_fills}</td><td>${r.win_rate!=null?_fmtPct(r.win_rate):'—'}</td>
-      <td>${r.profit_factor!=null?r.profit_factor.toFixed(2):'—'}</td>
-      <td>${r.mc_pvalue!=null?r.mc_pvalue.toFixed(4):'—'}</td>
-      <td>${r.loocv_ratio!=null?r.loocv_ratio.toFixed(2):'—'}</td>
-    </tr>`).join('');
-    document.getElementById('cmp-reason-table').innerHTML = `
-      <table class="table table-sm table-hover mb-0">
-        <thead class="text-muted small"><tr>
-          <th>Reason (Algo N)</th><th>Kind</th><th>Rank</th><th>Status</th>
-          <th>N fills</th><th>Win%</th><th>PF</th><th>MC p</th><th>LOOCV</th>
-        </tr></thead>
-        <tbody>${reasonRows||'<tr><td colspan="9" class="text-muted">No backtested reason data yet -- needs tick history for the research-line dates, and/or more live fills.</td></tr>'}</tbody>
-      </table>`;
-
-    const comboRows = d.combo_scores.map(c=>`<tr>
-      <td>${c.algo_type}</td><td>${c.tp_ticks}/${c.sl_ticks}</td>
-      <td>${c.direction_filter}</td><td>${c.rank??'—'}</td>
-      <td>${_cmpStatusBadge(c.data_status)}</td><td>${c.n_fills}</td>
-      <td>${c.win_rate!=null?_fmtPct(c.win_rate):'—'}</td>
-      <td>${c.profit_factor!=null?c.profit_factor.toFixed(2):'—'}</td>
-      <td>${c.mc_pvalue!=null?c.mc_pvalue.toFixed(4):'—'}</td>
-      <td>${c.loocv_ratio!=null?c.loocv_ratio.toFixed(2):'—'}</td>
-    </tr>`).join('');
-    document.getElementById('cmp-combo-table').innerHTML = `
-      <table class="table table-sm table-hover mb-0">
-        <thead class="text-muted small"><tr>
-          <th>Entry style</th><th>TP/SL</th><th>Dir</th><th>Rank</th><th>Status</th>
-          <th>N fills</th><th>Win%</th><th>PF</th><th>MC p</th><th>LOOCV</th>
-        </tr></thead>
-        <tbody>${comboRows||'<tr><td colspan="10" class="text-muted">No scoring run yet -- run back-trading/run_cl_algo_pipeline.py.</td></tr>'}</tbody>
-      </table>`;
-
-    const liveRows = d.live_breakdown.map(g=>`<tr>
-      <td>${g.symbol}</td><td>${g.source}</td><td>${g.n_trades}</td>
-      <td>${_fmtPct(g.win_rate)}</td>
-      <td class="${g.total_pnl_dollars>=0?'text-success':'text-danger'}">${_fmtMoney(g.total_pnl_dollars)}</td>
-    </tr>`).join('');
-    document.getElementById('cmp-live-table').innerHTML = `
-      <table class="table table-sm table-hover mb-0">
-        <thead class="text-muted small"><tr>
-          <th>Symbol</th><th>Source</th><th>N trades</th><th>Win%</th><th>$</th>
-        </tr></thead>
-        <tbody>${liveRows||'<tr><td colspan="5" class="text-muted">No closed research_ce/research_random trades yet.</td></tr>'}</tbody>
-      </table>
-      <p class="text-muted small mt-1">Source-level only -- live trades aren't tagged with which specific
-      WINNING_REASON (Algo 1-5) produced them yet, only research_ce vs research_random.</p>`;
+    const d = await (await fetch('/api/results-research/overview?range='+rrRange)).json();
+    rrDomains = d.filters_available;
+    rrFilters = {};
+    Object.entries(rrDomains).forEach(([f,vals])=>{ rrFilters[f]=new Set(vals); });
+    rrTotalsByFamily = d.total_by_family;
+    rrRenderRail();
+    rrRenderOverviewFromCards(d.cards);
   }catch(e){}finally{_exitBusy();}
 }
-document.getElementById('btn-compare-tab').addEventListener('click',loadCompare);
-document.getElementById('cmp-symbol-select').addEventListener('change',loadCompare);
+async function rrLoadOverviewCards(){
+  _enterBusy();
+  try{
+    const d = await (await fetch('/api/results-research/overview?'+rrRangeQS())).json();
+    rrTotalsByFamily = d.total_by_family;
+    rrRenderOverviewFromCards(d.cards);
+  }catch(e){}finally{_exitBusy();}
+}
+
+function rrMaturity(n){
+  if(n>=200) return {cls:'established', label:'Established'};
+  if(n>=30)  return {cls:'building', label:'Building'};
+  return {cls:'early', label:n>0?'Early':'Just started'};
+}
+function rrRenderOverviewFromCards(cards){
+  const el=document.getElementById('rr-cards'); el.innerHTML='';
+  const maxAbs = Math.max(...RR_METHODS.map(m=>Math.abs((cards[m]&&cards[m].usd)||0)),1);
+  RR_METHODS.forEach(name=>{
+    const c=cards[name]||{n:0,win_pct:0,profit_factor:null,usd:0};
+    const mat=rrMaturity(rrTotalsByFamily[name]||0);
+    const usdCls = c.usd>0?'good':(c.usd<0?'bad':'');
+    const barPct = Math.min(100, Math.round(Math.abs(c.usd||0)/maxAbs*100));
+    const barColor = c.usd>=0 ? 'var(--gl-good)' : 'var(--gl-bad)';
+    const card=document.createElement('div');
+    card.className='gl-card rr-mcard';
+    card.onclick=()=>rrShowMethod(name);
+    card.innerHTML = `
+      <div class="name">${name}</div>
+      <div class="sub">${RR_METHOD_SUB[name]}</div>
+      <div class="stats">
+        <div class="stat"><div class="k">Fills (${rrRange})</div><div class="v">${c.n}</div></div>
+        <div class="stat"><div class="k">Win rate</div><div class="v">${c.n?c.win_pct.toFixed(0)+'%':'—'}</div></div>
+        <div class="stat"><div class="k">Profit factor</div><div class="v">${c.profit_factor!=null?c.profit_factor.toFixed(2):'—'}</div></div>
+        <div class="stat"><div class="k">Net $</div><div class="v ${usdCls}">${c.n?rrFmtUsd(c.usd):'—'}</div></div>
+      </div>
+      <div style="height:5px;border-radius:3px;background:var(--gl-panel-2);overflow:hidden;margin-top:2px">
+        <div style="height:100%;width:${barPct}%;background:${barColor}"></div>
+      </div>
+      <div class="footer"><span class="rr-maturity ${mat.cls}">${mat.label}</span><span style="color:var(--gl-accent);font-weight:600">Drill in &rarr;</span></div>`;
+    el.appendChild(card);
+  });
+}
+
+function rrBuildFilterSection(sec){
+  const box=document.createElement('div');
+  const h=document.createElement('h3'); h.textContent=sec.title; box.appendChild(h);
+  const note=document.createElement('div'); note.className='small text-muted mb-1'; note.textContent=sec.note; box.appendChild(note);
+  const set=document.createElement('div'); set.className='rr-chipset';
+  (rrDomains[sec.field]||[]).forEach(v=>{
+    const c=document.createElement('div');
+    c.className='rr-chip'+(rrFilters[sec.field].has(v)?' active':'');
+    c.textContent=v;
+    c.onclick=()=>{ if(rrFilters[sec.field].has(v)) rrFilters[sec.field].delete(v); else rrFilters[sec.field].add(v);
+      c.classList.toggle('active'); rrLoadOverviewCards(); };
+    set.appendChild(c);
+  });
+  box.appendChild(set);
+  return box;
+}
+function rrRenderRail(){
+  const main=document.getElementById('rr-rail-main'); main.innerHTML='';
+  RR_OVERVIEW_MAIN.forEach(sec=> main.appendChild(rrBuildFilterSection(sec)));
+  const sec2=document.getElementById('rr-rail-secondary'); sec2.innerHTML='';
+  RR_OVERVIEW_SECONDARY.forEach(sec=> sec2.appendChild(rrBuildFilterSection(sec)));
+}
+function rrResetFilters(){
+  Object.entries(rrDomains).forEach(([f,vals])=>{ rrFilters[f]=new Set(vals); });
+  rrRenderRail();
+  rrLoadOverviewCards();
+}
+
+// ── drill-down (per method) ─────────────────────────────────────────────────────
+function rrInitMethodState(name){
+  if(rrMethodState[name]) return rrMethodState[name];
+  const fields=RR_METHOD_FIELDS[name];
+  const filters={};
+  fields.forEach(f=>{ filters[f]=new Set(rrDomainFor(f)); });
+  const def=RR_DEFAULT_AXES[name];
+  rrMethodState[name]={filters, minN:3, xf:def.col, yf:def.row, ff:def.facet, starred:new Map()};
+  return rrMethodState[name];
+}
+function rrShowOverview(){
+  document.getElementById('rr-view-overview').style.display='';
+  document.getElementById('rr-view-matrix').style.display='none';
+  rrCloseDrawer();
+}
+function rrShowMethod(name){
+  rrCurrentMethod=name;
+  rrInitMethodState(name);
+  document.getElementById('rr-view-overview').style.display='none';
+  document.getElementById('rr-view-matrix').style.display='';
+  document.getElementById('rr-method-name').textContent=name;
+  document.getElementById('rr-method-sub').textContent=RR_METHOD_SUB[name];
+  rrFillAxisSelects(name);
+  rrRebuildDrillRail(name);
+  rrRenderMatrix();
+}
+function rrFillAxisSelects(name){
+  const fields=RR_METHOD_FIELDS[name], st=rrMethodState[name];
+  ['rr-axis-x','rr-axis-y'].forEach(id=>{
+    const el=document.getElementById(id); el.innerHTML='';
+    fields.forEach(f=>{ const o=document.createElement('option'); o.value=f; o.textContent=RR_FIELD_LABELS[f]; el.appendChild(o); });
+  });
+  document.getElementById('rr-axis-x').value=st.xf;
+  document.getElementById('rr-axis-y').value=st.yf;
+  rrFillFacetSelect(name);
+  document.getElementById('rr-minn').value=st.minN;
+  document.getElementById('rr-minn-val').textContent=`≥ ${st.minN} fills`;
+}
+function rrFillFacetSelect(name){
+  const fields=RR_METHOD_FIELDS[name], st=rrMethodState[name];
+  const el=document.getElementById('rr-axis-facet'); el.innerHTML='';
+  const noneOpt=document.createElement('option'); noneOpt.value='none'; noneOpt.textContent='None (single matrix)'; el.appendChild(noneOpt);
+  fields.forEach(f=>{
+    if(f===st.xf||f===st.yf) return;
+    const o=document.createElement('option'); o.value=f; o.textContent=RR_FIELD_LABELS[f]; el.appendChild(o);
+  });
+  if(st.ff && st.ff!=='none' && (st.ff===st.xf||st.ff===st.yf)) st.ff='none';
+  const valid=[...el.options].some(o=>o.value===st.ff);
+  el.value = valid ? st.ff : 'none';
+  st.ff = el.value;
+}
+function rrOnAxisChange(){
+  const st=rrMethodState[rrCurrentMethod];
+  st.xf=document.getElementById('rr-axis-x').value;
+  st.yf=document.getElementById('rr-axis-y').value;
+  rrFillFacetSelect(rrCurrentMethod);
+  rrRebuildDrillRail(rrCurrentMethod);
+  rrRenderMatrix();
+}
+function rrOnFacetChange(){
+  const st=rrMethodState[rrCurrentMethod];
+  st.ff=document.getElementById('rr-axis-facet').value;
+  rrRebuildDrillRail(rrCurrentMethod);
+  rrRenderMatrix();
+}
+function rrSwapAxes(){
+  const x=document.getElementById('rr-axis-x'), y=document.getElementById('rr-axis-y');
+  const t=x.value; x.value=y.value; y.value=t;
+  rrOnAxisChange();
+}
+function rrOnMinN(v){
+  rrMethodState[rrCurrentMethod].minN=+v;
+  document.getElementById('rr-minn-val').textContent=`≥ ${v} fills`;
+  rrRenderMatrix();
+}
+function rrRebuildDrillRail(name){
+  const fields=RR_METHOD_FIELDS[name], st=rrMethodState[name];
+  const wrap=document.getElementById('rr-drill-chipgroups'); wrap.innerHTML='';
+  fields.forEach(f=>{
+    if(f===st.xf||f===st.yf||f===st.ff) return;
+    const box=document.createElement('div');
+    const h=document.createElement('h3'); h.textContent=RR_FIELD_LABELS[f]; box.appendChild(h);
+    const set=document.createElement('div'); set.className='rr-chipset';
+    rrDomainFor(f).forEach(v=>{
+      const c=document.createElement('div');
+      c.className='rr-chip'+(st.filters[f].has(v)?' active':'');
+      c.textContent=v;
+      c.onclick=()=>{ if(st.filters[f].has(v)) st.filters[f].delete(v); else st.filters[f].add(v);
+        c.classList.toggle('active'); rrRenderMatrix(); };
+      set.appendChild(c);
+    });
+    box.appendChild(set);
+    wrap.appendChild(box);
+  });
+}
+
+// ── matrix fetch + render ────────────────────────────────────────────────────────
+function rrMetricVal(s, metric){ if(!s||!s.n) return null; return s[metric]; }
+function rrMetricFmt(metric, v){
+  if(v==null) return '—';
+  if(metric==='win_pct') return v.toFixed(0)+'%';
+  if(metric==='profit_factor') return v.toFixed(2);
+  return rrFmtUsd(v);
+}
+function rrHexToRgb(h){ h=h.replace('#',''); return [0,2,4].map(i=>parseInt(h.substr(i,2),16)); }
+function rrMix(a,b,t){ const A=rrHexToRgb(a),B=rrHexToRgb(b); return `rgb(${A.map((v,i)=>Math.round(v+(B[i]-v)*t)).join(',')})`; }
+function rrColorFor(value, lo, hi){
+  let t = hi===lo?0.5:(value-lo)/(hi-lo); t=Math.max(0,Math.min(1,t));
+  const s=getComputedStyle(document.documentElement);
+  return rrMix(s.getPropertyValue('--gl-bad').trim(), s.getPropertyValue('--gl-good').trim(), t);
+}
+
+function rrBuildMatrixTable(rowDomain, colDomain, cellsForFacet, metric, st, name, facetTag){
+  let vals=[];
+  rowDomain.forEach(rv=>{ colDomain.forEach(cv=>{
+    const s=(cellsForFacet[rv]||{})[cv]; const v=rrMetricVal(s,metric);
+    if(v!=null && s.n>=st.minN) vals.push(v);
+  });});
+  const lo=vals.length?Math.min(...vals):0, hi=vals.length?Math.max(...vals):1;
+  rrLastGrids[facetTag]={rowDomain,colDomain,cellsForFacet,rowField:st.yf,colField:st.xf};
+
+  const table=document.createElement('table'); table.className='rr-mx';
+  const head=document.createElement('tr');
+  head.innerHTML = `<th class="corner">${RR_FIELD_LABELS[st.yf]} \\ ${RR_FIELD_LABELS[st.xf]}</th>` +
+    colDomain.map(c=>`<th>${c}</th>`).join('');
+  table.appendChild(head);
+  rowDomain.forEach(rv=>{
+    const tr=document.createElement('tr');
+    tr.innerHTML = `<th class="rowhead">${rv}</th>`;
+    colDomain.forEach(cv=>{
+      const s=(cellsForFacet[rv]||{})[cv];
+      const td=document.createElement('td');
+      const key=[name,facetTag,rv,cv,st.xf,st.yf].join('|');
+      if(!s || !s.n){ td.className='rr-empty'; td.textContent='—'; }
+      else{
+        const v=rrMetricVal(s,metric), passes = s.n>=st.minN;
+        td.className='rr-cell'+(passes?'':' rr-faint')+(st.starred.has(key)?' starred':'');
+        td.style.background = passes ? rrColorFor(v,lo,hi) : 'var(--gl-panel-2)';
+        td.innerHTML = `<div class="v">${rrMetricFmt(metric,v)}</div>`+
+          `<div class="sub">n=${s.n} · pf${s.profit_factor!=null?s.profit_factor.toFixed(1):'—'}</div>`;
+        td.onclick=()=>rrOpenDrawer(rv,cv,st.xf,st.yf,s,key,facetTag);
+      }
+      tr.appendChild(td);
+    });
+    table.appendChild(tr);
+  });
+  return table;
+}
+
+async function rrRenderMatrix(){
+  const name=rrCurrentMethod, st=rrMethodState[name];
+  const metric=document.getElementById('rr-axis-color').value;
+  const qs=new URLSearchParams();
+  qs.set('method', name); qs.set('row', st.yf); qs.set('col', st.xf); qs.set('range', rrRange);
+  if(st.ff && st.ff!=='none') qs.set('facet', st.ff);
+  RR_METHOD_FIELDS[name].forEach(f=>{
+    if(f===st.xf||f===st.yf||f===st.ff) return;
+    const domain=rrDomainFor(f);
+    if(st.filters[f].size < domain.length) qs.set(rrParamName(f), [...st.filters[f]].join(','));
+  });
+
+  _enterBusy();
+  let d;
+  try{ d = await (await fetch('/api/results-research/matrix?'+qs.toString())).json(); }
+  catch(e){ _exitBusy(); return; }
+  _exitBusy();
+  if(d.error) return;
+
+  document.getElementById('rr-mx-n').textContent = `${d.n_total} fills in scope`;
+
+  const familyTotal = rrTotalsByFamily[name]||0;
+  const banner=document.getElementById('rr-sparse-banner');
+  if(familyTotal < 30){
+    banner.style.display='';
+    banner.textContent = `${name} only has ${familyTotal} closed fills recorded so far -- most cells will read `+
+      `"not enough data" until more volume accumulates. Shown honestly rather than hidden.`;
+  } else banner.style.display='none';
+
+  const colorLabel = document.getElementById('rr-axis-color').selectedOptions[0].textContent;
+  const target=document.getElementById('rr-matrix-target'); target.innerHTML='';
+  rrLastGrids={};
+
+  if(!d.facet){
+    document.getElementById('rr-mx-title').textContent = `${RR_FIELD_LABELS[st.yf]} × ${RR_FIELD_LABELS[st.xf]} — ${colorLabel}`;
+    target.appendChild(rrBuildMatrixTable(d.row_domain, d.col_domain, d.cells['_all']||{}, metric, st, name, ''));
+  } else {
+    document.getElementById('rr-mx-title').textContent =
+      `${RR_FIELD_LABELS[st.yf]} × ${RR_FIELD_LABELS[st.xf]} — ${colorLabel}, faceted by ${RR_FIELD_LABELS[d.facet]}`;
+    const grid=document.createElement('div'); grid.className='rr-facetgrid';
+    d.facet_domain.forEach(fv=>{
+      const panel=document.createElement('div'); panel.className='rr-facetpanel';
+      const h=document.createElement('div'); h.className='rr-facetpanel-title'; h.textContent=`${RR_FIELD_LABELS[d.facet]}: ${fv}`;
+      panel.appendChild(h);
+      const scroll=document.createElement('div'); scroll.style.overflowX='auto';
+      scroll.appendChild(rrBuildMatrixTable(d.row_domain, d.col_domain, d.cells[fv]||{}, metric, st, name, d.facet+'='+fv));
+      panel.appendChild(scroll);
+      grid.appendChild(panel);
+    });
+    target.appendChild(grid);
+  }
+}
+
+// ── drawer + compare tray ─────────────────────────────────────────────────────────
+function rrOpenDrawer(rv,cv,xf,yf,s,key,facetTag){
+  rrActiveKey=key;
+  let title = `${RR_FIELD_LABELS[yf]} ${rv} · ${RR_FIELD_LABELS[xf]} ${cv}`;
+  if(facetTag){ const eq=facetTag.indexOf('='); title = `${RR_FIELD_LABELS[facetTag.slice(0,eq)]} ${facetTag.slice(eq+1)} · `+title; }
+  document.getElementById('rr-dr-title').textContent=title;
+  document.getElementById('rr-dr-stats').innerHTML = `
+    <div class="rr-stattile"><div class="k">Fills (n)</div><div class="val">${s.n}</div></div>
+    <div class="rr-stattile"><div class="k">Win rate</div><div class="val">${s.win_pct}%</div></div>
+    <div class="rr-stattile"><div class="k">Profit factor</div><div class="val">${s.profit_factor!=null?s.profit_factor.toFixed(2):'—'}</div></div>
+    <div class="rr-stattile"><div class="k">Net $</div><div class="val">${rrFmtUsd(s.usd)}</div></div>
+    <div class="rr-stattile"><div class="k">Avg win</div><div class="val">${s.avg_win} pts</div></div>
+    <div class="rr-stattile"><div class="k">Avg loss</div><div class="val">${s.avg_loss} pts</div></div>`;
+  rrUpdateStarBtn();
+  document.getElementById('rr-drawer').classList.add('show');
+  document.getElementById('rr-backdrop').classList.add('show');
+}
+function rrCloseDrawer(){
+  document.getElementById('rr-drawer').classList.remove('show');
+  document.getElementById('rr-backdrop').classList.remove('show');
+  rrActiveKey=null;
+}
+function rrUpdateStarBtn(){
+  const st=rrMethodState[rrCurrentMethod];
+  document.getElementById('rr-dr-star-btn').textContent = st && st.starred.has(rrActiveKey) ? '★ In compare tray' : '☆ Add to compare';
+}
+function rrToggleStar(){
+  if(!rrActiveKey) return;
+  const st=rrMethodState[rrCurrentMethod];
+  if(st.starred.has(rrActiveKey)) st.starred.delete(rrActiveKey);
+  else st.starred.set(rrActiveKey, {key:rrActiveKey, label:document.getElementById('rr-dr-title').textContent});
+  rrUpdateStarBtn(); rrRenderTray(); rrRenderMatrix();
+}
+function rrRenderTray(){
+  const st=rrMethodState[rrCurrentMethod];
+  document.getElementById('rr-tray-count').textContent = `${st.starred.size} starred`;
+  const body=document.getElementById('rr-tray-body');
+  if(!st.starred.size){ body.innerHTML='<p class="text-muted small mb-0">Click a cell &rarr; "Add to compare" to line combos up side by side.</p>'; return; }
+  const rows=[...st.starred.values()].map(item=>{
+    const [,facetTag,rv,cv]=item.key.split('|');
+    const g=rrLastGrids[facetTag];
+    const s = g ? (g.cellsForFacet[rv]||{})[cv] : null;
+    return {label:item.label, s};
+  }).filter(r=>r.s);
+  const metrics=[['n','Fills'],['win_pct','Win%'],['profit_factor','PF'],['usd','Net $']];
+  const best={};
+  metrics.forEach(([m])=>{ const v=rows.map(r=>r.s[m]).filter(x=>x!=null); best[m]=v.length?Math.max(...v):null; });
+  let html='<table class="rr-tray-table"><tr><th>Combo</th>'+metrics.map(([,l])=>`<th>${l}</th>`).join('')+'<th></th></tr>';
+  rows.forEach((r,i)=>{
+    html += `<tr><td>${r.label}</td>` + metrics.map(([m])=>{
+      const v=r.s[m]; const isBest = v!=null && v===best[m];
+      const disp = v==null?'—' : m==='win_pct'?v+'%' : m==='profit_factor'?v.toFixed(2) : m==='usd'?rrFmtUsd(v) : v;
+      return `<td class="${isBest?'best':''}">${disp}</td>`;
+    }).join('') + `<td class="rm" onclick="rrRemoveStar(${i})">remove</td></tr>`;
+  });
+  body.innerHTML = html+'</table>';
+}
+function rrRemoveStar(i){
+  const st=rrMethodState[rrCurrentMethod];
+  const key=[...st.starred.keys()][i];
+  st.starred.delete(key);
+  rrRenderTray(); rrRenderMatrix();
+}
+
+rrRenderRangeBtns();
+document.getElementById('btn-compare-tab').addEventListener('click', ()=>{
+  if(!rrDomains) rrLoadDomains(); else rrLoadOverviewCards();
+});
 
 // ── Allocation ───────────────────────────────────────────────────────────────
 async function loadAllocation(){
@@ -6219,6 +6904,27 @@ document.addEventListener('shown.bs.tab',function(e){
 # ── Release notes ─────────────────────────────────────────────────────────────
 
 _RELEASE_NOTES = [
+    ("v5.16", "New 'Results Research' tab: 4-method comparison + per-method parameter matrix",
+              "Replaces the old single-symbol Compare tab, per several rounds of design "
+              "iteration approved by the user (design pitched and refined as a standalone "
+              "artifact mockup first). Two layers: a live-performance overview across "
+              "GevaExtract/Critical Lines/Spread/Correlation (real commands+critical_lines "
+              "join, same one api_closed_stats/_bucket_for already use) with a filter rail "
+              "(symbol, buy/sell, order type, bracket size, algorithm, real/control) that "
+              "narrows only the methods each filter actually applies to; and, per method, a "
+              "real parameter matrix (pick any 2 of its own fields as rows/columns, an "
+              "optional 3rd as facet -- e.g. Critical Lines faceted by Algorithm shows all "
+              "5 algos' symbol x bracket-size grids at once). New routes "
+              "/api/results-research/{overview,matrix}. Scope decided against the original "
+              "mockup: cl_algo_combo_scores exists but is MES-only and scores a different "
+              "axis (backtest entry-style, not live WINNING_REASON Algo 1-5) -- unifying the "
+              "two is real follow-up work, not attempted here. This ships a live-trade-"
+              "aggregate matrix instead (symbol/direction/entry_type/bracket_size, plus algo "
+              "for Critical Lines and control for Spread/Correlation), which works today for "
+              "every method and is honestly sparse for Spread/Correlation (both still "
+              "cfg.*.enabled=false, zero live commands yet). Old /api/algo-compare route and "
+              "its backing tables are untouched, still reachable -- this is a UI-level "
+              "replacement, not a data migration."),
     ("v5.15", "Fix 'refreshes forever / stuck in hourglass' on the Trading tab",
               "Root cause: /api/broker-queue called _fetch_live_prices() (shells out to "
               "ib_dayclean.py, up to a 30s fresh IB connect) synchronously in the request "
@@ -6908,7 +7614,8 @@ def self_test() -> bool:
             assert by_algo.get("PDL") == 90.0,  f"PDL should be prior day's L=90, got {by_algo.get('PDL')}"
 
         print("PASS -- trading_dashboard: strength scale (bug 7) + PDH/PDL look-ahead fix (bug 8)")
-        return True
+        rr_ok = _self_test_results_research()
+        return rr_ok
     except Exception as e:
         import traceback
         print(f"FAIL -- trading_dashboard self_test: {e}")
@@ -6916,6 +7623,84 @@ def self_test() -> bool:
         return False
     finally:
         _HIST_DIR = orig_hist_dir
+
+
+def _self_test_results_research() -> bool:
+    """
+    Results Research (v5.16): builds one synthetic CLOSED command per method
+    family (GevaExtract/Critical Lines/Spread/Correlation) in a temp DB, then
+    hits /api/results-research/{overview,matrix} through app.test_client() and
+    checks: (1) each method's card counts exactly its own family, (2) a filter
+    narrows only the methods that actually have that field, (3) the matrix
+    groups by real fields and returns the right cell for a known combo,
+    (4) faceting slices correctly, (5) an invalid row/col/facet field for a
+    method (e.g. 'algo' on Spread, which has no such field) is rejected (400).
+    """
+    import tempfile
+    global _DB_OVERRIDE
+    orig_override = _DB_OVERRIDE
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "rr_test.db"
+            init_db(db_path)
+            today = date.today().isoformat()
+
+            with get_db(db_path) as con:
+                line_id = con.execute(
+                    "INSERT INTO critical_lines (symbol, date, line_type, price, strength, source, note)"
+                    " VALUES ('MNQ', ?, 'SUPPORT', 100.0, 1, 'research_ce', ?)",
+                    (today, json.dumps({"reason": "PREVIOUS_DAY_LOW"}))
+                ).lastrowid
+
+                def _insert(symbol, source, direction, entry_type, bracket, pnl, critical_line_id=None):
+                    con.execute(
+                        "INSERT INTO commands (symbol, line_price, line_type, line_strength, direction,"
+                        " entry_type, entry_price, tp_price, sl_price, bracket_size, quantity, status,"
+                        " pnl_points, exit_time, source, critical_line_id)"
+                        " VALUES (?,0,'SUPPORT',1,?,?,0,0,0,?,1,'CLOSED',?,?,?,?)",
+                        (symbol, direction, entry_type, bracket, pnl, f"{today}T10:00:00Z", source, critical_line_id)
+                    )
+
+                _insert("MES", "geva_extract", "BUY",  "LMT", 4.0,  2.0)
+                _insert("MNQ", "research_ce",  "SELL", "STP", 8.0, -1.0, critical_line_id=line_id)
+                _insert("MYM", "spread",       "BUY",  "MKT", 2.0,  1.5)
+                _insert("M2K", "correlation",  "SELL", "STP", 4.0,  0.5)
+
+            _DB_OVERRIDE = db_path
+            client = app.test_client()
+
+            d = client.get("/api/results-research/overview?range=all").get_json()
+            assert d["cards"]["GevaExtract"]["n"] == 1, d["cards"]
+            assert d["cards"]["Critical Lines"]["n"] == 1, d["cards"]
+            assert d["cards"]["Spread"]["n"] == 1, d["cards"]
+            assert d["cards"]["Correlation"]["n"] == 1, d["cards"]
+            assert "Algo 1" in d["filters_available"]["algo"], d["filters_available"]
+
+            d2 = client.get("/api/results-research/overview?range=all&symbol=MES").get_json()
+            assert d2["cards"]["GevaExtract"]["n"] == 1, "MES filter should keep GevaExtract's MES row"
+            assert d2["cards"]["Critical Lines"]["n"] == 0, "MES filter should drop Critical Lines' MNQ-only row"
+
+            dm = client.get("/api/results-research/matrix?method=Critical Lines&row=symbol&col=bracket_size").get_json()
+            assert dm["cells"]["_all"]["MNQ"]["8"]["n"] == 1, dm["cells"]
+
+            dmf = client.get(
+                "/api/results-research/matrix?method=Critical Lines&row=symbol&col=bracket_size&facet=algo"
+            ).get_json()
+            assert "Algo 1" in dmf["facet_domain"], dmf["facet_domain"]
+            assert dmf["cells"]["Algo 1"]["MNQ"]["8"]["n"] == 1, dmf["cells"]
+
+            bad = client.get("/api/results-research/matrix?method=Spread&row=algo&col=symbol")
+            assert bad.status_code == 400, f"Spread has no 'algo' field, expected 400, got {bad.status_code}"
+
+        print("PASS -- trading_dashboard: Results Research overview/matrix routes (v5.16)")
+        return True
+    except Exception as e:
+        import traceback
+        print(f"FAIL -- trading_dashboard Results Research self_test: {e}")
+        traceback.print_exc()
+        return False
+    finally:
+        _DB_OVERRIDE = orig_override
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
