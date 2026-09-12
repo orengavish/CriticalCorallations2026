@@ -107,6 +107,60 @@ def _handle_exec_fill(order_id: int, fill_price: float, db_path):
         log.warning(f"Event fill handler error: {e}")
 
 
+def _handle_exec_exit(order_id: int, fill_price: float, db_path):
+    """
+    2026-09-12 (Tier 3, strategic reliability review): event-driven TP/SL exit
+    detection, symmetric to _handle_exec_fill()'s existing entry-side fast path.
+    Before this, exits were 100% poll-bound (poll_tp_sl_fills(), gated by
+    ib_poll_seconds=30) even though the entry side already had an instant event
+    path -- an asymmetry found during this session's latency review. Mirrors
+    poll_tp_sl_fills()'s exact exit_reason-derivation + pnl calc + CLOSED
+    transition (same source NOT IN ('spread','spread_control') exclusion --
+    those legs have no TP/SL order ids at all by design, so this can never
+    legitimately match one of theirs anyway, but the guard is kept for parity).
+
+    Idempotent alongside poll_tp_sl_fills(): both query WHERE status='FILLED',
+    so whichever path (event or next 30s poll) gets there first flips the status
+    away from FILLED, making the other a no-op on its next look. ib_insync event
+    callbacks and the polling loop share one asyncio event loop with no
+    preemption mid-function, so there is no real concurrent-write race here --
+    same risk model already accepted for _handle_exec_fill's entry-side path.
+    """
+    now = _now_utc()
+    try:
+        with get_db(db_path) as con:
+            cmd = con.execute(
+                "SELECT * FROM commands WHERE (ib_tp_order_id=? OR ib_sl_order_id=?)"
+                " AND status='FILLED' AND needs_review=0"
+                " AND (source IS NULL OR source NOT IN ('spread', 'spread_control'))",
+                (order_id, order_id)
+            ).fetchone()
+            if not cmd:
+                return
+            if cmd["fill_price"] is None:
+                return
+
+            d = cmd["direction"]
+            tp_p, sl_p = cmd["tp_price"], cmd["sl_price"]
+            if d == "BUY":
+                exit_reason = "TP" if fill_price >= tp_p else ("SL" if fill_price <= sl_p else "STAGNATION")
+            else:
+                exit_reason = "TP" if fill_price <= tp_p else ("SL" if fill_price >= sl_p else "STAGNATION")
+            pnl = (fill_price - cmd["fill_price"]) if d == "BUY" else (cmd["fill_price"] - fill_price)
+
+            update_command_status(con, cmd["id"], "CLOSED",
+                                  exit_price=fill_price, exit_time=now,
+                                  exit_reason=exit_reason, pnl_points=round(pnl, 4))
+            record_completed_trade(con, cmd["id"])
+            update_price_cache(con, cmd["symbol"], fill_price, now, source="fill")
+            log.info(
+                f"[event] Command {cmd['id']} CLOSED via {exit_reason} "
+                f"(execDetails orderId={order_id} exit={fill_price}) pnl={pnl:+.2f}pts"
+            )
+    except Exception as e:
+        log.warning(f"Event exit handler error: {e}")
+
+
 def register_ib_events(ibc: IBClient, db_path):
     """
     Wire ib_insync events on both PAPER and LIVE connections to ib_events table.
@@ -154,7 +208,12 @@ def register_ib_events(ibc: IBClient, db_path):
                f"qty={ex.shares} price={ex.avgPrice} time={ex.time}")
         log.info(f"IB execDetails: {msg}")
         _write_ib_event(db_path, "INFO", "paper", msg)
+        # Entry and exit handlers each match on a different column/status combo
+        # (ib_order_id+SUBMITTED vs. ib_tp/sl_order_id+FILLED) -- safe to always
+        # call both on every execution, each is a no-op when it's not their kind
+        # of fill.
         _handle_exec_fill(ex.orderId, ex.avgPrice, db_path)
+        _handle_exec_exit(ex.orderId, ex.avgPrice, db_path)
 
     def on_paper_connected():
         msg = f"PAPER connected (clientId={ibc._paper_client_id})"
@@ -1096,6 +1155,23 @@ def run_broker(db_path=None, dry_run: bool = False):
             except Exception as e:
                 log.error(f"Error in process_pending_commands: {e}")
 
+            # 2026-09-12 (Tier 3, latency review): rebase drain moved OUT of the
+            # ib_poll_seconds=30 gate below to run every command_poll_seconds=5 pass
+            # instead. Still safely in the main-loop thread (not the ib_insync event
+            # thread -- _drain_rebase_queue()'s own docstring is explicit that IB API
+            # calls need that), just on a tighter cadence: a fast-detected entry fill
+            # (event-driven, near-instant) used to wait up to 30s for its TP/SL
+            # bracket to actually get rebased to the real fill price even though the
+            # fill itself was already known -- now up to ~5s. The function itself
+            # no-ops cheaply when the queue is empty (the common case), so running
+            # it 6x more often adds negligible overhead.
+            try:
+                rb = _drain_rebase_queue(ibc, db_path)
+                if rb:
+                    log.info(f"Rebased TP/SL brackets for {rb} command(s)")
+            except Exception as e:
+                log.error(f"Error in _drain_rebase_queue: {e}")
+
             # Periodic fill poll (entry fills + TP/SL child order exits)
             now = time.time()
             if now - last_ib_poll >= ib_poll_seconds:
@@ -1105,12 +1181,6 @@ def run_broker(db_path=None, dry_run: bool = False):
                         log.info(f"Detected {f} entry fill(s)")
                 except Exception as e:
                     log.error(f"Error in poll_fills: {e}")
-                try:
-                    rb = _drain_rebase_queue(ibc, db_path)
-                    if rb:
-                        log.info(f"Rebased TP/SL brackets for {rb} command(s)")
-                except Exception as e:
-                    log.error(f"Error in _drain_rebase_queue: {e}")
                 try:
                     trail_ticks = getattr(getattr(cfg, "correlation_trading", None),
                                           "trail_ticks", None) or TRAIL_TICKS
@@ -1555,10 +1625,14 @@ def self_test() -> bool:
                                  (id_capped,)).fetchone()["status"]
             assert s == "PENDING", f"command past admission cap should stay PENDING: {s}"
 
-            #    8d. opposite-side TP/SL legs count too: 6 resting SELL commands (12
-            #    opposite-side legs on BUY) already exceed a cap of 10 -> new BUY held back
-            #    even though same-side BUY entry count is 0
-            for _ in range(6):
+            #    8d. opposite-side TP/SL legs count too: enough resting SELL commands
+            #    that their 2x opposite-side-leg contribution alone exceeds the cap ->
+            #    new BUY held back even though same-side BUY entry count is 0. Sized off
+            #    the real configured cap (2026-09-12: was hardcoded to 6, silently
+            #    assumed a cap of 10 -- broke the moment the cap was raised to 15 per the
+            #    approved capacity plan, since 6*2=12 no longer exceeds 15).
+            opposite_needed = cap // 2 + 1
+            for _ in range(opposite_needed):
                 _insert_cmd(symbol='M2K', direction='SELL', status='SUBMITTED', needs_review=0)
             with get_db(db_path) as con:
                 con.execute("""
@@ -1673,6 +1747,49 @@ def self_test() -> bool:
                     (id_not_conn,)).fetchone()
             assert r_not_conn["status"] == "PENDING", \
                 f"a transient 'Not connected' failure must leave the command PENDING for retry, not {r_not_conn['status']}"
+
+            # 9. _handle_exec_exit (2026-09-12, Tier 3 latency review): event-driven
+            #    TP/SL exit detection, symmetric to _handle_exec_fill's entry-side path.
+            #    Covers TP hit (BUY), SL hit (SELL), idempotency (a second event/poll
+            #    for the same order must no-op), and the spread-leg exclusion guard.
+            id_tp = _insert_cmd(symbol='MES', direction='BUY', status='FILLED',
+                                 needs_review=0, fill_price=6500.0, fill_time=_now_utc(),
+                                 ib_tp_order_id=9101, ib_sl_order_id=9102,
+                                 entry_price=6500.0, tp_price=6504.0, sl_price=6496.0)
+            _handle_exec_exit(9101, 6504.0, db_path)
+            with get_db(db_path) as con:
+                r_tp = con.execute("SELECT status, exit_reason, pnl_points FROM commands WHERE id=?",
+                                    (id_tp,)).fetchone()
+            assert r_tp["status"] == "CLOSED" and r_tp["exit_reason"] == "TP" \
+                and abs(r_tp["pnl_points"] - 4.0) < 1e-9, dict(r_tp)
+
+            # Second call for the same order (simulating a race with the poll path)
+            # must be a no-op -- status already moved off FILLED.
+            _handle_exec_exit(9101, 6504.0, db_path)
+            with get_db(db_path) as con:
+                r_tp2 = con.execute("SELECT status FROM commands WHERE id=?", (id_tp,)).fetchone()
+            assert r_tp2["status"] == "CLOSED", "duplicate exit event must not re-process"
+
+            id_sl = _insert_cmd(symbol='MNQ', direction='SELL', status='FILLED',
+                                 needs_review=0, fill_price=19000.0, fill_time=_now_utc(),
+                                 ib_tp_order_id=9201, ib_sl_order_id=9202,
+                                 entry_price=19000.0, tp_price=18990.0, sl_price=19010.0)
+            _handle_exec_exit(9202, 19010.0, db_path)
+            with get_db(db_path) as con:
+                r_sl = con.execute("SELECT status, exit_reason, pnl_points FROM commands WHERE id=?",
+                                    (id_sl,)).fetchone()
+            assert r_sl["status"] == "CLOSED" and r_sl["exit_reason"] == "SL" \
+                and abs(r_sl["pnl_points"] - (-10.0)) < 1e-9, dict(r_sl)
+
+            id_spread = _insert_cmd(symbol='MYM', direction='BUY', source='spread',
+                                     status='FILLED', needs_review=0, fill_price=52000.0,
+                                     fill_time=_now_utc(), ib_tp_order_id=9301, ib_sl_order_id=9302,
+                                     entry_price=52000.0, tp_price=52000.0, sl_price=52000.0)
+            _handle_exec_exit(9301, 52000.0, db_path)
+            with get_db(db_path) as con:
+                r_spread = con.execute("SELECT status FROM commands WHERE id=?", (id_spread,)).fetchone()
+            assert r_spread["status"] == "FILLED", \
+                "spread legs have no real TP/SL by design -- this event path must never touch them"
 
         print("[self-test] broker: PASS")
         return True

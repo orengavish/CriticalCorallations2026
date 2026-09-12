@@ -98,7 +98,20 @@ def allocated_cap_for(family: str, symbol: str):
     un-dedicated stock, or any symbol outside the 4 futures pairs + 30 dedicated
     stocks) -- callers should fall back to the flat per-symbol-per-direction cap only
     in that case, not treat None as zero.
+
+    2026-09-12 bug found live in broker.py's self-test: `family` NOT being one of the
+    plan's 4 named families (e.g. "Other" -- an untagged/legacy/test source with no
+    recognized commands.source) must ALSO return None here, unconditionally, even on
+    an otherwise-governed symbol. The plan only allocates shares to GevaExtract/
+    Critical Line/Spread/Correlation; anything outside those 4 was falling through to
+    `.get(family, 0)`'s 0 default, which check_admission() then read as "capped at
+    zero, forever" -- silently blocking EVERY untagged command on any governed symbol,
+    regardless of how much real capacity existed. "Not one of the 4 families" must mean
+    "ungoverned", exactly like an un-dedicated stock, not "zero slots".
     """
+    if family not in ALLOC_FAMILY_SOURCES:
+        return None
+
     pair_name, _ = pair_for_symbol(symbol)
     if pair_name:
         return ALLOC_PAIR_PLAN.get(pair_name, {}).get(family, 0)
@@ -168,6 +181,14 @@ def self_test() -> bool:
         assert allocated_cap_for("Spread", "AAPL") == 0          # AAPL is Critical Line's, not Spread's
         assert allocated_cap_for("Correlation", "NFLX") == 10
         assert allocated_cap_for("Critical Line", "UNKNOWNSTOCK") is None  # not yet governed
+
+        # 5b. "Other" (an untagged/legacy/test source) must be UNGOVERNED even on an
+        # otherwise-governed symbol -- a real bug caught live 2026-09-12: this used to
+        # fall through to a 0 default, silently blocking every untagged command on
+        # MES/MNQ/etc. forever regardless of real capacity. Not one of the plan's 4
+        # named families must mean "no opinion here", same as an un-dedicated stock.
+        assert allocated_cap_for("Other", "MES") is None
+        assert allocated_cap_for("Other", "AAPL") is None
 
         # 6. check_admission against a real (temp) DB
         import tempfile
