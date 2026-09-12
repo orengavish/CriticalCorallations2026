@@ -31,6 +31,17 @@ symbols:
   - MNQ
   - MYM
   - M2K
+  # 2026-09-12: full-size futures added for the capacity-allocation plan ("double
+  # capacity per index by trading both micro and full-size contracts", approved this
+  # session). Contract specs (exchange/tick/multiplier) confirmed live via
+  # reqContractDetails -- see lib/ib_client.py's _SYMBOL_EXCHANGE comment. decider.py
+  # mirrors each armed line onto both contracts in a pair; lib/allocation.py enforces
+  # each algorithm family's pooled share of the combined MES+ES/MNQ+NQ/MYM+YM/M2K+RTY
+  # capacity (see that module for the actual per-family caps).
+  - ES
+  - NQ
+  - YM
+  - RTY
   - AAPL
   - MSFT
   - NVDA
@@ -94,12 +105,23 @@ orders:
   tick_size: 0.25
   # 2026-09-09: broker.py admission gates (process_pending_commands), added after the
   # 2026-09-08 order-storm incident -- see REBUILD_PLAN_2026-09-09.md Phase 1.
-  max_resting_per_side: 10        # stay under IB's own ~15-per-contract-per-side cap
+  max_resting_per_side: 15        # stay under IB's own ~15-per-contract-per-side cap
                                    # 2026-09-10: applies to geva_manual too now -- its prior
                                    # exemption let real exposure quietly compound across days
                                    # (12 lines 09-09 + 16 more 09-10) until IB itself rejected
                                    # orders outright (45 resting legs/side, a real incident).
                                    # It still gets first priority when capacity exists.
+                                   # 2026-09-12: raised 10->15 (approved capacity plan --
+                                   # "push toward IB's real ~15/side ceiling, not the old
+                                   # conservative 10"; user explicitly accepted the risk of
+                                   # occasional order rejections in paper trading rather than
+                                   # staying conservative). Now that lib/allocation.py's Gate
+                                   # 1b enforces each algorithm family's own, tighter share
+                                   # (e.g. Critical Line only gets 5 of MES+ES's pooled slots)
+                                   # this flat cap only binds as the outer real-IB-facing
+                                   # ceiling per contract -- GevaExtract's own 15-slot
+                                   # allocation would be silently truncated to 10 by this same
+                                   # setting if it stayed unchanged.
   min_entry_buffer_ticks: 8       # refuse a submit whose entry is closer than this to
                                    # the fresh live price (in ticks, so it scales per symbol)
   # 2026-09-10: control-group lines (geva_manual_control, research_random*) fan out to
