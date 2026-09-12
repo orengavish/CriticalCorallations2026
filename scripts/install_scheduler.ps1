@@ -91,9 +91,20 @@ $TraderDir = Join-Path $ProjectRoot "trader"
 $BrokerAction = New-ScheduledTaskAction -Execute $PythonW `
     -Argument "broker.py" -WorkingDirectory $TraderDir
 $BrokerTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 2)
+# 2026-09-12: -RestartCount/-RestartInterval REMOVED -- found live, causing an actual
+# incident. Task Scheduler's own "restart on failure" (1 min, up to 3x) stacks on TOP of
+# the 2-min RepetitionInterval above, and broker.py exits in well under a second when its
+# one-shot startup connect fails (trader/broker.py's main(): no retry loop, straight
+# sys.exit(1)) -- so a genuinely down IB Gateway turned into relaunches every ~15-45s
+# instead of the intended 2 min, hammering IB with fresh connection attempts, which the
+# code then misreports as "all client IDs exhausted" (lib/ib_client.py's _try_connect
+# raises that same message whether IDs are truly in use or the port just isn't
+# listening). The 2-min RepetitionInterval + singleton lock is already the whole
+# mechanism this needs -- restart-on-failure was redundant with it and, combined with a
+# fast-failing script, actively harmful.
 $BrokerSettings = New-ScheduledTaskSettingsSet `
     -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes 0) `
-    -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -StartWhenAvailable
+    -StartWhenAvailable
 
 try {
     Register-ScheduledTask -TaskName "CC2026Broker" `
@@ -110,9 +121,12 @@ try {
 $DeciderAction = New-ScheduledTaskAction -Execute $PythonW `
     -Argument "decider.py --mode session" -WorkingDirectory $TraderDir
 $DeciderTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 2)
+# 2026-09-12: -RestartCount/-RestartInterval removed -- see $BrokerSettings above for the
+# live incident this caused (same settings, same risk, even though decider.py wasn't the
+# one crash-looping this time).
 $DeciderSettings = New-ScheduledTaskSettingsSet `
     -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes 0) `
-    -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -StartWhenAvailable
+    -StartWhenAvailable
 
 try {
     Register-ScheduledTask -TaskName "CC2026Decider" `

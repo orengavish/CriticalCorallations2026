@@ -115,6 +115,7 @@ class IBClient:
         import random
         ids = list(client_ids)
         random.shuffle(ids)          # randomise so concurrent processes don't collide
+        last_err = None
         for cid in ids:
             try:
                 log.info(f"Connecting to {label} {host}:{port} clientId={cid}")
@@ -122,9 +123,17 @@ class IBClient:
                 log.info(f"Connected to {label} port {port} clientId={cid}")
                 return cid
             except Exception as e:
+                last_err = e
                 log.warning(f"{label} clientId={cid} failed: {e}")
+        # 2026-09-12: every ID failing usually means nothing is listening on {port} at
+        # all (Gateway down/not logged in for this side) -- NOT that the ID pool is
+        # actually exhausted (every ID would need to be held by a live session for that).
+        # The old blanket "all client IDs exhausted" message caused a real live-debugging
+        # detour: every ID fails identically either way, so surface the last underlying
+        # exception too instead of guessing which case it was.
         raise ConnectionError(
-            f"Could not connect to {label} {host}:{port} — all client IDs exhausted"
+            f"Could not connect to {label} {host}:{port} after trying all "
+            f"{len(ids)} configured client ID(s) — last error: {last_err}"
         )
 
     def _connect_live(self):
