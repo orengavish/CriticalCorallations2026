@@ -22,7 +22,12 @@ import argparse
 from datetime import datetime, time as dtime
 from zoneinfo import ZoneInfo
 
-_FUTURES_SYMBOLS = {"MES", "MNQ", "MYM", "M2K"}
+# 2026-09-12: ES/NQ/YM/RTY (full-size futures, capacity-allocation plan) added -- same
+# exchange/session hours as their micro counterpart in every case, so no new close-time
+# logic needed, just membership in this set. Without this, is_entry_cutoff("ES") etc.
+# would have silently applied STOCK market hours (16:00 America/New_York) instead of
+# the correct futures close (16:00 America/Chicago) to the new symbols.
+_FUTURES_SYMBOLS = {"MES", "MNQ", "MYM", "M2K", "ES", "NQ", "YM", "RTY"}
 
 _FUTURES_TZ = ZoneInfo("America/Chicago")
 _FUTURES_CLOSE = dtime(16, 0)   # matches simulate_trades.py's empirical ~16:00 CT close

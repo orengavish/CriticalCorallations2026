@@ -39,6 +39,7 @@ from lib.critical_lines import get_armed_lines
 from lib.session_clock import (is_entry_cutoff, is_forced_exit_time, is_before_open,
                                 seconds_until_open, is_before_trading_start,
                                 seconds_until_trading_start, _FUTURES_SYMBOLS)
+from lib.allocation import pair_for_symbol
 from trader.correlation_signal import check_correlation_signal
 
 log = get_logger("decider")
@@ -166,8 +167,30 @@ def generate_commands(symbol: str, date_str: str, current_price: float,
     # exactly how MES accumulated 425 stale resting orders across repeated
     # restarts in one day (2026-07-17 incident). CLOSED/CANCELLED/ERROR/FILLED
     # commands don't block regeneration — only ones still actively working do.
+    in_flight = _in_flight_for(db_path, symbol)
+
+    count, skipped = _generate_commands_for_lines(
+        lines, symbol, current_price, cfg, db_path, in_flight
+    )
+
+    count2, skipped2 = _mirror_onto_pair_symbol(
+        symbol, lines, current_price, cfg, db_path,
+        in_flight_fn=lambda mirror: _in_flight_for(db_path, mirror)
+    )
+    count += count2
+    skipped += skipped2
+
+    log.info(f"Generated {count} commands for {symbol} {date_str} "
+             f"({len(lines)} lines, {skipped} skipped as already in flight)")
+    return count
+
+
+def _in_flight_for(db_path, symbol: str) -> set:
+    """(critical_line_id, direction, bracket_size) combos already unresolved for
+    `symbol` -- shared by generate_commands()'s own dedup and its full-size/micro
+    mirror (2026-09-12, capacity-allocation plan)."""
     with get_db(db_path) as con:
-        in_flight = {
+        return {
             (r["critical_line_id"], r["direction"], r["bracket_size"])
             for r in con.execute(
                 "SELECT critical_line_id, direction, bracket_size FROM commands"
@@ -176,12 +199,45 @@ def generate_commands(symbol: str, date_str: str, current_price: float,
             ).fetchall()
         }
 
-    count, skipped = _generate_commands_for_lines(
-        lines, symbol, current_price, cfg, db_path, in_flight
+
+def _mirror_onto_pair_symbol(symbol: str, lines: list, current_price: float,
+                              cfg, db_path, in_flight_fn) -> tuple[int, int]:
+    """
+    2026-09-12, capacity-allocation plan ("double capacity by trading both micro and
+    full-size contracts"): generate the SAME set of commands this call already made
+    for `symbol` onto its paired contract too (MES<->ES, MNQ<->NQ, MYM<->YM,
+    M2K<->RTY -- see lib/allocation.py), reusing the identical `lines` and
+    `current_price`. Safe to reuse current_price unchanged: the pair shares the same
+    underlying index (any live basis difference is treated as negligible, not worth
+    a second price fetch per cycle), and tick sizes are IDENTICAL within every pair
+    (confirmed live via reqContractDetails), so calc_bracket_prices()' output needs no
+    rescaling for the mirror -- only the `symbol` column differs.
+
+    `in_flight_fn(mirror_symbol) -> set` lets each caller supply the right dedup scope
+    (generate_commands() needs a fresh per-symbol query; generate_commands_for_new_
+    lines() can pass a lambda returning set() since its own line-level NOT EXISTS
+    guard already guarantees these lines have zero commands under ANY symbol yet).
+    Returns (count, skipped), same shape as _generate_commands_for_lines().
+    """
+    mirror = _mirror_pair_symbol(symbol)
+    if not mirror or not lines:
+        return 0, 0
+    mirror_in_flight = in_flight_fn(mirror)
+    m_count, m_skipped = _generate_commands_for_lines(
+        lines, mirror, current_price, cfg, db_path, mirror_in_flight
     )
-    log.info(f"Generated {count} commands for {symbol} {date_str} "
-             f"({len(lines)} lines, {skipped} skipped as already in flight)")
-    return count
+    if m_count:
+        log.info(f"Mirrored {m_count} command(s) onto {mirror} (paired with {symbol})")
+    return m_count, m_skipped
+
+
+def _mirror_pair_symbol(symbol: str):
+    """The OTHER contract in symbol's capacity-allocation pair, or None if symbol
+    isn't part of one. See lib/allocation.py.pair_for_symbol()."""
+    _, pair_syms = pair_for_symbol(symbol)
+    if not pair_syms:
+        return None
+    return pair_syms[1] if pair_syms[0] == symbol else pair_syms[0]
 
 
 def generate_commands_for_new_lines(symbol: str, date_str: str, current_price: float,
@@ -223,6 +279,18 @@ def generate_commands_for_new_lines(symbol: str, date_str: str, current_price: f
     count, _ = _generate_commands_for_lines(
         lines, symbol, current_price, cfg, db_path, in_flight=set()
     )
+
+    # 2026-09-12, capacity-allocation plan: mirror onto the paired full-size/micro
+    # contract too. in_flight_fn returns set() unconditionally here (not a fresh
+    # per-symbol query like generate_commands() needs) -- this function's own
+    # "NOT EXISTS any command for this critical_line_id" guard above already
+    # guarantees every line here has never had a command under ANY symbol, so the
+    # mirror side is provably just as empty.
+    count2, _ = _mirror_onto_pair_symbol(
+        symbol, lines, current_price, cfg, db_path, in_flight_fn=lambda mirror: set()
+    )
+    count += count2
+
     if count:
         log.info(f"generate_commands_for_new_lines: {count} commands for "
                  f"{len(lines)} newly-armed {symbol} line(s)")
@@ -604,12 +672,33 @@ def self_test() -> bool:
 
             # 1. Generate commands
             n = generate_commands("MES", today, current_price, cfg, db_path)
-            expected = 2 * len(brackets) * 2  # 2 lines * N brackets * 2 directions
+            # 2026-09-12: MES now mirrors onto ES (capacity-allocation plan) -- doubles
+            # the expected count. Computed via the real helper, not a hardcoded *2, so
+            # this assertion can't silently drift from lib/allocation.py's actual pairing.
+            mirror_factor = 2 if _mirror_pair_symbol("MES") else 1
+            expected = 2 * len(brackets) * 2 * mirror_factor  # 2 lines * N brackets * 2 directions * mirror
             assert n == expected, f"Expected {expected} commands, got {n}"
 
             with get_db(db_path) as con:
                 rows = con.execute("SELECT * FROM commands WHERE status='PENDING'").fetchall()
             assert len(rows) == expected
+
+            # 1f. Mirror correctness (2026-09-12): ES got exactly as many rows as MES,
+            # and for any given (direction, line_price, bracket_size), the two symbols'
+            # entry/tp/sl prices are IDENTICAL -- confirms no rescaling was (wrongly)
+            # applied, since ES/MES share the same tick size.
+            mes_rows = [r for r in rows if r["symbol"] == "MES"]
+            es_rows  = [r for r in rows if r["symbol"] == "ES"]
+            assert len(es_rows) == len(mes_rows) == expected // 2, \
+                f"MES/ES row counts should match and halve the total: {len(mes_rows)} vs {len(es_rows)}"
+            es_by_key = {(r["direction"], r["line_price"], r["bracket_size"]): r for r in es_rows}
+            for m in mes_rows:
+                key = (m["direction"], m["line_price"], m["bracket_size"])
+                e = es_by_key.get(key)
+                assert e is not None, f"No mirrored ES row for MES combo {key}"
+                assert (e["entry_price"], e["tp_price"], e["sl_price"]) == \
+                       (m["entry_price"], m["tp_price"], m["sl_price"]), \
+                    f"ES mirror prices should match MES exactly (same tick size): {key}"
 
             # 1c. logical_trade_id: each (line, bracket, direction) combo gets its
             # own distinct, non-null id -- they're independent slots, not siblings.
@@ -661,7 +750,8 @@ def self_test() -> bool:
                 )
             n_control = generate_commands("MES", today, current_price, cfg, db_path)
             control_brackets = getattr(cfg.orders, "control_active_brackets", None) or brackets[:1]
-            expected_control = len(control_brackets) * 2  # 1 line * N control brackets * 2 directions
+            # 2026-09-12: mirrored onto ES too, same mirror_factor as the main assertion above.
+            expected_control = len(control_brackets) * 2 * mirror_factor  # 1 line * N control brackets * 2 directions * mirror
             assert n_control == expected_control, \
                 f"Expected {expected_control} control commands, got {n_control}"
             with get_db(db_path) as con:
@@ -683,8 +773,9 @@ def self_test() -> bool:
                 )
                 new_line_id = cur.lastrowid
             n_new = generate_commands_for_new_lines("MES", today, current_price, cfg, db_path)
-            assert n_new == len(brackets) * 2, \
-                f"Expected {len(brackets)*2} commands for the new line, got {n_new}"
+            expected_new = len(brackets) * 2 * mirror_factor  # 2026-09-12: + ES mirror
+            assert n_new == expected_new, \
+                f"Expected {expected_new} commands for the new line, got {n_new}"
             with get_db(db_path) as con:
                 new_line_cmds = con.execute(
                     "SELECT * FROM commands WHERE critical_line_id=?", (new_line_id,)
