@@ -29,7 +29,7 @@ if str(_ROOT) not in sys.path:
 
 from flask import Flask, jsonify, request, render_template_string
 
-from lib.db import get_db, get_cached_price, init_db, archive_and_delete_commands, set_system_state, get_system_state
+from lib.db import get_db, get_cached_price, init_db, archive_and_delete_commands, set_system_state, get_system_state, compute_side_resting
 from lib.price_profile import ensure_profile as _ensure_price_profile, get_price_profile
 from trader.session import get_session_manager
 from lib import algo_lab, algo_pnl, correlation_lab
@@ -2067,6 +2067,73 @@ def api_algo_compare():
     })
 
 
+# 2026-09-12: which algorithm family a commands.source belongs to, for the
+# Allocation tab -- GevaExtract / Critical Line / Spread / Correlation are the 4
+# the capacity plan is built around; everything else (legacy critical_line,
+# algo_lab, geva_manual_control) collapses to "Other" here so nothing silently
+# drops out of the live total even though it's not one of the 4.
+_ALLOC_FAMILY_SOURCES = {
+    "GevaExtract":    {"geva_extract", "geva_manual"},
+    "Critical Line":  {"research_ce", "research_ce_stock", "research_random", "research_random_stock"},
+    "Spread":         {"spread", "spread_control"},
+    "Correlation":    {"correlation", "correlation_control"},
+}
+
+
+def _alloc_family_for(source):
+    for fam, srcs in _ALLOC_FAMILY_SOURCES.items():
+        if source in srcs:
+            return fam
+    return "Other"
+
+
+@app.route("/api/allocation")
+def api_allocation():
+    """
+    Actual (live) half of the Allocation tab: how many commands are currently
+    resting (SUBMITTED, or FILLED with needs_review=0 -- same definition
+    lib.db.compute_side_resting uses for the real admission-cap check), broken
+    out by algorithm family and symbol, alongside the TRUE per-symbol/side
+    total (which sums across every family, not just one) so it's visible
+    whether one family is close to crowding out the others on a given symbol.
+    """
+    db_path = _resolve_db()
+    with get_db(db_path) as con:
+        rows = [dict(r) for r in con.execute(
+            "SELECT symbol, direction, source FROM commands "
+            "WHERE status='SUBMITTED' OR (status='FILLED' AND needs_review=0)"
+        ).fetchall()]
+
+        same_dir_counts = {}
+        for r in rows:
+            fam = _alloc_family_for(r["source"])
+            key = (fam, r["symbol"], r["direction"])
+            same_dir_counts[key] = same_dir_counts.get(key, 0) + 1
+
+        families = ["GevaExtract", "Critical Line", "Spread", "Correlation", "Other"]
+        symbols = sorted({r["symbol"] for r in rows})
+        by_family = []
+        for sym in symbols:
+            for fam in families:
+                for direction in ("BUY", "SELL"):
+                    opposite = "SELL" if direction == "BUY" else "BUY"
+                    same = same_dir_counts.get((fam, sym, direction), 0)
+                    opp  = same_dir_counts.get((fam, sym, opposite), 0)
+                    resting = same + opp * 2
+                    if resting > 0:
+                        by_family.append({"family": fam, "symbol": sym,
+                                          "direction": direction, "resting": resting})
+
+        true_totals = []
+        for sym in symbols:
+            for direction in ("BUY", "SELL"):
+                n = compute_side_resting(con, sym, direction)
+                if n > 0:
+                    true_totals.append({"symbol": sym, "direction": direction, "resting": n})
+
+    return jsonify({"by_family": by_family, "true_totals": true_totals})
+
+
 # ── Sup/Res visualization data (feeds the Graph tab's line overlay) ───────────
 
 @app.route("/api/srviz/<symbol>")
@@ -2393,13 +2460,18 @@ body:not(.busy-wait) .busy-strip{background:var(--gl-border)}
   <!-- ══════════════════════ LEFT RAIL ══════════════════════ -->
   <nav class="rail" id="rail">
     <div class="rail-mark">GL</div>
+    <!-- 2026-09-12: Trading/Results/Allocation moved first -- contract-slot capacity
+         is now the system's scarcest resource, so the tabs that show live positions,
+         results, and how capacity is actually allocated/used lead; the
+         mockup/exploration tools (Overview/Levels/Charts/Correlation/Algo Lab) follow. -->
+    <button class="rail-item" data-group="trading"><span class="ico">&#9635;</span><span class="lbl">Trading</span></button>
+    <button class="rail-item" data-group="results"><span class="ico">&#128202;</span><span class="lbl">Results</span></button>
+    <button class="rail-item" data-group="allocation"><span class="ico">&#9873;</span><span class="lbl">Allocation</span></button>
     <button class="rail-item" data-group="overview"><span class="ico">&#9671;</span><span class="lbl">Overview</span></button>
     <button class="rail-item" data-group="levels"><span class="ico">&#9638;</span><span class="lbl">Levels</span></button>
     <button class="rail-item" data-group="charts"><span class="ico">&#128200;</span><span class="lbl">Charts</span></button>
     <button class="rail-item" data-group="correlation"><span class="ico">&#9678;</span><span class="lbl">Correlation</span></button>
     <button class="rail-item" data-group="algolab"><span class="ico">&#9879;</span><span class="lbl">Algo Lab</span></button>
-    <button class="rail-item" data-group="trading"><span class="ico">&#9635;</span><span class="lbl">Trading</span></button>
-    <button class="rail-item" data-group="results"><span class="ico">&#128202;</span><span class="lbl">Results</span></button>
     <a class="rail-item" id="rail-link-geva" target="_blank"><span class="ico">&#128279;</span><span class="lbl">Geva Extract</span></a>
     <div class="rail-spacer"></div>
   </nav>
@@ -2409,7 +2481,7 @@ body:not(.busy-wait) .busy-strip{background:var(--gl-border)}
     <!-- Header -->
     <div class="app-header">
       <span class="brand">Galao</span>
-      <span class="verchip">v5.10</span>
+      <span class="verchip">v5.11</span>
       <span class="gl-pill" id="session-broker-badge" style="color:var(--gl-muted)">Broker: —</span>
       <span class="gl-pill" id="session-decider-badge" style="color:var(--gl-muted)">Decider: —</span>
       <span class="text-muted" id="session-uptime" style="font-size:.7rem;min-width:3.5em"></span>
@@ -2428,9 +2500,14 @@ body:not(.busy-wait) .busy-strip{background:var(--gl-border)}
     <div class="busy-strip idle" id="busy-strip"></div>
 
     <div id="top-bar">
-      <span class="rail-group-caption" id="rail-group-caption">Overview</span>
+      <span class="rail-group-caption" id="rail-group-caption">Trading</span>
       <ul class="nav mb-0 flex-shrink-0" id="mainTab" role="tablist" style="height:36px;gap:0;list-style:none;padding:0;margin:0;display:flex">
-        <li class="nav-item" data-group="overview"><button class="nav-link top-tab active" data-bs-toggle="tab" data-bs-target="#tab-overview" id="btn-overview-tab">Overview</button></li>
+        <li class="nav-item" data-group="trading"><button class="nav-link top-tab active" data-bs-toggle="tab" data-bs-target="#tab-broker" id="btn-broker-tab">Broker</button></li>
+        <li class="nav-item" data-group="trading"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-submitted" id="btn-sub-tab">Submitted</button></li>
+        <li class="nav-item" data-group="results"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-stats" id="btn-stats-tab">Results</button></li>
+        <li class="nav-item" data-group="results"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-compare" id="btn-compare-tab">Compare</button></li>
+        <li class="nav-item" data-group="allocation"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-allocation" id="btn-allocation-tab">Allocation</button></li>
+        <li class="nav-item" data-group="overview"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-overview" id="btn-overview-tab">Overview</button></li>
         <li class="nav-item" data-group="levels"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-lines" id="btn-lines-tab">Lines</button></li>
         <li class="nav-item" data-group="levels"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-sandbox" id="btn-sandbox-tab">Sandbox</button></li>
         <li class="nav-item" data-group="levels"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-trades" id="btn-trades-tab">Create Trades</button></li>
@@ -2441,10 +2518,6 @@ body:not(.busy-wait) .busy-strip{background:var(--gl-border)}
         <li class="nav-item" data-group="charts"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-srviz" id="btn-srviz-tab">Sup/Res Viz</button></li>
         <li class="nav-item" data-group="algolab"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-algolab-grid" id="btn-algolab-grid-tab">Grid &amp; Submit</button></li>
         <li class="nav-item" data-group="algolab"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-algolab-pnl" id="btn-algolab-pnl-tab">P&amp;L Breakdown</button></li>
-        <li class="nav-item" data-group="trading"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-broker" id="btn-broker-tab">Broker</button></li>
-        <li class="nav-item" data-group="trading"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-submitted" id="btn-sub-tab">Submitted</button></li>
-        <li class="nav-item" data-group="results"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-stats" id="btn-stats-tab">Results</button></li>
-        <li class="nav-item" data-group="results"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-compare" id="btn-compare-tab">Compare</button></li>
       </ul>
       <ul class="dropdown-menu dropdown-menu-dark" id="menu-links">
         <li><a class="dropdown-item" id="menu-link-cc2026"  target="_blank">CC2026 Dashboard (this)</a></li>
@@ -2525,7 +2598,7 @@ body:not(.busy-wait) .busy-strip{background:var(--gl-border)}
 <div class="tab-content">
 
 <!-- ══════════════════════ OVERVIEW ══════════════════════ -->
-<div class="tab-pane fade show active" id="tab-overview">
+<div class="tab-pane fade" id="tab-overview">
   <div class="row g-3 mb-1">
     <div class="col-3"><div class="gl-card"><div class="gl-stat-k">Session Uptime</div>
       <div class="gl-stat-v" id="ov-uptime">—</div></div></div>
@@ -3046,8 +3119,56 @@ body:not(.busy-wait) .busy-strip{background:var(--gl-border)}
  </div>
 </div>
 
+<!-- ══════════════════════ ALLOCATION ══════════════════════ -->
+<!-- 2026-09-12: contract-slot capacity (IB's ~15-resting-orders-per-symbol-per-side
+     hard cap) is the system's scarcest resource now that GevaExtract, Critical Line,
+     Spread, and Correlation all draw from the same per-symbol pool. This tab shows
+     the agreed allocation plan (top) against what's actually resting at IB right now
+     (bottom) -- e.g. GevaExtract may be allocated 15 slots but show 0 in use while
+     the market's closed. -->
+<div class="tab-pane fade" id="tab-allocation">
+ <div class="st-page">
+  <div class="cmp-section">
+    <h6 class="text-muted small text-uppercase mb-2">Theoretical allocation (agreed plan, per side)</h6>
+    <div class="alloc-static">
+      <table class="table table-sm table-hover mb-3">
+        <thead class="text-muted small"><tr>
+          <th>Pair</th><th>Total/side</th><th>GevaExtract</th><th>Critical Line</th><th>Spread</th><th>Correlation</th>
+        </tr></thead>
+        <tbody>
+          <tr><td>MES + ES</td><td>~30</td><td>15 (8 ES + 7 MES)</td><td>5</td><td>5</td><td>5</td></tr>
+          <tr><td>MNQ + NQ</td><td>~30</td><td>&mdash;</td><td>10</td><td>10</td><td>10</td></tr>
+          <tr><td>MYM + YM</td><td>~30</td><td>&mdash;</td><td>10</td><td>10</td><td>10</td></tr>
+          <tr><td>M2K + RTY</td><td>~30</td><td>&mdash;</td><td>10</td><td>10</td><td>10</td></tr>
+        </tbody>
+      </table>
+      <table class="table table-sm table-hover mb-0">
+        <thead class="text-muted small"><tr><th>Stock range</th><th>Symbols</th><th>Algorithm</th><th>Mode</th></tr></thead>
+        <tbody>
+          <tr><td>1&ndash;10</td><td>AAPL...TSLA</td><td>Critical Line</td><td>Dedicated</td></tr>
+          <tr><td>11&ndash;20</td><td>LLY...JNJ</td><td>Spread</td><td>Dedicated</td></tr>
+          <tr><td>21&ndash;30</td><td>NFLX...PEP</td><td>Correlation</td><td>Dedicated</td></tr>
+          <tr><td>31&ndash;100</td><td>70 symbols</td><td>All 4 (incl. GevaExtract)</td><td>Shared, cap pushed toward ~14-15/side per symbol</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="cmp-section mt-4">
+    <div class="d-flex align-items-center mb-2">
+      <h6 class="text-muted small text-uppercase mb-0">Actual (live)</h6>
+      <button class="btn btn-sm btn-outline-secondary ms-auto" onclick="loadAllocation()">&#8635;</button>
+    </div>
+    <div id="alloc-actual-table"></div>
+    <p class="text-muted small mt-2">"Resting" = commands currently SUBMITTED or FILLED (with needs_review=0) --
+      the same definition broker.py's own admission cap uses (lib.db.compute_side_resting), broken out by
+      source-family and symbol here instead of collapsed into one account-wide number.</p>
+  </div>
+ </div>
+</div>
+
 <!-- ══════════════════════ BROKER ══════════════════════ -->
-<div class="tab-pane fade" id="tab-broker">
+<div class="tab-pane fade show active" id="tab-broker">
   <div class="dayclean-bar">
     <b class="small">Day Start</b>
     <button class="btn btn-sm btn-outline-secondary" id="dc-btn-verify" onclick="dcVerify()">Verify</button>
@@ -5676,6 +5797,51 @@ async function loadCompare(){
 document.getElementById('btn-compare-tab').addEventListener('click',loadCompare);
 document.getElementById('cmp-symbol-select').addEventListener('change',loadCompare);
 
+// ── Allocation ───────────────────────────────────────────────────────────────
+async function loadAllocation(){
+  _enterBusy();
+  try{
+    const d=await (await fetch('/api/allocation')).json();
+
+    const trueBySymbol={};
+    d.true_totals.forEach(t=>{ (trueBySymbol[t.symbol]=trueBySymbol[t.symbol]||{})[t.direction]=t.resting; });
+
+    const byKey={};
+    d.by_family.forEach(f=>{
+      const k=f.symbol;
+      byKey[k]=byKey[k]||{};
+      byKey[k][f.family]=byKey[k][f.family]||{};
+      byKey[k][f.family][f.direction]=f.resting;
+    });
+
+    const families=['GevaExtract','Critical Line','Spread','Correlation','Other'];
+    const symbols=Object.keys(byKey).sort();
+    const rows=symbols.map(sym=>{
+      const trueB=(trueBySymbol[sym]||{}).BUY||0, trueS=(trueBySymbol[sym]||{}).SELL||0;
+      const famCells=families.map(fam=>{
+        const c=(byKey[sym][fam])||{};
+        const b=c.BUY||0, s=c.SELL||0;
+        return (b||s) ? `<td>${b}/${s}</td>` : '<td class="text-muted">&mdash;</td>';
+      }).join('');
+      return `<tr><td><b>${sym}</b></td><td>${trueB}/${trueS}</td>${famCells}</tr>`;
+    }).join('');
+
+    document.getElementById('alloc-actual-table').innerHTML = `
+      <table class="table table-sm table-hover mb-0">
+        <thead class="text-muted small"><tr>
+          <th>Symbol</th><th>Total (Buy/Sell side)</th>
+          ${families.map(f=>`<th>${f}</th>`).join('')}
+        </tr></thead>
+        <tbody>${rows || '<tr><td colspan="7" class="text-muted">No resting commands right now.</td></tr>'}</tbody>
+      </table>
+      <p class="text-muted small mt-2">Per-family cells show Buy/Sell resting counts (this family's own
+      same-direction entries + 2x its opposite-direction entries, per lib.db.compute_side_resting's
+      definition). "Total" is the true account-wide figure across every family on that symbol/side --
+      the number IB's own ~15-per-side cap actually applies against.</p>`;
+  }catch(e){}finally{_exitBusy();}
+}
+document.getElementById('btn-allocation-tab').addEventListener('click',loadAllocation);
+
 // ── Correlation ───────────────────────────────────────────────────────────────
 async function loadCorrMatrix(){
   const window_=document.getElementById('corr-window').value;
@@ -5761,7 +5927,8 @@ document.getElementById('btn-overview-tab').addEventListener('click',loadOvervie
 
 // ── Rail navigation (groups) ─────────────────────────────────────────────────
 const GROUP_LABELS={overview:'Overview',levels:'Levels',
-  charts:'Charts',correlation:'Correlation',algolab:'Algo Lab',trading:'Trading',results:'Results'};
+  charts:'Charts',correlation:'Correlation',algolab:'Algo Lab',trading:'Trading',
+  results:'Results',allocation:'Allocation'};
 
 function setActiveRailGroup(group){
   document.querySelectorAll('.rail-item').forEach(b=>b.classList.toggle('active',b.dataset.group===group));
@@ -5816,10 +5983,18 @@ document.addEventListener('shown.bs.tab',function(e){
 });
 
 // ── Init ──────────────────────────────────────────────────────────────────────
+// 2026-09-12: default landing tab changed from Overview to Trading/Broker --
+// contract-slot capacity is now the scarcest resource in the system, so the
+// live-position view leads instead of the mockup/exploration screen.
 (function(){
-  setActiveRailGroup('overview');
-  showGroupTabs('overview',false);
-  loadOverview();
+  setActiveRailGroup('trading');
+  showGroupTabs('trading',false);
+  loadBroker();
+  clearInterval(_bkTimer);
+  _bkTimer=setInterval(loadBroker,5000);
+  dcVerify();
+  clearInterval(_dcTimer);
+  _dcTimer=setInterval(dcVerify,15000);
   const lw=_lastWeekday();
   document.getElementById('range-from').value=lw;
   document.getElementById('range-to').value=lw;
@@ -5837,6 +6012,19 @@ document.addEventListener('shown.bs.tab',function(e){
 # ── Release notes ─────────────────────────────────────────────────────────────
 
 _RELEASE_NOTES = [
+    ("v5.11", "Nav reorder + new Allocation tab -- contract-slot capacity is the scarce resource now",
+              "User request: Trading/Results/Allocation moved first (both the left "
+              "rail and the top tab bar), Overview/Levels/Charts/Correlation/Algo Lab "
+              "pushed after them -- default landing tab changed from Overview to "
+              "Trading/Broker to match. New Allocation tab: top half is the agreed "
+              "capacity plan (MES+ES/MNQ+NQ/MYM+YM/M2K+RTY doubling, GevaExtract's "
+              "15-of-30 MES+ES share, the 100-stock dedicated/shared split), static "
+              "for now, not yet enforced in code. Bottom half is live -- new "
+              "/api/allocation route breaks out currently-resting commands "
+              "(SUBMITTED, or FILLED with needs_review=0 -- same definition "
+              "lib.db.compute_side_resting already uses for the real admission cap) "
+              "by algorithm family and symbol, next to the true account-wide total "
+              "per symbol/side IB's own cap actually applies against."),
     ("v5.10", "Results screen: two-level nav -- 5 top buttons, Critical Lines drills into Algo 1-5",
               "User request: main button row cut to exactly 5 -- All / GevaExtract / "
               "Critical Lines / Spread / Correlation. Control/Critical Line/Algo Lab/"
