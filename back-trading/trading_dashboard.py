@@ -2481,7 +2481,7 @@ body:not(.busy-wait) .busy-strip{background:var(--gl-border)}
     <!-- Header -->
     <div class="app-header">
       <span class="brand">Galao</span>
-      <span class="verchip">v5.11</span>
+      <span class="verchip">v5.12</span>
       <span class="gl-pill" id="session-broker-badge" style="color:var(--gl-muted)">Broker: —</span>
       <span class="gl-pill" id="session-decider-badge" style="color:var(--gl-muted)">Decider: —</span>
       <span class="text-muted" id="session-uptime" style="font-size:.7rem;min-width:3.5em"></span>
@@ -3180,6 +3180,15 @@ body:not(.busy-wait) .busy-strip{background:var(--gl-border)}
     <button class="btn btn-sm btn-outline-info" id="dc-btn-extractstocks" onclick="dcExtractStocks()">Extract Stock Lines</button>
     <span class="small text-muted" id="dc-status"></span>
   </div>
+  <!-- 2026-09-12: moved up from the bottom of the Closed strip -- user report:
+       buried at the bottom under the whole Pending/Submitted/Filled board, hard
+       to reach/use down there. Second line, same row-group as Day Start. -->
+  <div class="dayclean-bar" style="margin-top:-4px">
+    <b class="small">Closed range</b>
+    <button class="btn btn-sm btn-outline-secondary bk-range active" data-bkrange="today">Today</button>
+    <button class="btn btn-sm btn-outline-secondary bk-range" data-bkrange="yesterday">Yesterday</button>
+    <button class="btn btn-sm btn-outline-secondary bk-range" data-bkrange="all">All days</button>
+  </div>
   <div class="small text-muted" id="dc-summary" style="margin:-4px 0 10px 2px"></div>
   <div class="broker-stats">
     <div class="broker-stat"><div class="k">Pending</div><div class="v" id="bk-c-pending">—</div></div>
@@ -3210,11 +3219,6 @@ body:not(.busy-wait) .busy-strip{background:var(--gl-border)}
   <div class="broker-closed-strip">
     <div class="d-flex align-items-center gap-1 mb-1">
       <h6 class="mb-0" id="bk-closed-title">Closed today</h6>
-      <div class="d-flex gap-1 ms-auto">
-        <button class="btn btn-sm btn-outline-secondary bk-range active" data-bkrange="today">Today</button>
-        <button class="btn btn-sm btn-outline-secondary bk-range" data-bkrange="yesterday">Yesterday</button>
-        <button class="btn btn-sm btn-outline-secondary bk-range" data-bkrange="all">All days</button>
-      </div>
     </div>
     <div class="broker-list" id="bk-closed"></div>
   </div>
@@ -5992,9 +5996,18 @@ document.addEventListener('shown.bs.tab',function(e){
   loadBroker();
   clearInterval(_bkTimer);
   _bkTimer=setInterval(loadBroker,5000);
+  // 2026-09-12 regression fix: dcVerify() spawns a whole new Python subprocess
+  // that connects fresh to IB Gateway (trader/scripts/ib_dayclean.py, up to a
+  // 30s timeout) -- auto-starting a 15s repeat of that on every page load (not
+  // just when the user actually clicked into Broker, which is all this used to
+  // do before Trading became the default tab) is what made everything feel
+  // constantly slow. Verified live: with IB Gateway currently refusing API
+  // connections, each attempt was taking ~21s and queuing up faster than the
+  // 15s interval could clear them. One-shot on load (so the Day Start gating/
+  // summary still populates once), no recurring timer -- same as clicking
+  // "Verify" once. The button itself, and every dc* action, still call
+  // dcVerify() on demand same as before.
   dcVerify();
-  clearInterval(_dcTimer);
-  _dcTimer=setInterval(dcVerify,15000);
   const lw=_lastWeekday();
   document.getElementById('range-from').value=lw;
   document.getElementById('range-to').value=lw;
@@ -6012,6 +6025,25 @@ document.addEventListener('shown.bs.tab',function(e){
 # ── Release notes ─────────────────────────────────────────────────────────────
 
 _RELEASE_NOTES = [
+    ("v5.12", "Fix v5.11 slowdown regression + move Trading's day-range filter to the top",
+              "User report: 'everything very very slow, constant hourglass' since the "
+              "v5.11 nav reorder. Root cause found: making Trading/Broker the default "
+              "landing tab meant dcVerify() (which spawns a whole new Python subprocess "
+              "connecting fresh to IB Gateway, trader/scripts/ib_dayclean.py, up to a "
+              "30s timeout) now auto-started a 15s repeat on every page load -- before, "
+              "this only ran when a user manually clicked into Broker. Verified live: "
+              "IB Gateway is currently refusing API connections entirely (separately "
+              "flagged to the user, not a code bug), so each attempt was taking ~21s and "
+              "queuing up faster than the 15s interval cleared them -- a real, "
+              "self-inflicted slowdown on top of the Gateway issue. Fixed: dcVerify() "
+              "runs once on load (Day Start gating/summary still populates), no "
+              "auto-repeating timer -- manually clicking into Broker (or any dc* action "
+              "button) still starts the same 15s live-poll as before, unchanged. "
+              "loadBroker()'s own 5s poll is untouched -- confirmed pure-DB, no IB call. "
+              "Also: the Today/Yesterday/All days closed-range filter moved from the "
+              "bottom of the Broker tab (buried under the whole Pending/Submitted/Filled "
+              "board) to a second line right under Day Start, per user report it was hard "
+              "to reach down there."),
     ("v5.11", "Nav reorder + new Allocation tab -- contract-slot capacity is the scarce resource now",
               "User request: Trading/Results/Allocation moved first (both the left "
               "rail and the top tab bar), Overview/Levels/Charts/Correlation/Algo Lab "
