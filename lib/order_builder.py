@@ -37,7 +37,13 @@ log = get_logger("order_builder")
 # tick) while broker.py already had its own private per-symbol dict -- harmless while
 # symbols:[MES] only, but MYM (tick=1.0) and M2K (tick=0.10) would get silently
 # mis-rounded entry/TP/SL prices the moment either was added to the live symbols list.
-TICK_BY_SYMBOL = {"MES": 0.25, "MNQ": 0.25, "MYM": 1.0, "M2K": 0.10}
+# 2026-09-12: ES/NQ/YM/RTY (full-size futures, capacity-allocation plan) added --
+# confirmed live via reqContractDetails (minTick), same tick as their micro counterpart
+# in every case: ES/NQ share MES/MNQ's 0.25, YM shares MYM's 1.0, RTY shares M2K's 0.10.
+TICK_BY_SYMBOL = {
+    "MES": 0.25, "MNQ": 0.25, "MYM": 1.0, "M2K": 0.10,
+    "ES":  0.25, "NQ":  0.25, "YM":  1.0, "RTY": 0.10,
+}
 
 # US equities all tick at $0.01 post-decimalization -- unlike futures, no per-symbol
 # table is needed for the ~100-stock research universe. Added 2026-09-07 alongside

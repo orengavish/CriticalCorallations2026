@@ -35,7 +35,13 @@ import json
 import argparse
 
 # CME official contract multipliers ($ per full point). Tick value = multiplier * tick_size.
-SYMBOL_MULTIPLIERS = {"MES": 5.0, "MNQ": 2.0, "MYM": 0.5, "M2K": 5.0}
+# 2026-09-12: ES/NQ/YM/RTY (full-size futures, capacity-allocation plan) added --
+# confirmed live via reqContractDetails, exactly 10x their micro counterpart in every
+# case (CME's standard micro:mini notional ratio for all 4 of these products).
+SYMBOL_MULTIPLIERS = {
+    "MES": 5.0, "MNQ": 2.0, "MYM": 0.5, "M2K": 5.0,
+    "ES":  50.0, "NQ":  20.0, "YM":  5.0, "RTY": 50.0,
+}
 
 
 def get_breakdown(db_path, date_from: str = None, date_to: str = None) -> list:

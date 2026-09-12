@@ -29,14 +29,27 @@ from lib.logger import get_logger
 log = get_logger("ib_client")
 
 _EXCHANGE = "CME"
-_SYMBOL_EXCHANGE = {"MYM": "CBOT"}  # Micro Dow is listed under CBOT, not CME -- confirmed
-                                    # via reqContractDetails (2026-08-29); MES/MNQ/M2K are CME.
+_SYMBOL_EXCHANGE = {
+    "MYM": "CBOT",  # Micro Dow is listed under CBOT, not CME -- confirmed
+                    # via reqContractDetails (2026-08-29); MES/MNQ/M2K are CME.
+    "YM":  "CBOT",  # Full-size Dow, same exchange as its micro. Confirmed
+                    # 2026-09-12 via a live reqContractDetails call (paper account,
+                    # read-only) alongside ES/NQ/RTY below -- not assumed from the
+                    # MYM pattern alone, the same rigor MYM itself got on 2026-08-29.
+}
 _CURRENCY = "USD"
 
-# The only 4 symbols this system has ever traded before 2026-09-07. Everything else
-# (the ~100-stock research universe) is assumed to be a US equity, routed via SMART --
-# no per-symbol exchange table needed the way futures need CME/CBOT disambiguation.
-_FUTURES_SYMBOLS = {"MES", "MNQ", "MYM", "M2K"}
+# 2026-09-12: ES/NQ/YM/RTY added -- the capacity-allocation plan's "double capacity per
+# index by trading both micro and full-size" (approved this session). All 4 confirmed
+# live via reqContractDetails (paper account, read-only, no orders): ES/NQ/RTY -> CME,
+# YM -> CBOT (matching their micro counterparts' exchanges); tick sizes identical to the
+# micro pair in every case (ES/NQ=0.25, YM=1.0, RTY=0.10 -- see lib/order_builder.py's
+# TICK_BY_SYMBOL); multipliers are exactly 10x the micro (ES=50 vs MES=5, NQ=20 vs
+# MNQ=2, YM=5 vs MYM=0.5, RTY=50 vs M2K=5 -- see lib/algo_pnl.py's SYMBOL_MULTIPLIERS).
+# The only 4 symbols this system traded before 2026-09-07 were MES/MNQ/MYM/M2K.
+# Everything else (the ~100-stock research universe) is assumed to be a US equity,
+# routed via SMART -- no per-symbol exchange table needed there.
+_FUTURES_SYMBOLS = {"MES", "MNQ", "MYM", "M2K", "ES", "NQ", "YM", "RTY"}
 _STOCK_EXCHANGE = "SMART"
 
 
@@ -392,6 +405,13 @@ def self_test() -> bool:
         assert isinstance(fut, Future) and fut.exchange == "CME"
         fut_mym = ibc0._make_contract("MYM")
         assert isinstance(fut_mym, Future) and fut_mym.exchange == "CBOT"
+        # 2026-09-12: full-size futures added for the capacity-allocation plan -- same
+        # exchange as their micro counterpart in every case (confirmed live via
+        # reqContractDetails, not assumed from the micro pattern alone).
+        for sym, exch in (("ES", "CME"), ("NQ", "CME"), ("YM", "CBOT"), ("RTY", "CME")):
+            f = ibc0._make_contract(sym)
+            assert isinstance(f, Future) and f.exchange == exch, \
+                f"{sym} should route to {exch}, got {f.exchange}"
         stk = ibc0._make_contract("AAPL")
         assert isinstance(stk, Stock) and stk.exchange == "SMART" and stk.symbol == "AAPL"
 
