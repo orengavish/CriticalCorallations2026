@@ -12,6 +12,7 @@ Usage:
 
 import sys
 import ast
+import re
 import csv
 import json
 import socket
@@ -1668,6 +1669,16 @@ _BUCKET_MAP = {
     "geva_manual_control":   "Control",  # matched random-distance control for the above
     "critical_line":         "Critical Line",
     "algo_lab":              "Algo Lab",
+    # 2026-09-12: Part 2/3's new live algorithms. "spread_control" is the reversed/
+    # mean-reversion reading of AI-35a's ambiguous leg-direction text (real vs control
+    # here means literal-vs-reversed, not real-vs-random-baseline like Algo 1-5).
+    # "correlation" has no control variant yet -- Part 2 only built one direction
+    # (AI-26 wasn't ambiguous the way AI-35a was) -- Control always reads n=0 until
+    # one exists.
+    "spread":                "Spread (Real)",
+    "spread_control":        "Spread (Control)",
+    "correlation":           "Correlation (Real)",
+    "correlation_control":   "Correlation (Control)",
 }
 # 2026-09-10: the two-winning-reasons experiment's exact winning reason, already saved
 # in critical_lines.note as JSON ({"reason": "...", ...}) by prep_research_lines*.py but
@@ -1688,8 +1699,10 @@ _BUCKET_ORDER = ["GevaExtract", "Algo 1 (Real)", "Algo 1 (Control)",
                  "Algo 2 (Real)", "Algo 2 (Control)",
                  "Algo 3 (Real)", "Algo 3 (Control)",
                  "Algo 4 (Real)", "Algo 4 (Control)",
-                 "Algo 5 (Real)", "Algo 5 (Control)", "Control",
-                 "Critical Line", "Algo Lab", "Other"]
+                 "Algo 5 (Real)", "Algo 5 (Control)",
+                 "Spread (Real)", "Spread (Control)",
+                 "Correlation (Real)", "Correlation (Control)",
+                 "Control", "Critical Line", "Algo Lab", "Other"]
 
 
 def _bucket_for(source, symbol, note=None):
@@ -1812,11 +1825,15 @@ def api_closed_stats():
 
     # 2026-09-11: the Results screen merged each Algo N's separate Real/Control
     # buttons into one -- "Algo 1" here means either "Algo 1 (Real)" or
-    # "Algo 1 (Control)", not an exact bucket match. Every other bucket name
-    # (GevaExtract, Control, Critical Line, Algo Lab, Other) has no Real/Control
-    # split to begin with, so exact match still covers them.
+    # "Algo 1 (Control)", not an exact bucket match. Same for Spread/Correlation.
+    # GevaExtract/Control/Critical Line/Algo Lab/Other have no Real/Control split,
+    # so exact match still covers them.
+    # 2026-09-12: "Critical Lines" (plural) is the new top-level group over Algo
+    # 1-5 -- matches any of the 5 pairs' Real/Control rows, not a single prefix.
     if bucket == "All":
         bucket_rows = filtered_rows
+    elif bucket == "Critical Lines":
+        bucket_rows = [r for r in filtered_rows if re.match(r"^Algo \d+ \(", r["bucket"])]
     else:
         bucket_rows = [r for r in filtered_rows
                        if r["bucket"] == bucket or r["bucket"].startswith(bucket + " (")]
@@ -2314,6 +2331,8 @@ body:not(.busy-wait) .busy-strip{background:var(--gl-border)}
 .st-bucket-opt .n{color:var(--gl-faint);font-size:10px;margin-left:4px}
 .st-bucket-opt.active{background:var(--gl-accent);color:var(--gl-accent-ink)}
 .st-bucket-opt.active .n{color:var(--gl-accent-ink);opacity:.75}
+.st-subbucket-select{margin-left:20px}
+.st-subbucket-select .st-bucket-opt{font-size:11px;padding:4px 12px}
 .unreliable-badge{color:var(--gl-bad);font-size:10px;margin-left:4px;font-weight:700;
   text-transform:none;letter-spacing:0}
 
@@ -2390,7 +2409,7 @@ body:not(.busy-wait) .busy-strip{background:var(--gl-border)}
     <!-- Header -->
     <div class="app-header">
       <span class="brand">Galao</span>
-      <span class="verchip">v5.09</span>
+      <span class="verchip">v5.10</span>
       <span class="gl-pill" id="session-broker-badge" style="color:var(--gl-muted)">Broker: —</span>
       <span class="gl-pill" id="session-decider-badge" style="color:var(--gl-muted)">Decider: —</span>
       <span class="text-muted" id="session-uptime" style="font-size:.7rem;min-width:3.5em"></span>
@@ -2949,6 +2968,9 @@ body:not(.busy-wait) .busy-strip{background:var(--gl-border)}
         <button class="btn btn-sm btn-outline-secondary st-range" data-range="all">All time</button>
         <button class="btn btn-sm btn-outline-secondary" onclick="loadStats()">&#8635;</button>
       </div>
+    </div>
+    <div class="st-topbar-row" id="st-subbucket-row" hidden>
+      <div class="st-bucket-select st-subbucket-select" id="st-subbucket-select"></div>
     </div>
     <div class="st-topbar-row">
       <div class="st-overall" id="st-overall"></div>
@@ -4514,23 +4536,36 @@ document.addEventListener('keydown', e=>{
 });
 
 // ── Stats screen ─────────────────────────────────────────────────────────────
-const ST_BUCKETS = ['All','GevaExtract','Algo 1 (Real)','Algo 1 (Control)','Algo 2 (Real)','Algo 2 (Control)','Algo 3 (Real)','Algo 3 (Control)','Algo 4 (Real)','Algo 4 (Control)','Algo 5 (Real)','Algo 5 (Control)','Control','Critical Line','Algo Lab','Other'];
-// 2026-09-11: display/selection layer over ST_BUCKETS -- one button per Algo N
-// instead of separate Real/Control buttons (half the buttons; the backend
-// already accepts a bare "Algo N" bucket param as a Real+Control prefix
-// match, see api_closed_stats()). GevaExtract/Control/Critical Line/Algo Lab/
-// Other have no Real/Control split to merge, so they pass through unchanged.
-const ST_BUCKET_GROUPS = ['All','GevaExtract','Algo 1','Algo 2','Algo 3','Algo 4','Algo 5','Control','Critical Line','Algo Lab','Other'];
-const ST_PAIRED_ALGOS = new Set(['Algo 1','Algo 2','Algo 3','Algo 4','Algo 5']);
+const ST_BUCKETS = ['All','GevaExtract','Algo 1 (Real)','Algo 1 (Control)','Algo 2 (Real)','Algo 2 (Control)','Algo 3 (Real)','Algo 3 (Control)','Algo 4 (Real)','Algo 4 (Control)','Algo 5 (Real)','Algo 5 (Control)','Spread (Real)','Spread (Control)','Correlation (Real)','Correlation (Control)','Control','Critical Line','Algo Lab','Other'];
+// 2026-09-12: top-level nav is now exactly these 5 -- Control/Critical Line/Algo
+// Lab/Other dropped entirely per user request (not relevant, fully hidden, not
+// folded into "All" either). "Critical Lines" is a new meta-group over Algo 1-5:
+// selecting it reveals a second row of Algo N sub-buttons (ST_CL_ALGOS) without
+// requiring one to be picked -- it shows all 5 combined until you drill further.
+const ST_TOP_GROUPS = ['All','GevaExtract','Critical Lines','Spread','Correlation'];
+const ST_CL_ALGOS = ['Algo 1','Algo 2','Algo 3','Algo 4','Algo 5'];
+// Paired = has a Real/Control split merged into one button. Algo 1-5's Control is a
+// matched random-distance baseline (Algo 1-5 vs randomly-placed lines); Spread's
+// Control is literal-vs-reversed AI-35a direction, not a random baseline; Correlation
+// has no control variant built yet (Part 2 only implemented one direction) -- its
+// Control side reads n=0 until one exists, not an error.
+const ST_PAIRED_ALGOS = new Set([...ST_CL_ALGOS, 'Spread', 'Correlation']);
 function _stGroupMembers(group){
+  if(group === 'Critical Lines') return ST_CL_ALGOS.flatMap(a => [`${a} (Real)`, `${a} (Control)`]);
   return ST_PAIRED_ALGOS.has(group) ? [`${group} (Real)`, `${group} (Control)`] : [group];
 }
 function _stGroupCount(group, counts){
   return _stGroupMembers(group).reduce((sum,b)=>sum+(counts[b]||0), 0);
 }
 function _stGroupHelp(group, map){
+  if(group === 'Critical Lines') return 'Algo 1-5 combined -- pick one below to narrow further.';
   if(!ST_PAIRED_ALGOS.has(group)) return map[group] || '';
   return `Real: ${map[`${group} (Real)`]||''} | Control: ${map[`${group} (Control)`]||''}`;
+}
+// Which top-level button should read as "active" for a given selected bucket --
+// an Algo N drill-down still highlights "Critical Lines" up top.
+function _stTopGroupFor(bucket){
+  return ST_CL_ALGOS.includes(bucket) ? 'Critical Lines' : bucket;
 }
 // 2026-09-11: Algo 3/4/5 (FIVE_DAY_HIGH+PIVOT_CONFLUENCE, FIVE_DAY_LOW,
 // PREVIOUS_DAY_LOW+PIVOT_CONFLUENCE) were reinstated after being excluded 2026-09-07 for
@@ -4610,6 +4645,10 @@ const ST_BUCKET_HELP = {
   'Algo 4 (Control)': "Matched random-distance control line for each Algo 4 (Real) line, same symbol/moment.",
   'Algo 5 (Real)': "Reinstated 2026-09-11 -- winning reason PREVIOUS_DAY_LOW+PIVOT_CONFLUENCE. Same reinstatement rationale as Algo 3.",
   'Algo 5 (Control)': "Matched random-distance control line for each Algo 5 (Real) line, same symbol/moment.",
+  'Spread (Real)': "Geva's DIFF method (AI-35), literal leg-direction reading -- the instrument that moved more goes LONG, per AI-35a's text as written.",
+  'Spread (Control)': "Same spread signal, REVERSED leg direction -- the mean-reversion reading of AI-35a's ambiguous text (no source lesson to resolve it, so both run live and this comparison decides).",
+  'Correlation (Real)': "Geva's laggard/breakout-retest rule (AI-26-AI-34) -- price/bar-based, not DOM-based (2026-09-11 scope decision).",
+  'Correlation (Control)': "No control variant exists yet for correlation -- AI-26's direction wasn't ambiguous the way spread's was, so only one reading was built. Reads n=0 until one exists.",
   'Control': "GevaExtract's own control: a matched random-distance line for each real Geva line (source 'geva_manual_control'). Unrelated to the Algo 1-5 experiments above.",
   'Critical Line': 'Legacy/orphaned commands with no critical_line_id reference at all -- pre-fix leftovers, not a real algorithm type.',
   'Algo Lab': 'Algo Lab parameter-grid submissions (strategy x tp x sl x direction x strength combos).',
@@ -4632,6 +4671,10 @@ const ST_BUCKET_SHORT = {
   'Algo 4 (Control)': 'Random control matched to Algo 4 (Real).',
   'Algo 5 (Real)': 'Previous-day-low + pivot confluence lines.',
   'Algo 5 (Control)': 'Random control matched to Algo 5 (Real).',
+  'Spread (Real)': 'DIFF method, literal AI-35a direction.',
+  'Spread (Control)': 'DIFF method, reversed direction.',
+  'Correlation (Real)': 'Laggard/breakout-retest rule.',
+  'Correlation (Control)': 'No control variant built yet.',
   'Control': "GevaExtract's own random control line (separate from Algo 1-5).",
   'Critical Line': 'Legacy/orphaned trades -- not a real algorithm.',
   'Algo Lab': 'Parameter-grid strategy testing.',
@@ -4647,15 +4690,34 @@ function _stSelectBucket(bucket){
 function _stRender(){
   const d=_stLastData; if(!d) return;
 
-  // Single-select bucket bar (rebuilt each load so counts stay current) -- one
-  // button per Algo N (Real+Control combined), not two.
-  document.getElementById('st-bucket-select').innerHTML = ST_BUCKET_GROUPS.map(b=>
-    `<div class="st-bucket-opt ${b===_stBucket?'active':''}" data-bucket="${b}" title="${_stGroupHelp(b, ST_BUCKET_HELP)}">${b}${_stUnreliableBadge(b)}`+
+  // Top-level bucket bar (rebuilt each load so counts stay current) -- exactly
+  // 5 buttons: All / GevaExtract / Critical Lines / Spread / Correlation.
+  const _stActiveTop = _stTopGroupFor(_stBucket);
+  document.getElementById('st-bucket-select').innerHTML = ST_TOP_GROUPS.map(b=>
+    `<div class="st-bucket-opt ${b===_stActiveTop?'active':''}" data-bucket="${b}" title="${_stGroupHelp(b, ST_BUCKET_HELP)}">${b}`+
     `<span class="n">${b==='All' ? d.bucket_counts['All'] : _stGroupCount(b, d.bucket_counts)}</span></div>`
   ).join('');
-  document.querySelectorAll('.st-bucket-opt').forEach(el=>{
+  document.querySelectorAll('#st-bucket-select .st-bucket-opt').forEach(el=>{
     el.addEventListener('click',()=>_stSelectBucket(el.dataset.bucket));
   });
+
+  // Sub-bucket row: only visible when Critical Lines is the active top group --
+  // Algo 1-5, each still merged Real+Control. Clicking "Critical Lines" itself
+  // (top row) shows all 5 combined; picking one here narrows further.
+  const subRow = document.getElementById('st-subbucket-row');
+  if(_stActiveTop === 'Critical Lines'){
+    subRow.hidden = false;
+    document.getElementById('st-subbucket-select').innerHTML = ST_CL_ALGOS.map(b=>
+      `<div class="st-bucket-opt ${b===_stBucket?'active':''}" data-bucket="${b}" title="${_stGroupHelp(b, ST_BUCKET_HELP)}">${b}${_stUnreliableBadge(b)}`+
+      `<span class="n">${_stGroupCount(b, d.bucket_counts)}</span></div>`
+    ).join('');
+    document.querySelectorAll('#st-subbucket-select .st-bucket-opt').forEach(el=>{
+      el.addEventListener('click',()=>_stSelectBucket(el.dataset.bucket));
+    });
+  } else {
+    subRow.hidden = true;
+  }
+
   document.getElementById('st-matrix-filter-label').textContent = _stBucket;
 
   // Bracket filter -- only brackets that actually exist for this bucket
@@ -4705,10 +4767,18 @@ function _stRender(){
         <span style="color:${v.usd>=0?'var(--gl-good)':'var(--gl-bad)'}">${v.usd>=0?'+':''}$${fmt(v.usd)}</span>
       </div>`).join('');
   }
-  const _cmpGroups = _stBucket === 'All'
-    ? ST_BUCKET_GROUPS.filter(b => b!=='All' &&
-        _stGroupMembers(b).some(m => d.comparison[m] && d.comparison[m].overall.n > 0))
-    : [_stBucket];
+  let _cmpGroups;
+  if(_stBucket === 'All'){
+    // Overview: every leaf group with any trades today, side by side. "Critical
+    // Lines" itself is a meta-group (not a leaf) -- flattened to its 5 algos here.
+    const leaves = ['GevaExtract', ...ST_CL_ALGOS, 'Spread', 'Correlation'];
+    _cmpGroups = leaves.filter(b =>
+      _stGroupMembers(b).some(m => d.comparison[m] && d.comparison[m].overall.n > 0));
+  } else if(_stBucket === 'Critical Lines'){
+    _cmpGroups = ST_CL_ALGOS;   // all 5, regardless of which have data today
+  } else {
+    _cmpGroups = [_stBucket];   // GevaExtract / one specific Algo N / Spread / Correlation
+  }
   document.getElementById('st-comparison').innerHTML = _cmpGroups
     .map(b => {
       if(!ST_PAIRED_ALGOS.has(b)){
@@ -5767,6 +5837,21 @@ document.addEventListener('shown.bs.tab',function(e){
 # ── Release notes ─────────────────────────────────────────────────────────────
 
 _RELEASE_NOTES = [
+    ("v5.10", "Results screen: two-level nav -- 5 top buttons, Critical Lines drills into Algo 1-5",
+              "User request: main button row cut to exactly 5 -- All / GevaExtract / "
+              "Critical Lines / Spread / Correlation. Control/Critical Line/Algo Lab/"
+              "Other dropped entirely (not relevant, fully hidden per user decision, "
+              "not folded into All either). Selecting Critical Lines reveals a second "
+              "row of Algo 1-5 sub-buttons (still Real+Control merged per algo, "
+              "v5.09's change) without requiring one to be picked -- shows all 5 "
+              "combined until narrowed further. Spread and Correlation are now new "
+              "top-level Real/Control pairs: Spread (Real)=literal AI-35a leg "
+              "direction, Spread (Control)=the reversed/mean-reversion reading; "
+              "Correlation (Real) exists, Correlation (Control) reads n=0 since Part 2 "
+              "only built one direction (AI-26 wasn't ambiguous the way AI-35a was). "
+              "GevaExtract stays exactly as before -- single card, no drill-down. The "
+              "middle comparison section already followed the selected button as of "
+              "v5.09's crash-fix commit; this just changes what's selectable."),
     ("v5.09", "Results screen: merge each Algo N's Real/Control buttons into one",
               "User request: 10 separate 'Algo N (Real)'/'Algo N (Control)' buttons in "
               "the bucket-select bar and comparison-card grid cut down to 5 'Algo N' "
