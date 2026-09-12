@@ -1,6 +1,89 @@
 # Claude State — CriticalCorallations2026
 > **Living doc. Update every time scope changes, a task completes, or context shifts.**
-> Last updated: 2026-08-18
+> rev 2 · Last updated: 2026-09-12
+
+---
+
+## 2026-09-12 — comparison engine + correlation/spread build cycle shipped; dashboard rebuilt v5.04→v5.15; Results Research matrix designed (not yet implemented)
+
+**Same lesson as the 2026-08-18 entry below, again**: this file sat at "v5.03" through an
+entire build cycle that took the dashboard to v5.15. Don't trust this file's version claim —
+always cross-check `git log --oneline -10` or the `verchip` in a running dashboard first.
+
+**Build cycle (3 parts, all shipped, both new algorithms gated OFF by default):**
+- **Part 1 — comparison/evaluation engine.** `back-trading/cl_algo_scorer.py` gained a
+  ported Monte-Carlo permutation p-value and LOOCV ratio (fixed a real always-p=1.0 bug in
+  the MC null model along the way), `MIN_N_FILLS` raised 3→20, `profit_factor` no-loss
+  default capped at 99 instead of 999. New `/api/algo-compare` route + Compare tab (`tab-compare`):
+  per-symbol ranked view of Algo 1-5 reason-scores and TP/SL/direction/strength combo-scores,
+  read-only over `cl_algo_reason_scores`/`cl_algo_combo_scores`/`cl_algo_learner_runs`. Honest
+  finding once run for real: nothing currently clears the bar (Sept tick history missing,
+  best combos are losing streaks) — this is real state, not a bug.
+- **Part 2 — correlation trading, live.** New `trader/correlation_signal.py` (break/retest/
+  fail-to-reclaim state machine per Geva's DQ-005 — never arms on the break itself),
+  `trader/correlation_trail.py` (AI-31 trailing stop — first trailing-stop code in this repo),
+  shared `lib/atr.py`. Wired into `decider.py`/`broker.py`. `correlation_trading.enabled: false`
+  in config — off until there's live data for Part 1's engine to judge.
+- **Part 3 — spread/DIFF trading, live.** New `lib/spread_diff.py` (DIFF construction + AI-35c
+  entry trigger), `lib/order_builder_spread.py` (deliberately TP/SL-less entry — legs are
+  managed by strategy logic, not resting brackets), `trader/spread_manager.py` (AI-35d sizing,
+  AI-35e exit, portfolio kill-switch). `reconcile_naked_positions()` in `broker.py` now exempts
+  open `spread_group_id` positions from its naked-position safety net — without this it would
+  silently protective-stop every spread leg on fill. AI-35a's leg-direction text was ambiguous
+  with no source lesson to resolve it, so both readings run simultaneously
+  (`source='spread'`=literal, `'spread_control'`=reversed) for Part 1's engine to judge later.
+  `spread.enabled: false` in config.
+- A dedicated code review of Parts 2/3 (the naked-position opt-out and the no-TP/no-SL
+  invariant especially) was run this session — see the review-agent findings, applied as
+  follow-up commits if any were confirmed; check `git log` for anything dated after this entry
+  if you need the exact outcome.
+
+**Dashboard rebuilt, v5.04 → v5.15** (`back-trading/trading_dashboard.py` — full detail in its
+own `_RELEASE_NOTES`, don't re-derive from scratch): Algo 1-5's separate Real/Control buttons
+consolidated to one per algo; Results screen's middle comparison panel fixed to actually follow
+the selected bucket; **nav fully redesigned** — Trading tab is now the default landing tab
+(was Overview), followed by Results, then a new **Allocation** tab (theoretical capacity plan
+merged with live "allocated/actual" usage per algorithm-family × symbol, built around IB's
+~15-resting-orders-per-symbol-per-side hard cap now shared across GevaExtract/Critical
+Line/Spread/Correlation), then Overview/Levels/Charts/Correlation/Algo Lab. Results screen
+top-level now shows exactly 4 buttons — GevaExtract, Critical Lines (drills into Algo 1-5),
+Spread, Correlation — Control/Critical Line/Algo Lab/Other fully hidden per explicit user
+choice. Trading tab's Today/Yesterday/All-days filter moved from the bottom to a second row
+near the top. Price ticker redesigned (bold symbol names, fresh/stale green/red coloring,
+shared last-fetch timestamp); broker/decider status badges now show green-when-genuinely-alive
+(previously flat gray for anything not launched via SessionManager, e.g. a manually-restarted
+process) via new launcher-agnostic `/api/process-health`; added a third "Market Data" indicator.
+
+**Two real incidents hit and fixed during this cycle:**
+1. IB Gateway stopped listening on 4001/4002 (recurring pattern, 09-08 through 09-12, no
+   auto-restart supervision) and broker.py/decider.py had both silently died — found, IB
+   Gateway brought back up by the user, both processes verified reconnected and restarted.
+   decider.py had a real bug surfaced by this: `_generate_for_symbols()` raised an uncaught
+   `ValueError` on a symbol with no live price (closed market) instead of skipping it like
+   `run_replenishment_loop()` already did — fixed, self-tested.
+2. **v5.15, 2026-09-12: dashboard hung ("stuck in hourglass, refreshes forever")** —
+   `/api/broker-queue` (polled every 5s by the now-default Trading tab) called
+   `_fetch_live_prices()`, which shells out to `ib_dayclean.py` for a fresh IB connect
+   (measured 7.3s/call live) *in the request thread*. Requests piled up faster than they
+   completed. Fixed by reading `price_cache` (`get_cached_price()`, kept fresh by
+   decider.py/broker.py) instead of a live IB round-trip on every poll — same root-cause
+   *class* as the v5.11→v5.12 `dcVerify()` regression (a subprocess-spawning IB call
+   auto-polled from the new default tab), not the same bug reappearing.
+
+**Results Research matrix — designed and pitched, nothing implemented yet.** The existing
+Compare tab (`tab-compare`, above) is a per-symbol *ranked list* of combos; the user wants a
+genuine multi-dimensional comparison tool for "hundreds of trades per day" volume — pick any
+two parameters (e.g. `tp_ticks` × `sl_ticks`, or `algo` × `symbol`) as a matrix's rows/columns,
+any metric (composite score, profit factor, win rate, MC p-value, LOOCV ratio) as the color,
+filter the rest down (symbol/algo/direction/min-fills/data-status), click a cell to see full
+stats + a fill sample + free-text notes, and star cells into a side-by-side compare tray. This
+stays **entirely manual by explicit design** — no auto-tuning, no config changes from this
+screen; it's a research/decision aid, not a control. A working interactive mockup (sample data,
+same schema shape as `cl_algo_combo_scores`) was built and shared with the user as a Claude
+artifact for design feedback — **status: pending user review, not yet built into
+`trading_dashboard.py`.** Do not start implementing this as a new dashboard tab until the user
+signs off on the interaction model; check with the user (or `git log`/the artifact's comment
+thread if still reachable) for the outcome before assuming this is still open.
 
 ---
 
