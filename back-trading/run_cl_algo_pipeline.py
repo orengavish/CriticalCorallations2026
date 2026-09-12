@@ -497,8 +497,16 @@ def _self_test() -> bool:
         # bug 6: cfg.paths.cl_algo_history must resolve to a real dir with tick CSVs
         # (this is what __main__ actually reads -- the synthetic run above uses its
         # own tmp hist_dir and never exercises the config path).
+        # 2026-09-12: was a bare get_config() -- lib.config_loader caches globally PER
+        # PROCESS and resolves the file nearest the *caller's* script when given no
+        # path, which for this file is back-trading/config.yaml (a separate file, with
+        # its own paths.db pointing at an isolated back-trading/data/backtest.db, NOT
+        # the live trader/data/galao.db that cl_algo_combo_scores' real 4500 rows and
+        # /api/algo-compare both actually live in/read from). Explicit path fixes it
+        # regardless of call order in-process (same footgun already fixed once in
+        # trading_dashboard.py's _trader_config()).
         from lib.config_loader import get_config
-        cfg = get_config()
+        cfg = get_config(_ROOT / "trader" / "config.yaml")
         real_hist_dir = Path(cfg.paths.cl_algo_history)
         assert real_hist_dir.exists(), (
             f"cfg.paths.cl_algo_history does not exist: {real_hist_dir}"
@@ -537,8 +545,12 @@ if __name__ == "__main__":
     if args.self_test:
         sys.exit(0 if _self_test() else 1)
 
+    # 2026-09-12: same explicit-path fix as _self_test() above -- a bare get_config()
+    # here resolves to back-trading/config.yaml (paths.db=data/backtest.db, an isolated
+    # sandbox DB) instead of the live trader/config.yaml (paths.db=data/galao.db, where
+    # cl_algo_combo_scores' real rows and every dashboard route actually live).
     from lib.config_loader import get_config
-    cfg      = get_config()
+    cfg      = get_config(_ROOT / "trader" / "config.yaml")
     db_path  = Path(cfg.paths.db)
     # bug 6: real tick CSVs live at cfg.paths.cl_algo_history, NOT db_path.parent/"history"
     # (which doesn't exist -- that path silently resolved to zero ready days).

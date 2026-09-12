@@ -138,7 +138,15 @@ paths:
   bars: data/bars.db          # 30m bars, read-only for algo_lab/correlation_lab
   critical_lines: data/critical_lines
   history: data/history
-  cl_algo_history: C:\Projects\CriticalCorallations2026\june\trader\data\history  # real tick CSVs live here (bug 6) -- NOT trader/data/history
+  # 2026-09-12: was C:\Projects\CriticalCorallations2026\june\trader\data\history (bug 6's
+  # fix) -- confirmed stale, stops at 2026-07-03. Per Fetcher2026's own OPERATIONS.md, the
+  # actually-live fetch destination moved to Galgo2026 at some point since; confirmed live
+  # C:\Projects\Galgo2026\june\trader\data\history has real MES/MNQ history through
+  # 2026-09-09/11 (the exact Sept research-line dates cl_algo_reason_scores needed and has
+  # never had). MYM/M2K still have no recent files at either path -- a separate,
+  # cross-repo fetch gap, not something this change fixes; cl_algo_reason_scores will
+  # populate for MES/MNQ only until that's addressed.
+  cl_algo_history: C:\Projects\Galgo2026\june\trader\data\history
   logs: logs
   versions: versions
 
