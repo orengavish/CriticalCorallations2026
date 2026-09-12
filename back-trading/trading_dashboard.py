@@ -1609,12 +1609,18 @@ def api_broker_queue():
         for f in filled:
             f["held_reason"] = "open position"
 
-        # Submitted rows: show the actual live-price gap to entry -- "resting at IB,
-        # waiting for fill" alone doesn't answer "how close is it". Ephemeral fetch
-        # (same helper Algo Lab already uses) rather than a new persistent connection
-        # just for this -- only a handful of distinct symbols typically have SUBMITTED
-        # orders at once, so the one-shot connect+fetch cost here is small.
-        live_prices = _fetch_live_prices(list({s["symbol"] for s in submitted})) if submitted else {}
+        # Submitted rows: show the price gap to entry -- "resting at IB, waiting for
+        # fill" alone doesn't answer "how close is it". 2026-09-12: this used to call
+        # _fetch_live_prices(), which shells out to ib_dayclean.py (up to a 30s IB
+        # connect) IN THE REQUEST THREAD -- fine for a one-off click, fatal for a route
+        # the Trading tab polls every 5s (now the default landing tab): a single slow
+        # call (measured 7.3s live, worse with market closed / Gateway unreachable)
+        # makes requests pile up faster than they finish, which is what "refreshes
+        # forever / stuck in hourglass" actually was. price_cache is already kept fresh
+        # by decider.py's replenishment loop (source='live_poll') and by broker.py on
+        # fill -- reuse that instead of a fresh IB round-trip on every poll.
+        from lib.db import get_cached_price
+        live_prices = {s["symbol"]: get_cached_price(con, s["symbol"]) for s in submitted}
         for s in submitted:
             live = live_prices.get(s["symbol"])
             if live is None:
@@ -2600,7 +2606,7 @@ body:not(.busy-wait) .busy-strip{background:var(--gl-border)}
     <!-- Header -->
     <div class="app-header">
       <span class="brand">Galao</span>
-      <span class="verchip">v5.14</span>
+      <span class="verchip">v5.15</span>
       <span class="gl-pill" id="session-broker-badge" style="color:var(--gl-muted)">Broker: —</span>
       <span class="gl-pill" id="session-decider-badge" style="color:var(--gl-muted)">Decider: —</span>
       <span class="gl-pill" id="market-data-badge" style="color:var(--gl-muted)">Market Data: —</span>
@@ -6213,6 +6219,21 @@ document.addEventListener('shown.bs.tab',function(e){
 # ── Release notes ─────────────────────────────────────────────────────────────
 
 _RELEASE_NOTES = [
+    ("v5.15", "Fix 'refreshes forever / stuck in hourglass' on the Trading tab",
+              "Root cause: /api/broker-queue called _fetch_live_prices() (shells out to "
+              "ib_dayclean.py, up to a 30s fresh IB connect) synchronously in the request "
+              "thread, to compute each SUBMITTED row's price gap. Trading is now the "
+              "default landing tab and polls this route every 5s; measured live at 7.3s "
+              "per call (worse with market closed), so requests piled up faster than they "
+              "finished -- the browser never got ahead, which is what 'stuck in hourglass' "
+              "actually was. Fixed by reading price_cache (get_cached_price(), already kept "
+              "fresh by decider.py/broker.py) instead of a live IB round-trip on every poll. "
+              "Also confirmed, per user's separate safety concern: zero commands were "
+              "created today (2026-09-12, a Saturday) -- the 106 PENDING / 28 SUBMITTED "
+              "rows the user saw are all from Friday 2026-09-11 during market hours "
+              "(sources research_ce/research_random/random_lmt/random_stp/random_mkt, all "
+              "legitimate existing algo/control sources), still resting because CME "
+              "futures reopen Sunday evening -- no trigger fired on a non-market day."),
     ("v5.14", "Third 'Market Data' indicator + broker/decider green-when-alive + readable ticker",
               "User report, three parts. (1) v5.13's dead-process alert only handled the "
               "confirmed-dead case -- a genuinely alive-but-not-SessionManager-launched "
