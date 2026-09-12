@@ -19,7 +19,7 @@ Self-test:
 
 import sys
 import argparse
-from datetime import datetime, time as dtime
+from datetime import datetime, time as dtime, timedelta
 from zoneinfo import ZoneInfo
 
 # 2026-09-12: ES/NQ/YM/RTY (full-size futures, capacity-allocation plan) added -- same
@@ -114,6 +114,40 @@ def is_forced_exit_time(symbol: str, now: datetime | None = None, cutoff_minutes
     return seconds_until_close(symbol, now) <= cutoff_minutes * 60
 
 
+def is_us_cash_session(now: datetime | None = None, entry_delay_minutes: float = 30) -> bool:
+    """
+    2026-09-12 (AI-34, correlation-trading.md): "correlation works best in the US cash
+    session... no correlation trading in the first 30 min of the US open." Deliberately
+    NOT symbol-dispatched like the functions above -- the 4 correlation symbols (MES/MNQ/
+    MYM/M2K) are traded as proxies for the underlying CASH indices per this module's own
+    _FUTURES_SYMBOLS docstring, but the rule itself is about NYSE cash-session timing
+    (9:30-16:00 America/New_York), not the futures contracts' own separate, much longer
+    session (which is why this uses _STOCK_TZ/_STOCK_OPEN/_STOCK_CLOSE directly rather
+    than routing through is_entry_cutoff("MES", ...) -- that would incorrectly use the
+    futures' own ~16:00 CT close, a different, later time than the 16:00 ET cash close).
+
+    True only from (cash open + entry_delay_minutes) through cash close; False before,
+    during the first entry_delay_minutes, at/after close, or on a weekend (Sat/Sun cash
+    market simply never "opens" that day under this same-day-only check). Does NOT
+    implement AI-34's Israel-morning DAX-proxy substitution -- that's a separate,
+    out-of-scope feature (no DAX/alternate-instrument watching exists in this system);
+    during that window this correctly just returns False, correlation goes quiet rather
+    than firing on the wrong session's timing.
+    """
+    now = now or datetime.now(ZoneInfo("UTC"))
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=ZoneInfo("UTC"))
+    local_now = now.astimezone(_STOCK_TZ)
+    if local_now.weekday() >= 5:  # Saturday=5, Sunday=6
+        return False
+    open_local = local_now.replace(hour=_STOCK_OPEN.hour, minute=_STOCK_OPEN.minute,
+                                    second=0, microsecond=0)
+    close_local = local_now.replace(hour=_STOCK_CLOSE.hour, minute=_STOCK_CLOSE.minute,
+                                     second=0, microsecond=0)
+    entry_start = open_local + timedelta(minutes=entry_delay_minutes)
+    return entry_start <= local_now < close_local
+
+
 def self_test() -> bool:
     try:
         utc = ZoneInfo("UTC")
@@ -159,6 +193,22 @@ def self_test() -> bool:
         assert is_before_trading_start("MES", t5, 30) is True
         t6 = datetime(2026, 9, 8, 9, 0, tzinfo=_FUTURES_TZ).astimezone(utc)
         assert is_before_trading_start("MES", t6, 30) is False
+
+        # is_us_cash_session (AI-34, 2026-09-12): 2026-09-08 is a Tuesday, ET times.
+        et = ZoneInfo("America/New_York")
+        # 9:45 ET -- 15 min after the 9:30 open, inside the 30-min entry-delay window.
+        assert is_us_cash_session(datetime(2026, 9, 8, 9, 45, tzinfo=et)) is False
+        # 10:00 ET -- exactly at the 30-min mark, session should be live.
+        assert is_us_cash_session(datetime(2026, 9, 8, 10, 0, tzinfo=et)) is True
+        # 11:30 ET -- comfortably mid-session.
+        assert is_us_cash_session(datetime(2026, 9, 8, 11, 30, tzinfo=et)) is True
+        # 16:00 ET -- exactly at the cash close, no longer live.
+        assert is_us_cash_session(datetime(2026, 9, 8, 16, 0, tzinfo=et)) is False
+        # 8:00 ET -- before the open at all (Israel-morning window, AI-34's DAX-proxy
+        # case -- correctly False, not the alternate instrument this doesn't implement).
+        assert is_us_cash_session(datetime(2026, 9, 8, 8, 0, tzinfo=et)) is False
+        # Saturday 2026-09-12, mid-day ET -- weekend, cash market never opens.
+        assert is_us_cash_session(datetime(2026, 9, 12, 11, 0, tzinfo=et)) is False
 
         print("[self-test] session_clock: PASS")
         return True

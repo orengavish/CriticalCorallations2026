@@ -52,6 +52,7 @@ from lib.order_builder import get_tick_size
 from lib.algo_pnl import SYMBOL_MULTIPLIERS
 from lib.atr import atr20_points
 from lib.logger import get_logger
+from lib.session_clock import is_us_cash_session
 
 log = get_logger("correlation_signal")
 
@@ -212,7 +213,22 @@ def check_correlation_signal(prices: dict, cfg, db_path, bars_db_path=None) -> i
     `prices`: {symbol: current_price}. Only symbols present (and in SYMBOLS)
     are processed -- a caller that can't get a live price for one symbol this
     cycle should omit it rather than pass a stale value.
+
+    2026-09-12 (AI-34, previously a confirmed but unimplemented rule -- found during
+    this session's strategic reliability review): "correlation works best in the US
+    cash session... no correlation trading in the first 30 min of the US open."
+    Gated here, at the very top, before any watch-state advancement -- this used to
+    run unconditionally on every poll cycle regardless of time of day. Deliberately
+    does NOT implement AI-34's Israel-morning DAX-proxy substitution (watching the
+    German DAX, trading Mini S&P off it) -- that's a separate, out-of-scope feature
+    with no existing DAX-watching code anywhere in this system; during that window
+    (and pre-open/after-close generally) this now correctly goes quiet rather than
+    firing on the wrong session's timing, which is strictly safer than the prior
+    always-on behavior even without the substitute implemented.
     """
+    if not is_us_cash_session():
+        return 0
+
     init_db(db_path)
     bars_db_path = bars_db_path or (Path(db_path).parent / "bars.db")
     date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -293,9 +309,19 @@ def check_correlation_signal(prices: dict, cfg, db_path, bars_db_path=None) -> i
 
 def self_test() -> bool:
     import tempfile
+    mod = sys.modules[__name__]
+    original_is_us_cash_session = mod.is_us_cash_session
     try:
         from lib.config_loader import get_config
         cfg = get_config()
+
+        # 2026-09-12 (AI-34 session gate, added this call): every existing test below
+        # exercises the break/retest/reclaim state machine itself, not time-of-day --
+        # neutralize the new gate here so this self-test doesn't spuriously fail
+        # depending on the real wall-clock moment it happens to run at (e.g. a weekend).
+        # The gate itself gets its own dedicated, time-controlled assertion further down,
+        # same convention as decider.py's is_entry_cutoff monkeypatch.
+        mod.is_us_cash_session = lambda **kw: True
 
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "test.db"
@@ -422,6 +448,23 @@ def self_test() -> bool:
                 ).fetchone()[0]
             assert armed3 == 0
 
+            # AI-34 gate itself (2026-09-12): mocked to False (not relying on
+            # whatever the real wall-clock happens to be when this runs -- the actual
+            # date/time logic is session_clock.py's own, separately self-tested job)
+            # -- a call outside the US cash session must return 0 immediately and
+            # touch NOTHING -- not even advance watch state -- regardless of what
+            # the prices would otherwise trigger.
+            mod.is_us_cash_session = lambda **kw: False
+            with get_db(db_path2) as con:
+                watch_count_before = con.execute("SELECT COUNT(*) FROM correlation_watch").fetchone()[0]
+            n_gated = check_correlation_signal(
+                {"MES": 9999.0, "MNQ": 9999.0, "MYM": 9999.0, "M2K": 9999.0}, cfg, db_path2)
+            assert n_gated == 0, "outside the US cash session, must return 0 unconditionally"
+            with get_db(db_path2) as con:
+                watch_count_after = con.execute("SELECT COUNT(*) FROM correlation_watch").fetchone()[0]
+            assert watch_count_after == watch_count_before, \
+                "gated-out call must not touch watch state at all, not just skip arming"
+
         print("[self-test] correlation_signal: PASS")
         return True
 
@@ -430,6 +473,8 @@ def self_test() -> bool:
         import traceback
         traceback.print_exc()
         return False
+    finally:
+        mod.is_us_cash_session = original_is_us_cash_session
 
 
 if __name__ == "__main__":
