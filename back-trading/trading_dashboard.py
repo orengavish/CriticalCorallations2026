@@ -2531,9 +2531,18 @@ body{font-size:.85rem;}
 .row-volume    {background:rgba(230,126,34,.12)!important;}
 .row-round     {background:rgba(127,140,141,.12)!important;}
 .price-chip{font-family:monospace;font-size:.8rem;padding:2px 8px;border-radius:4px;}
-body.busy-wait{cursor:wait!important;}
-body.busy-wait *{pointer-events:none!important;}
-body.busy-wait button,body.busy-wait input,body.busy-wait select{opacity:.55;}
+/* 2026-09-12: "better hourglass" -- the old body.busy-wait rules (removed) put a
+   cursor:wait over the ENTIRE page and pointer-events:none/disabled on EVERY button,
+   input and select while ANY single background fetch anywhere was in flight, even on
+   a tab the user wasn't looking at. That's what made the whole dashboard feel "stuck
+   loading" constantly -- user report. Now busy state only drives the slim top strip
+   (below) plus a small delayed toast for calls that are genuinely slow; nothing on
+   the page is ever frozen or made unclickable by it. */
+.busy-toast{position:fixed;top:44px;left:50%;transform:translateX(-50%) translateY(-6px);
+  opacity:0;pointer-events:none;transition:opacity .15s,transform .15s;
+  background:var(--gl-panel-2);border:1px solid var(--gl-border);color:var(--gl-muted);
+  font-size:11.5px;padding:5px 12px;border-radius:20px;z-index:2000;font-family:var(--gl-mono)}
+.busy-toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
 #top-bar{background:#161b22;height:40px;border-bottom:1px solid #30363d;display:flex;align-items:center;padding:0 8px;gap:0;overflow-x:auto;overflow-y:hidden;scrollbar-width:thin}
 #top-bar::-webkit-scrollbar{height:4px}
 #top-bar::-webkit-scrollbar-thumb{background:#30363d;border-radius:2px}
@@ -2629,7 +2638,6 @@ body{background:var(--gl-bg)!important}
   animation:gl-sweep 1.3s linear infinite}
 .busy-strip.idle::after{display:none}
 @keyframes gl-sweep{from{transform:translateX(-120%)}to{transform:translateX(320%)}}
-body:not(.busy-wait) .busy-strip{background:var(--gl-border)}
 
 /* Tabstrip (repurposed #top-bar / #mainTab) */
 #top-bar{background:var(--gl-panel-2)!important;height:36px!important;border-bottom:1px solid var(--gl-border)}
@@ -2876,7 +2884,7 @@ td.rr-empty{color:var(--gl-faint);font-size:11px;background:var(--gl-panel-2);bo
     <!-- Header -->
     <div class="app-header">
       <span class="brand">Galao</span>
-      <span class="verchip">v5.17</span>
+      <span class="verchip">v5.18</span>
       <span class="gl-pill" id="session-broker-badge" style="color:var(--gl-muted)">Broker: —</span>
       <span class="gl-pill" id="session-decider-badge" style="color:var(--gl-muted)">Decider: —</span>
       <span class="gl-pill" id="market-data-badge" style="color:var(--gl-muted)">Market Data: —</span>
@@ -2895,6 +2903,7 @@ td.rr-empty{color:var(--gl-faint);font-size:11px;background:var(--gl-panel-2);bo
 
     <!-- Unified busy indicator (replaces the old full-screen hourglass overlay) -->
     <div class="busy-strip idle" id="busy-strip"></div>
+    <div class="busy-toast" id="busy-toast">still working&hellip;</div>
 
     <div id="top-bar">
       <span class="rail-group-caption" id="rail-group-caption">Trading</span>
@@ -3806,24 +3815,29 @@ const SOURCE_COLORS={
 };
 
 // ── Busy state ────────────────────────────────────────────────────────────────
-let _busyCount=0,_busyDisabled=[];
+// 2026-09-12 "better hourglass": this used to add body.busy-wait (cursor:wait over
+// the WHOLE page + pointer-events:none/disabled on EVERY button/input/select) while
+// any single background fetch anywhere was in flight -- even on a tab the user
+// wasn't looking at. That's what made the dashboard feel permanently "stuck
+// loading" (user report). Now: the slim top strip always reflects real busy state
+// immediately, nothing on the page is ever frozen/disabled by it, and a small
+// toast only appears if a busy period runs past 500ms -- a normal ~0.2s fetch
+// never flashes anything, a genuinely slow one (the old broker-queue-hang class of
+// bug) gives clear "still working" feedback instead of silence.
+let _busyCount=0,_busyToastTimer=null;
 function _enterBusy(){
   if(++_busyCount===1){
-    document.body.classList.add('busy-wait');
     document.getElementById('busy-strip')?.classList.remove('idle');
-    _busyDisabled=[];
-    document.querySelectorAll('button:not(:disabled),input:not(:disabled),select:not(:disabled)').forEach(el=>{
-      _busyDisabled.push(el);el.disabled=true;
-    });
+    clearTimeout(_busyToastTimer);
+    _busyToastTimer=setTimeout(()=>{ document.getElementById('busy-toast')?.classList.add('show'); }, 500);
   }
 }
 function _exitBusy(){
   if(--_busyCount<=0){
     _busyCount=0;
-    document.body.classList.remove('busy-wait');
     document.getElementById('busy-strip')?.classList.add('idle');
-    _busyDisabled.forEach(el=>el.disabled=false);
-    _busyDisabled=[];
+    clearTimeout(_busyToastTimer);
+    document.getElementById('busy-toast')?.classList.remove('show');
   }
 }
 const STATUS_CLS={PENDING:'secondary',SUBMITTED:'primary',SUBMITTING:'info',
@@ -4024,12 +4038,12 @@ function setAllAlgos(checked){
 }
 
 async function buildLinesDB(force){
-  _enterBusy();
   const msg=document.getElementById('build-db-msg');
   const algos=[...document.querySelectorAll('.algo-chk:checked')].map(e=>e.value);
   const mergeThr=parseFloat(document.querySelector('input[name="merge-thr"]:checked')?.value||'16');
   msg.className='small text-warning ms-1';
   msg.textContent=force?'Force creating...':'Creating missing...';
+  _enterBusy();
   try{
     const r=await (await fetch('/api/build_db',{method:'POST',
       headers:{'Content-Type':'application/json'},
@@ -4866,11 +4880,11 @@ document.querySelectorAll('#mainTab .top-tab').forEach(btn=>{
 let _candidates=[];
 
 async function createTrades(){
-  _enterBusy();
   const syms=checkedVals('sym-trades');
   const brackets=[...document.querySelectorAll('.bkt-chk:checked')].map(e=>parseFloat(e.value));
   const ms=parseInt(document.getElementById('min-str-trades').value)||1;
   document.getElementById('trades-msg').textContent='Generating...';
+  _enterBusy();
   try{
     const d=await (await fetch('/api/trades/create',{method:'POST',
       headers:{'Content-Type':'application/json'},
@@ -4913,9 +4927,9 @@ function renderTrades(cands){
 
 async function submitTrades(){
   if(!_candidates.length)return;
-  _enterBusy();
   const btn=document.getElementById('btn-submit');
   btn.disabled=true;
+  _enterBusy();
   try{
     const d=await (await fetch('/api/trades/submit',{method:'POST',
       headers:{'Content-Type':'application/json'},
@@ -6910,6 +6924,22 @@ document.addEventListener('shown.bs.tab',function(e){
 # ── Release notes ─────────────────────────────────────────────────────────────
 
 _RELEASE_NOTES = [
+    ("v5.18", "'Better hourglass': busy state no longer freezes the whole page",
+              "User asked twice for a better hourglass and kept reporting the dashboard as "
+              "'still loading' even after v5.17's dcVerify fix. Root cause: _enterBusy()/"
+              "_exitBusy() added body.busy-wait, which put cursor:wait over the ENTIRE page "
+              "and pointer-events:none + disabled on EVERY button/input/select while ANY "
+              "single background fetch anywhere was in flight -- even on a tab the user wasn't "
+              "looking at. That's what made the dashboard feel permanently stuck regardless of "
+              "which specific call was slow. Removed entirely: busy state now only drives the "
+              "slim top strip (unchanged) plus a small toast that appears if a busy period runs "
+              "past 500ms ('still working...') -- nothing on the page is ever frozen or made "
+              "unclickable by it again, and a normal ~0.2s fetch never flashes anything. Also "
+              "fixed 3 latent bugs this design flaw was hiding: buildLinesDB()/createTrades()/"
+              "submitTrades() called _enterBusy() BEFORE synchronous DOM reads that could throw "
+              "(e.g. a missing element) -- if any of those ever threw, _exitBusy() would never "
+              "run and the busy state would get stuck permanently. Reordered so _enterBusy() "
+              "only wraps the actual fetch, matching every other call site's existing pattern."),
     ("v5.17", "Fix recurring background dcVerify() poll on Broker tab clicks; clarify Closed-range scope",
               "User report: 'the trading is doing something in the background while it is loaded... "
               "every time I'm going there, there is some huge, very slow one' plus a periodically-"
