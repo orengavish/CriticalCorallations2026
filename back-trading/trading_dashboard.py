@@ -2515,9 +2515,49 @@ HTML = r"""<!doctype html>
 <title>Trading Dashboard</title>
 <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%23212529'/%3E%3Crect x='4' y='20' width='5' height='9' rx='1' fill='%23198754'/%3E%3Cline x1='6.5' y1='12' x2='6.5' y2='20' stroke='%23198754' stroke-width='1.5'/%3E%3Crect x='4' y='12' width='5' height='4' rx='1' fill='%23198754' opacity='.4'/%3E%3Crect x='13' y='8' width='5' height='21' rx='1' fill='%230d6efd'/%3E%3Cline x1='15.5' y1='4' x2='15.5' y2='8' stroke='%230d6efd' stroke-width='1.5'/%3E%3Crect x='13' y='4' width='5' height='5' rx='1' fill='%230d6efd' opacity='.4'/%3E%3Crect x='22' y='14' width='5' height='15' rx='1' fill='%23dc3545'/%3E%3Cline x1='24.5' y1='7' x2='24.5' y2='14' stroke='%23dc3545' stroke-width='1.5'/%3E%3Crect x='22' y='7' width='5' height='5' rx='1' fill='%23dc3545' opacity='.4'/%3E%3C/svg%3E">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<!-- 2026-09-12: user report -- page refresh took 5+ seconds with nothing but the
+     browser's own default cursor/spinner visible the whole time. Root cause: these
+     two <script> tags used to sit here in <head>, with no defer/async -- the
+     browser was blocked from parsing anything past <head> (including the
+     #page-splash markup right after <body>, and every CSS rule below) until
+     Bootstrap's JS bundle and Plotly (a large library) finished downloading from
+     their CDNs. Moved both down to just before this file's own big inline <script>
+     (search "app's own script" below) instead of adding defer -- 32 call sites in
+     that script call bootstrap.Modal(...)/Plotly.*() and its relative execution
+     order against these two is easy to get wrong with defer (a deferred script's
+     execution is held until AFTER the whole document finishes parsing, which is
+     LATER than a classic synchronous script positioned after it in the document --
+     exactly backwards from what's needed here). This way <head>/<body> parse and
+     paint immediately (including the splash), execution order relative to the app
+     script is completely unchanged from before, and only the *position* moved. -->
 <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
-<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
-<script src="https://cdn.plot.ly/plotly-2.32.0.min.js"></script>
+<!-- Page-load splash: a faithful recreation of v4.12's own hourglass overlay (user
+     specifically remembered and asked for this back -- removed in v5.00 only
+     because it was reused as the general per-fetch busy indicator and froze the
+     whole page on every background poll. Used ONLY here now, for the one-time
+     initial page load, where a brief full-screen moment is genuinely appropriate
+     since the page isn't usable yet anyway; the lightweight strip+toast pair
+     introduced in v5.18 remains the indicator for everything after that i.e. every
+     background fetch while the page is already up.) Self-contained inline style,
+     zero dependency on the CDN links above or the big stylesheet below, so it
+     paints immediately regardless of network speed. -->
+<style>
+#page-splash{position:fixed;inset:0;z-index:99999;background:#12141a;
+  display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;
+  font-family:"SF Mono","Cascadia Code","Consolas","Roboto Mono",ui-monospace,monospace;
+  transition:opacity .25s ease;}
+#page-splash.hide{opacity:0;pointer-events:none;}
+#page-splash .glass{font-size:4rem;line-height:1;animation:splash-flip 1s ease-in-out infinite;
+  filter:drop-shadow(0 0 10px rgba(255,193,7,.7));}
+#page-splash .brand{color:#d98d2b;font-weight:700;font-size:1.05rem;letter-spacing:.05em}
+#page-splash .label{color:#eae7df;font-size:.8rem;letter-spacing:.05em;text-shadow:0 1px 3px #000}
+@keyframes splash-flip{
+  0%   {transform:rotate(0deg)   scale(1)}
+  45%  {transform:rotate(180deg) scale(1.15)}
+  55%  {transform:rotate(180deg) scale(1.15)}
+  100% {transform:rotate(360deg) scale(1)}
+}
+</style>
 <style>
 body{font-size:.85rem;}
 .source-ohlc      {background:#4e79a7;color:#fff;}
@@ -2864,6 +2904,29 @@ td.rr-empty{color:var(--gl-faint);font-size:11px;background:var(--gl-panel-2);bo
 </head>
 <body>
 
+<div id="page-splash">
+  <span class="glass">&#8987;</span>
+  <div class="brand">Galao</div>
+  <div class="label">Loading&hellip;</div>
+</div>
+<script>
+// Hides on window 'load' (all deferred scripts + assets actually done, not just
+// DOMContentLoaded) -- matches "the page is genuinely ready," not just "parsed."
+// A fallback timeout removes it regardless in case 'load' never fires for some
+// reason (e.g. a CDN completely unreachable) -- this must never be able to leave
+// a permanent full-screen overlay up, unlike the v4.12 original it's modeled on.
+(function(){
+  function hide(){
+    var el=document.getElementById('page-splash');
+    if(!el) return;
+    el.classList.add('hide');
+    setTimeout(function(){ el.remove(); }, 300);
+  }
+  window.addEventListener('load', hide);
+  setTimeout(hide, 8000);
+})();
+</script>
+
 <div class="app-shell">
 
   <!-- ══════════════════════ LEFT RAIL ══════════════════════ -->
@@ -2890,7 +2953,7 @@ td.rr-empty{color:var(--gl-faint);font-size:11px;background:var(--gl-panel-2);bo
     <!-- Header -->
     <div class="app-header">
       <span class="brand">Galao</span>
-      <span class="verchip">v5.20</span>
+      <span class="verchip">v5.21</span>
       <span class="gl-pill" id="session-broker-badge" style="color:var(--gl-muted)">Broker: —</span>
       <span class="gl-pill" id="session-decider-badge" style="color:var(--gl-muted)">Decider: —</span>
       <span class="gl-pill" id="market-data-badge" style="color:var(--gl-muted)">Market Data: —</span>
@@ -3813,6 +3876,12 @@ td.rr-empty{color:var(--gl-faint);font-size:11px;background:var(--gl-panel-2);bo
   </div><!-- main-col -->
 </div><!-- app-shell -->
 
+<!-- moved here from <head> (2026-09-12, see the comment up there) -- execution
+     order unchanged (Bootstrap -> Plotly -> app's own script below, all classic
+     synchronous scripts in document order), only the position moved so <head> and
+     all of the visible HTML above (including #page-splash) parse/paint first. -->
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+<script src="https://cdn.plot.ly/plotly-2.32.0.min.js"></script>
 <script>
 // ── Constants ─────────────────────────────────────────────────────────────────
 const SOURCE_COLORS={
@@ -6948,6 +7017,27 @@ document.addEventListener('shown.bs.tab',function(e){
 # ── Release notes ─────────────────────────────────────────────────────────────
 
 _RELEASE_NOTES = [
+    ("v5.21", "Bring back the v4.12 hourglass as a page-load splash; fix the 5s blank-page load",
+              "User specifically remembered and asked for v4.12's full-screen hourglass overlay "
+              "back (removed in v5.00 when it was reused as the general per-fetch busy indicator "
+              "and froze the whole page on every background poll -- that reuse is NOT restored, "
+              "the v5.18 lightweight strip+toast stays the indicator for every fetch after initial "
+              "load). Recreated faithfully (same 4rem flip+scale hourglass, amber glow, dark "
+              "overlay) but scoped to ONLY the one-time initial page load, where a brief "
+              "full-screen moment is genuinely fine since the page isn't usable yet anyway. "
+              "Separately root-caused the '5+ seconds, nothing but the browser's own default "
+              "spinner' complaint: the Bootstrap JS bundle and Plotly <script> tags sat in <head> "
+              "with no defer/async, so the browser couldn't parse or paint ANYTHING past <head> -- "
+              "including the new splash markup -- until both finished downloading from their "
+              "CDNs. Considered adding defer, rejected it: 32 call sites in this file's own inline "
+              "script call bootstrap.Modal(...)/Plotly.*(), and defer's execution timing relative "
+              "to a classic script positioned after it is easy to get backwards. Moved both "
+              "<script> tags down to immediately before the app's own inline script instead -- "
+              "execution order is completely unchanged, only the position moved, so <head> and "
+              "all visible HTML (the splash included) now parse and paint immediately while those "
+              "two still load in the background. Splash hides on window 'load' with an 8s hard "
+              "fallback so it can never itself get stuck the way the old overlay's replacement "
+              "did earlier this session."),
     ("v5.20", "Busy-state watchdog: 'still working...' toast can no longer stick forever",
               "User screenshot showed the v5.18 toast stuck permanently visible on the Broker "
               "tab, long after any real fetch should have finished -- direct evidence _busyCount "
