@@ -1,6 +1,6 @@
 # Claude State — CriticalCorallations2026
 > **Living doc. Update every time scope changes, a task completes, or context shifts.**
-> rev 2 · Last updated: 2026-09-12
+> rev 3 · Last updated: 2026-09-12
 
 ---
 
@@ -70,20 +70,39 @@ process) via new launcher-agnostic `/api/process-health`; added a third "Market 
    *class* as the v5.11→v5.12 `dcVerify()` regression (a subprocess-spawning IB call
    auto-polled from the new default tab), not the same bug reappearing.
 
-**Results Research matrix — designed and pitched, nothing implemented yet.** The existing
-Compare tab (`tab-compare`, above) is a per-symbol *ranked list* of combos; the user wants a
-genuine multi-dimensional comparison tool for "hundreds of trades per day" volume — pick any
-two parameters (e.g. `tp_ticks` × `sl_ticks`, or `algo` × `symbol`) as a matrix's rows/columns,
-any metric (composite score, profit factor, win rate, MC p-value, LOOCV ratio) as the color,
-filter the rest down (symbol/algo/direction/min-fills/data-status), click a cell to see full
-stats + a fill sample + free-text notes, and star cells into a side-by-side compare tray. This
-stays **entirely manual by explicit design** — no auto-tuning, no config changes from this
-screen; it's a research/decision aid, not a control. A working interactive mockup (sample data,
-same schema shape as `cl_algo_combo_scores`) was built and shared with the user as a Claude
-artifact for design feedback — **status: pending user review, not yet built into
-`trading_dashboard.py`.** Do not start implementing this as a new dashboard tab until the user
-signs off on the interaction model; check with the user (or `git log`/the artifact's comment
-thread if still reachable) for the outcome before assuming this is still open.
+**Results Research matrix — SHIPPED, v5.16 (`7a2feea`).** Iterated as a standalone Claude
+artifact mockup first (4-method overview → per-method drill-down → per-method "facet by" a
+3rd dimension), approved by the user, then implemented for real and replaced the old
+single-symbol Compare tab (`tab-compare` — same nav slot/id, new content; old `/api/algo-compare`
+route + `cl_algo_combo_scores`/`cl_algo_reason_scores` tables untouched, still reachable).
+
+- **Overview**: live-performance cards for GevaExtract/Critical Lines/Spread/Correlation, built
+  from the same `commands`+`critical_lines` join `api_closed_stats` already used (reuses
+  `_bucket_for`/`_summarize`, not reinvented). Filter rail (symbol, buy/sell, order type,
+  bracket size, algorithm, real/control) narrows only the methods each field actually applies to.
+- **Drill-down**: real parameter matrix per method — pick any 2 of that method's own real fields
+  as rows/columns, an optional 3rd as facet (e.g. Critical Lines faceted by Algorithm shows all
+  5 algos' symbol×bracket-size grids at once — the "within one algorithm, different symbols,
+  different brackets" comparison this was built for), color by win%/profit-factor/net-$.
+- New routes `/api/results-research/{overview,matrix}`.
+- **Scope cut, decided against the original mockup**: `cl_algo_combo_scores` exists but is
+  MES-only (4500 rows, one symbol) and its `algo_type` axis is a backtest *entry-style* label
+  (BOTH/BOUNCE/BREAKOUT/DIRECTIONAL/FADE), **not** the live WINNING_REASON "Algo 1-5" labels the
+  Results tab uses — these are two different real tables/taxonomies. Unifying them into one
+  matrix is real follow-up work, not attempted here. Shipped a **live-trade-aggregate** matrix
+  instead (symbol/direction/entry_type/bracket_size, +algo for Critical Lines, +control for
+  Spread/Correlation) — works today for every method. Verified live: GevaExtract n=26 closed
+  fills, Critical Lines n=2, Spread/Correlation n=0 (both still `cfg.*.enabled=false`) — honestly
+  sparse where the data actually is sparse, not faked.
+- New self-test (`_self_test_results_research()`, called from the file's existing `self_test()`)
+  covers per-family card isolation, cross-field filtering, matrix grouping, facet slicing, and
+  the 400-on-invalid-field guard. Full regression sweep of every existing route re-run clean
+  after the change (one transient 500 on `/api/session/status` during testing turned out to be
+  leftover state from repeated manual process kill/restart churn during verification, not a
+  real regression — confirmed by a clean restart).
+- **Next natural step, not started**: wiring `cl_algo_combo_scores` in as a second, richer data
+  source specifically for Critical Lines (real MC p-value/LOOCV confidence, once it covers more
+  than MES) — worth it once that table has multi-symbol coverage, not before.
 
 ---
 
