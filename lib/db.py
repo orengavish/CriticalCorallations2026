@@ -1023,10 +1023,11 @@ def spawn_replenishment(con, parent_cmd, price: float, tick: float) -> int:
 
 def compute_side_resting(con, symbol: str, direction: str) -> int:
     """
-    Real IB-facing exposure on one symbol/side: same-direction entries (SUBMITTED or
-    unresolved FILLED) plus 2x opposite-direction entries -- a bracket rests its TP+SL
-    on the OPPOSITE side the instant it's submitted, so each opposite-direction entry
-    already contributes 2 resting legs to THIS side.
+    Real IB-facing exposure on one symbol/side: same-direction RESTING entries
+    (SUBMITTED, not yet filled) plus 2x opposite-direction healthy-FILLED entries --
+    a bracket rests its TP+SL on the OPPOSITE side the instant it's submitted, so
+    each opposite-direction FILLED entry already contributes 2 resting legs to THIS
+    side.
 
     Lives here (not in broker.py, where this logic originated) so trading_dashboard.py
     can reuse the exact same admission-cap math for its "at cap" reporting without
@@ -1041,11 +1042,20 @@ def compute_side_resting(con, symbol: str, direction: str) -> int:
     commands were actually being held back on every cycle (confirmed live: M2K/MYM
     SELL commands stuck PENDING at ~11 resting, dashboard reported 0) -- broker.py now
     imports this instead of keeping its own copy, so the two can't drift apart again.
+
+    2026-09-13 fix (full-system audit): same_side used to ALSO count FILLED
+    same-direction commands, on top of SUBMITTED ones. A FILLED entry's own order
+    has already executed -- nothing of it rests on ITS OWN side anymore, only its
+    TP/SL (2 legs) rest on the OPPOSITE side, which the opposite-side term already
+    counts. Counting it a second time here silently tightened the cap below IB's
+    real limit, throttling legitimate new same-direction signals sooner than
+    necessary as more commands filled over a session -- not a safety violation
+    (fails safe, never let more through than intended), but a real, growing loss
+    of usable capacity. Fixed by dropping FILLED from the same-side term entirely.
     """
     opposite = "SELL" if direction == "BUY" else "BUY"
     same_side_entries = con.execute(
-        "SELECT COUNT(*) FROM commands WHERE symbol=? AND direction=?"
-        " AND (status='SUBMITTED' OR (status='FILLED' AND needs_review=0))",
+        "SELECT COUNT(*) FROM commands WHERE symbol=? AND direction=? AND status='SUBMITTED'",
         (symbol, direction)
     ).fetchone()[0]
     opposite_side_legs = con.execute(
@@ -1058,9 +1068,11 @@ def compute_side_resting(con, symbol: str, direction: str) -> int:
 
 def compute_family_pool_resting(con, family_sources: set, pool_symbols: list, direction: str) -> int:
     """
-    2026-09-12, capacity-allocation plan: the same IB-realistic "same-direction entries
-    + 2x opposite-direction entries" formula as compute_side_resting() above, but
-    scoped to one algorithm family's own commands.source values AND one symbol pool
+    2026-09-12, capacity-allocation plan: the same IB-realistic "same-direction
+    RESTING entries + 2x opposite-direction healthy-FILLED entries" formula as
+    compute_side_resting() above (see its docstring, including the 2026-09-13
+    same-side-FILLED-double-count fix -- mirrored here identically), but scoped
+    to one algorithm family's own commands.source values AND one symbol pool
     (both contracts of a futures pair, e.g. MES+ES, or a single stock) -- lets
     lib.allocation.check_admission() enforce a family's specific slot allocation on
     top of (not instead of) the flat per-symbol cap compute_side_resting() already
@@ -1072,15 +1084,18 @@ def compute_family_pool_resting(con, family_sources: set, pool_symbols: list, di
     if not family_sources or not pool_symbols:
         return 0
 
-    def _count(dir_):
+    def _count(dir_, include_filled):
+        status_clause = (
+            "(status='SUBMITTED' OR (status='FILLED' AND needs_review=0))"
+            if include_filled else "status='SUBMITTED'"
+        )
         return con.execute(
             f"SELECT COUNT(*) FROM commands WHERE symbol IN ({sym_placeholders})"
-            f" AND direction=? AND source IN ({src_placeholders})"
-            " AND (status='SUBMITTED' OR (status='FILLED' AND needs_review=0))",
+            f" AND direction=? AND source IN ({src_placeholders}) AND {status_clause}",
             (*pool_symbols, dir_, *family_sources)
         ).fetchone()[0]
 
-    return _count(direction) + _count(opposite) * 2
+    return _count(direction, include_filled=False) + _count(opposite, include_filled=True) * 2
 
 
 def get_pending_commands(con, symbol: str = None) -> list:

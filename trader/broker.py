@@ -1674,6 +1674,32 @@ def self_test() -> bool:
                 s = con.execute("SELECT status FROM commands WHERE id=?", (id_opposite,)).fetchone()["status"]
             assert s == "PENDING", f"opposite-side TP/SL legs should count toward the cap: {s}"
 
+            #    8d2. 2026-09-13 fix: FILLED same-direction commands must NOT ALSO
+            #    count toward their own side's resting count -- their entry order has
+            #    already executed, only their TP/SL (on the OPPOSITE side) still rest.
+            #    `cap` healthy FILLED BUY commands on a fresh symbol used to make the
+            #    BUY side look completely full (same_side_entries==cap) and block a
+            #    brand-new BUY even though nothing of theirs actually rests on the BUY
+            #    side anymore -- silently tighter than IB's real limit.
+            for _ in range(cap):
+                _insert_cmd(symbol='YM', direction='BUY', status='FILLED', needs_review=0)
+            with get_db(db_path) as con:
+                con.execute("""
+                    INSERT INTO commands
+                        (symbol, line_price, line_type, line_strength,
+                         direction, entry_type, entry_price, tp_price, sl_price, bracket_size)
+                    VALUES ('YM', 40012.0, 'SUPPORT', 2, 'BUY', 'LMT', 40012.0, 40022.0, 40002.0, 10.0)
+                """)
+                id_filled_same_side = con.execute("SELECT last_insert_rowid()").fetchone()[0]
+            # YM's tick is 1.0 (vs MES/MNQ's 0.25), so its 8-tick Gate 2 buffer is 8pts,
+            # not 2 -- entry offset above widened to clear it (a 4pt gap tripped "stale").
+            process_pending_commands(_FakeIBClient(price=40000.0), db_path, cfg)
+            with get_db(db_path) as con:
+                s2 = con.execute("SELECT status FROM commands WHERE id=?",
+                                  (id_filled_same_side,)).fetchone()["status"]
+            assert s2 == "SUBMITTED", \
+                f"FILLED same-direction commands must not double-count toward their own side: {s2}"
+
             #    8e. per-family allocation cap (2026-09-12, capacity-allocation plan):
             #    Critical Line's own share of the MES+ES pool is 5, well under the flat
             #    per-symbol cap of 10 -- so a 6th research_ce command on MES must be held
