@@ -1590,7 +1590,7 @@ def api_broker_queue():
     that filter is why the old Submitted tab shows almost nothing real).
     """
     cols = ("id, symbol, direction, entry_type, entry_price, tp_price, sl_price,"
-            " bracket_size, source, status, needs_review, fill_price, created_at, updated_at")
+            " bracket_size, source, status, needs_review, review_note, fill_price, created_at, updated_at")
 
     def rows(con, status):
         return [dict(r) for r in con.execute(
@@ -3116,7 +3116,7 @@ td.rr-empty{color:var(--gl-faint);font-size:11px;background:var(--gl-panel-2);bo
     <!-- Header -->
     <div class="app-header">
       <span class="brand">Galao</span>
-      <span class="verchip">v5.25</span>
+      <span class="verchip">v5.26</span>
       <span class="gl-pill" id="session-broker-badge" style="color:var(--gl-muted)">Broker: —</span>
       <span class="gl-pill" id="session-decider-badge" style="color:var(--gl-muted)">Decider: —</span>
       <span class="gl-pill" id="market-data-badge" style="color:var(--gl-muted)">Market Data: —</span>
@@ -5313,7 +5313,7 @@ function _bkRow(r,bucket){
     extra = `<span>${fmt(r.entry_price)}</span>`+
             (r.tp_price!=null?`<span class="dir-buy">${fmt(r.tp_price)}</span>`:'')+
             (r.sl_price!=null?`<span class="dir-sell">${fmt(r.sl_price)}</span>`:'')+
-            (r.needs_review?'<span class="rev">&#9888; review</span>':'');
+            (r.needs_review?`<span class="rev" title="${(r.review_note||'').replace(/"/g,'&quot;')}">&#9888; review</span>`:'');
   }
   const status = r.held_reason ? `<span class="src" title="status">${r.held_reason}</span>` : '';
   return `<div class="broker-row${justArrived}" data-id="${bucket}:${r.id}">`+
@@ -7479,6 +7479,14 @@ document.addEventListener('shown.bs.tab',function(e){
 # ── Release notes ─────────────────────────────────────────────────────────────
 
 _RELEASE_NOTES = [
+    ("v5.26", "Surface review_note as a tooltip on the '⚠ review' badge",
+              "Found via a full-system code-quality audit: broker.py's flag_needs_review() "
+              "writes a human-readable diagnostic (e.g. 'TP/SL order ids (X, Y) both missing "
+              "from IB trades') into commands.review_note, but nothing anywhere read it back -- "
+              "the Broker queue's own review badge showed a generic '⚠ review' with zero context "
+              "on why. Added review_note to /api/broker-queue's column list and as a title= "
+              "tooltip on the badge -- the whole point of that column (telling a human WHY "
+              "something needs review) was previously defeated entirely."),
     ("v5.25", "Fix stale futures/stock symbol lists (full-system audit)",
               "Found via a cross-cutting architecture audit: this file's own TICKS dict "
               "(futures-only, 0.25 default fallback) and _FUTURES tuple (4 micro futures) "

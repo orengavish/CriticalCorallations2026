@@ -6,7 +6,11 @@ monitors fills, and writes status back to DB.
 
 Key invariants:
 - Writes status=SUBMITTING (claim lock) before calling IB (R-ORD-12)
-- Polls open orders every broker.ib_poll_seconds for fill detection
+- Fills (entry and TP/SL exit) are detected primarily via IB's execDetailsEvent,
+  near-instantly (_handle_exec_fill/_handle_exec_exit, 2026-09-12) -- polling
+  open orders every broker.ib_poll_seconds is now only the backstop for
+  whatever that event path misses, not the primary detection path this
+  docstring originally described.
 - Reconnects on disconnect (R-ERR-01)
 - Never touches LIVE connection (data only via IBClient)
 - Session stops when SESSION=SHUTDOWN appears in system_state
