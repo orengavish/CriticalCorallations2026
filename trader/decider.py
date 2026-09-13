@@ -523,7 +523,32 @@ def run_session_start(ibc, cfg, db_path, date_str: str = None):
     Session start: read critical lines already in DB (entered via GUI),
     fetch price, generate all commands.
     Called once at the beginning of a trading session.
+
+    2026-09-13: found live via a cross-cutting architecture audit -- this used to
+    run unconditionally, with NO check of SESSION state, and unconditionally set
+    SESSION=RUNNING at the end regardless of what it was before. Real incident
+    chain this enabled: operator clicks "Stop Session" (session.py's
+    SessionManager.stop() sets SESSION=SHUTDOWN and kills its child processes) ->
+    within <=2 min the CC2026Decider Scheduled Task watchdog relaunches
+    `decider.py --mode session` (singleton lock is free again, the old process
+    already exited) -> this fresh process called run_session_start() with no
+    shutdown check at all, generating brand-new commands AND flipping SESSION
+    back to RUNNING -> within another <=2 min CC2026Broker's own watchdog
+    relaunches broker.py, which sees SESSION=RUNNING and resumes submitting
+    orders -- "Stop Session" silently self-reversed within minutes, with no
+    operator action. Every OTHER shutdown-sensitive path in this file
+    (run_replenishment_loop's own loop, _replenish_single, see R-SHD-07) already
+    checks _is_shutdown() -- this was the one gap. Now: a SHUTDOWN mid-session-
+    start is authoritative and sticky -- skip everything (no command generation,
+    SESSION left exactly as SHUTDOWN) until a human explicitly restarts via
+    SessionManager.start(), which is the only thing that clears SESSION back to
+    RUNNING before a fresh run_session_start() gets to run at all.
     """
+    if _is_shutdown(db_path):
+        log.info("SESSION=SHUTDOWN — run_session_start() skipping entirely "
+                  "(a deliberate stop must stay stopped until explicitly restarted)")
+        return
+
     date_str = date_str or date.today().strftime("%Y-%m-%d")
 
     futures_symbols = [s for s in cfg.symbols if s in _FUTURES_SYMBOLS]
@@ -1037,6 +1062,38 @@ def self_test() -> bool:
         _this_source = Path(__file__).read_text()
         assert "ibc.connect(live=True, paper=True)" in _this_source, \
             "decider.py's __main__ must connect paper=True -- force_close_symbol needs ibc.paper"
+
+        # 6. run_session_start() must be a total no-op when SESSION=SHUTDOWN --
+        # 2026-09-13 fix for a real incident chain: SessionManager.stop() sets
+        # SESSION=SHUTDOWN with no equivalent "flip it back" anywhere except this
+        # function's own tail (it used to run unconditionally and always end by
+        # setting SESSION=RUNNING). With the CC2026Decider Scheduled Task watchdog
+        # relaunching `decider.py --mode session` every <=2 min (singleton lock
+        # free again once the stopped process exits), that meant "Stop Session"
+        # silently self-reversed within minutes -- a fresh decider process would
+        # generate brand-new commands AND flip SESSION back to RUNNING with zero
+        # operator action, and the next CC2026Broker tick would then resume
+        # submitting them. SessionManager.start() clears SHUTDOWN to "STARTING"
+        # before ever launching anything (session.py's _clear_stale_shutdown()),
+        # so this guard only ever blocks the watchdog's own blind relaunch, never
+        # a real operator-initiated start.
+        with tempfile.TemporaryDirectory() as tmp6:
+            db_path6 = Path(tmp6) / "test6.db"
+            init_db(db_path6)
+            today6 = date.today().strftime("%Y-%m-%d")
+            with get_db(db_path6) as con:
+                set_system_state(con, "SESSION", "SHUTDOWN")
+                con.execute(
+                    "INSERT INTO critical_lines (symbol, date, line_type, price, strength, source, armed)"
+                    " VALUES ('MES', ?, 'SUPPORT', 100.0, 1, 'geva_manual', 1)",
+                    (today6,)
+                )
+            run_session_start(None, None, db_path6)
+            with get_db(db_path6) as con:
+                assert get_system_state(con, "SESSION") == "SHUTDOWN", \
+                    "must stay SHUTDOWN, not flip back to RUNNING"
+                n_cmds = con.execute("SELECT COUNT(*) FROM commands").fetchone()[0]
+                assert n_cmds == 0, "must not generate any commands while SESSION=SHUTDOWN"
 
         print("[self-test] decider: PASS")
         return True
