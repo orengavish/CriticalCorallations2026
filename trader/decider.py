@@ -433,7 +433,19 @@ def force_close_symbol(symbol: str, db_path, ibc) -> int:
         filled = con.execute(
             "SELECT * FROM commands WHERE symbol=? AND status='FILLED'", (symbol,)
         ).fetchall()
-    if not filled:
+        # 2026-09-13 fix, found via a full-system audit: this function used to ONLY
+        # look at FILLED commands -- a resting (PENDING/SUBMITTED) entry order for
+        # this symbol was never touched at all, even though the whole point of
+        # entering the forced-exit window is to make the symbol flat and safe going
+        # into the close. CME futures trade nearly 24/5, so an untouched resting
+        # STP/LMT entry could trigger well after decider.py's active session,
+        # opening a brand-new, completely unmonitored position overnight.
+        resting_entries = con.execute(
+            "SELECT * FROM commands WHERE symbol=? AND status IN ('PENDING','SUBMITTED')",
+            (symbol,)
+        ).fetchall()
+
+    if not filled and not resting_entries:
         return 0
 
     if ibc.paper is None:
@@ -442,8 +454,27 @@ def force_close_symbol(symbol: str, db_path, ibc) -> int:
         # a per-command AttributeError and moved on, easy to miss in the noise. Fail loud
         # and up front instead so it can never again quietly do nothing for every symbol.
         log.error(f"[forced_eod] {symbol}: ibc.paper is None -- cannot force-flatten "
-                   f"{len(filled)} position(s); decider's paper connection is down")
+                   f"{len(filled)} position(s)/{len(resting_entries)} resting entry order(s); "
+                   f"decider's paper connection is down")
         return 0
+
+    n_cancelled_entries = 0
+    for cmd in resting_entries:
+        if cmd["status"] == "SUBMITTED" and cmd["ib_order_id"]:
+            try:
+                o = Order(); o.orderId = cmd["ib_order_id"]
+                ibc.paper.cancelOrder(o)
+            except Exception:
+                pass
+        with get_db(db_path) as con:
+            update_command_status(con, cmd["id"], "CANCELLED",
+                                  error_message="Cancelled by forced_eod (resting entry, symbol closing)")
+        n_cancelled_entries += 1
+    if n_cancelled_entries:
+        log.info(f"[forced_eod] {symbol}: cancelled {n_cancelled_entries} resting entry order(s)")
+
+    if not filled:
+        return n_cancelled_entries
 
     for cmd in filled:
         for oid in (cmd["ib_tp_order_id"], cmd["ib_sl_order_id"]):
@@ -488,7 +519,7 @@ def force_close_symbol(symbol: str, db_path, ibc) -> int:
         except Exception as e:
             log.error(f"[forced_eod] {symbol}: MKT exit failed, leaving commands FILLED "
                        f"for retry next poll: {e}")
-            return 0
+            return n_cancelled_entries
 
     with get_db(db_path) as con:
         for cmd in filled:
@@ -503,7 +534,7 @@ def force_close_symbol(symbol: str, db_path, ibc) -> int:
             record_completed_trade(con, cmd["id"])
     log.info(f"[forced_eod] {symbol}: force-flattened {len(filled)} command(s) "
              f"(net position was {net})")
-    return len(filled)
+    return len(filled) + n_cancelled_entries
 
 
 def _generate_for_symbols(symbols, date_str, cfg, db_path, ibc):
@@ -1123,6 +1154,28 @@ def self_test() -> bool:
             with get_db(db_path3) as con:
                 row = con.execute("SELECT status FROM commands WHERE logical_trade_id='lt4'").fetchone()
                 assert row["status"] == "FILLED", "must stay FILLED for retry, not silently closed"
+
+            # 5e. 2026-09-13 fix: a resting (never-filled) entry order for a symbol
+            # entering its forced-exit window used to be left completely untouched --
+            # only FILLED positions' TP/SL got cancelled. No FILLED row at all here,
+            # just one SUBMITTED entry with no position -- must still be cancelled,
+            # both at IB (cancelOrder on its own ib_order_id) and in the DB.
+            with get_db(db_path3) as con:
+                resting_id = con.execute(
+                    "INSERT INTO commands (symbol, line_price, line_type, line_strength, direction,"
+                    " entry_type, entry_price, tp_price, sl_price, bracket_size, source,"
+                    " quantity, logical_trade_id, status, ib_order_id) VALUES"
+                    " ('NVDA', 900, 'SUPPORT', 2, 'BUY', 'LMT', 900, 902, 898, 4,"
+                    " 'critical_line', 1, 'lt5', 'SUBMITTED', 8888)"
+                ).lastrowid
+            resting_ibc = _FakeIBC([])  # no NVDA position at all
+            n_resting = force_close_symbol("NVDA", db_path3, resting_ibc)
+            assert n_resting == 1, f"expected the 1 resting entry cancelled, got {n_resting}"
+            assert any(getattr(o, "orderId", None) == 8888 for o in resting_ibc.paper.cancels), \
+                "resting entry's own ib_order_id must be cancelled at IB"
+            with get_db(db_path3) as con:
+                row5e = con.execute("SELECT status FROM commands WHERE id=?", (resting_id,)).fetchone()
+            assert row5e["status"] == "CANCELLED", row5e
 
         # 5c. Regression guard: decider's own __main__ must connect with paper=True.
         # This exact line (paper=False, "decider only needs LIVE for price") is what
