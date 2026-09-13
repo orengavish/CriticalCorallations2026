@@ -2006,6 +2006,105 @@ def _rr_rows(con, date_from: str, date_to: str) -> list:
     return rows
 
 
+# ── Winning Formula (v5.24): drill-down live-performance tree ────────────────
+# Family x Real/Control x algo("reason"), then parallel single-parameter
+# breakdowns (bracket, order type, direction, + any family-specific extra).
+# Reuses _bucket_for's own source tables (_BUCKET_MAP, _ALGO_REASON_LABEL,
+# _RESEARCH_REAL_SOURCES/_RESEARCH_CONTROL_SOURCES) so this can never silently
+# disagree with Results Research about which bucket a trade belongs to -- but
+# needs a *structured* (family, kind, reason) tuple instead of _bucket_for's one
+# flat display string, because that string loses real/control specifically for
+# GevaExtract's control bucket (_BUCKET_MAP routes it to the family-less
+# "Control", not "GevaExtract (Control)" -- a pre-existing quirk in the string
+# format, left alone here rather than touched, since _bucket_for/_rr_family_for
+# are already relied on elsewhere and out of this feature's scope to change).
+# _WF_FUTURES_SYMBOLS is defined further down, right after this file's own
+# `from lib.allocation import ALLOC_PAIRS as _ALLOC_PAIRS` -- can't be defined
+# here, this runs at import time and that import hasn't happened yet this far
+# up the file.
+
+
+def _wf_classify(source: str, symbol: str, note):
+    """(family, kind, reason) for one command, `reason=None` means the family
+    has no further named sub-algorithm split (yet) -- caller falls back to the
+    family name itself as the one algorithm-level tree node."""
+    if source == "geva_extract" and symbol != "MES":
+        return "Other", None, None
+    if source in _RESEARCH_REAL_SOURCES or source in _RESEARCH_CONTROL_SOURCES:
+        reason = None
+        if note:
+            try:
+                reason = json.loads(note).get("reason")
+            except (ValueError, TypeError):
+                pass
+        algo = _ALGO_REASON_LABEL.get(reason, "Algo ? (untagged)")
+        kind = "real" if source in _RESEARCH_REAL_SOURCES else "control"
+        return "Critical Line", kind, algo
+    if source in ("geva_extract", "geva_manual"):
+        return "GevaExtract", "real", None
+    if source == "geva_manual_control":
+        return "GevaExtract", "control", None
+    if source == "critical_line":
+        return "Critical Line", "real", "Untagged/legacy"
+    if source == "spread":
+        return "Spread", "real", None
+    if source == "spread_control":
+        return "Spread", "control", None
+    if source == "correlation":
+        return "Correlation", "real", None
+    if source == "correlation_control":
+        return "Correlation", "control", None
+    return "Other", None, None
+
+
+def _wf_rows(con, date_from: str, date_to: str) -> list:
+    """Same commands+critical_lines join _rr_rows() uses, EXCEPT deliberately
+    NOT filtering out NULL pnl_points -- Forced-EOD closes (exit_reason=
+    'FORCED_EOD') need to stay visible/countable here (see decider.py's
+    force_close_symbol fix, 2026-09-13) rather than silently vanishing, which
+    is exactly what api_closed_stats/_rr_rows's "AND pnl_points IS NOT NULL"
+    filter would still do to any of the many historical rows from before that
+    fix (pnl_points permanently NULL, since there's no way to recover their
+    real fill price after the fact)."""
+    rows = [dict(r) for r in con.execute(
+        "SELECT c.symbol, c.source AS cmd_source, cl.source AS line_source,"
+        " cl.note AS line_note, c.direction, c.entry_type, c.bracket_size,"
+        " c.pnl_points, c.exit_reason, c.exit_time"
+        " FROM commands c LEFT JOIN critical_lines cl ON cl.id = c.critical_line_id"
+        " WHERE c.status='CLOSED' AND date(c.exit_time) BETWEEN ? AND ?",
+        (date_from, date_to)
+    ).fetchall()]
+    for r in rows:
+        true_source = r["line_source"] or r["cmd_source"]
+        family, kind, reason = _wf_classify(true_source, r["symbol"], r["line_note"])
+        r["family"] = family
+        r["kind"] = kind
+        r["reason"] = reason or family
+        r["symtype"] = "Futures" if r["symbol"] in _WF_FUTURES_SYMBOLS else "Stock"
+        r["eod"] = r["exit_reason"] == "FORCED_EOD"
+    return rows
+
+
+@app.route("/api/winning-formula")
+def api_winning_formula():
+    """Flat, already-classified leaf rows for the Winning Formula tab -- the
+    tree itself (family -> real/control -> algo -> parallel breakdowns) is
+    built client-side (same rollup logic validated in the design mock), since
+    real trade counts are small enough that shipping raw rows is simpler and
+    lower-risk than a second, server-side aggregation engine that could drift
+    from the client one."""
+    range_sel, date_from, date_to = _rr_date_range(request.args.get("range", "all"))
+    with get_db(_resolve_db()) as con:
+        rows = _wf_rows(con, date_from, date_to)
+    leaves = [{
+        "family": r["family"], "kind": r["kind"], "reason": r["reason"],
+        "entry_type": r["entry_type"], "direction": r["direction"],
+        "bracket": r["bracket_size"], "symtype": r["symtype"], "symbol": r["symbol"],
+        "pnl": r["pnl_points"], "eod": r["eod"],
+    } for r in rows if r["family"] in ("Critical Line", "GevaExtract", "Spread", "Correlation")]
+    return jsonify({"leaves": leaves, "range": range_sel, "date_from": date_from, "date_to": date_to})
+
+
 def _rr_date_range(range_sel: str):
     if range_sel == "today":
         d = date.today().isoformat()
@@ -2340,6 +2439,10 @@ from lib.allocation import (
     ALLOC_PAIR_PLAN as _ALLOC_PAIR_PLAN,
     ALLOC_STOCK_DEDICATED as _ALLOC_STOCK_DEDICATED,
 )
+
+# Winning Formula's symbol->Futures/Stock classification -- derived from the
+# same ALLOC_PAIRS the Allocation tab uses, not a separately hardcoded set.
+_WF_FUTURES_SYMBOLS = {s for _, syms in _ALLOC_PAIRS for s in syms}
 
 
 @app.route("/api/allocation")
@@ -2874,6 +2977,73 @@ td.rr-empty{color:var(--gl-faint);font-size:11px;background:var(--gl-panel-2);bo
 .st-sortable:hover{color:var(--gl-ink)}
 .st-sortable.sort-asc::after{content:" \25B2";font-size:9px}
 .st-sortable.sort-desc::after{content:" \25BC";font-size:9px}
+
+/* ══════════════════════ Winning Formula (v5.24) ══════════════════════ */
+/* All classes prefixed wf- -- this file already defines a generic .row (grid
+   utility used elsewhere) and .pill/.chk/.badge-shaped things via Bootstrap;
+   reusing those bare names here (as the original design mock did, standalone)
+   would silently collide with them. */
+.wf-page{display:flex;flex-direction:column;height:100%}
+.wf-head{padding:8px 4px 6px;flex:none}
+.wf-head .sub{color:var(--gl-muted);font-size:11.5px;margin:2px 0 0;max-width:100ch}
+.wf-eodflag{margin-top:6px;font-size:11px;color:var(--gl-bad);background:rgba(224,90,90,.1);
+  border:1px solid rgba(224,90,90,.35);border-radius:5px;padding:5px 10px;display:inline-block}
+.wf-filterbar{flex:none;display:flex;flex-wrap:wrap;align-items:flex-end;gap:16px;
+  padding:8px 10px;background:var(--gl-panel);border:1px solid var(--gl-border);border-radius:6px;margin-bottom:8px}
+.wf-fgroup{display:flex;flex-direction:column;gap:4px}
+.wf-fgroup .k{font-size:9px;color:var(--gl-faint);text-transform:uppercase;letter-spacing:.08em}
+.wf-chkrow{display:flex;gap:10px;align-items:center;flex-wrap:wrap;height:26px}
+.wf-chk{display:flex;align-items:center;gap:4px;font-size:11.5px;color:var(--gl-muted);cursor:pointer;user-select:none}
+.wf-chk input{accent-color:var(--gl-accent);cursor:pointer}
+.wf-chk.eod{color:var(--gl-bad)}
+.wf-chk.eod input{accent-color:var(--gl-bad)}
+.wf-msel{background:var(--gl-panel-2);color:var(--gl-ink);border:1px solid var(--gl-border);border-radius:5px;
+  font-family:var(--gl-mono);font-size:11.5px;padding:3px 6px;min-width:130px}
+.wf-pillrow{display:flex;gap:3px;flex-wrap:wrap}
+.wf-pill{border:1px solid var(--gl-border);background:var(--gl-panel-2);color:var(--gl-muted);
+  padding:3px 9px;border-radius:20px;font-size:11px;cursor:pointer;font-family:var(--gl-mono)}
+.wf-pill.active{background:var(--gl-accent);border-color:var(--gl-accent);color:var(--gl-accent-ink);font-weight:700}
+.wf-pill:hover:not(.active){color:var(--gl-ink);border-color:var(--gl-faint)}
+.wf-fnote{color:var(--gl-faint);font-size:10.5px;max-width:34ch}
+.wf-tablewrap{flex:1;overflow:auto;border:1px solid var(--gl-border);border-radius:6px}
+.wf-thead{display:grid;grid-template-columns:1fr 90px 130px 130px 110px;
+  background:var(--gl-panel-2);border-bottom:1px solid var(--gl-border);
+  font-size:9.5px;text-transform:uppercase;letter-spacing:.05em;color:var(--gl-faint);
+  position:sticky;top:0;z-index:1;font-family:var(--gl-mono)}
+.wf-thead>div{padding:7px 9px;cursor:pointer;user-select:none;display:flex;align-items:center;gap:4px}
+.wf-thead>div.num{justify-content:flex-end}
+.wf-thead>div:hover{color:var(--gl-ink)}
+.wf-sort-ind{font-size:8px;opacity:.6}
+.wf-row{display:grid;grid-template-columns:1fr 90px 130px 130px 110px;
+  border-bottom:1px solid var(--gl-border);align-items:center;font-family:var(--gl-mono)}
+.wf-row:hover{background:var(--gl-panel-2)}
+.wf-row.wf-hidden{display:none}
+.wf-row.wf-has-eod{box-shadow:inset 3px 0 0 var(--gl-bad)}
+.wf-cell{padding:5px 9px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.wf-cell.num{text-align:right;font-variant-numeric:tabular-nums}
+.wf-rowlabel{display:flex;align-items:center;gap:5px;min-width:0}
+.wf-twisty{flex:none;width:13px;height:13px;display:flex;align-items:center;justify-content:center;
+  color:var(--gl-faint);font-size:9px;cursor:pointer;transition:transform .12s}
+.wf-twisty.open{transform:rotate(90deg)}
+.wf-twisty.leaf{visibility:hidden}
+.wf-labeltext{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.wf-eodchip{flex:none;font-size:8.5px;font-weight:700;color:var(--gl-bad);background:rgba(224,90,90,.14);
+  border-radius:3px;padding:0 5px;margin-left:2px}
+.wf-row[data-depth="0"]{font-weight:800;font-size:13px;background:rgba(217,141,43,.05)}
+.wf-row[data-depth="0"] .wf-cell{padding-top:7px;padding-bottom:7px}
+.wf-row[data-depth="1"]{font-weight:700;font-size:12.5px}
+.wf-row[data-depth="2"]{font-weight:600}
+.wf-row[data-depth="3"]{font-weight:400;font-style:italic;color:var(--gl-muted);font-size:11.5px}
+.wf-row.wf-control{color:var(--gl-faint)}
+.wf-winrate{font-weight:700}
+.wf-winrate.good{color:var(--gl-good)}
+.wf-winrate.bad{color:var(--gl-bad)}
+.wf-winrate.thin{color:var(--gl-faint);font-weight:400}
+.wf-pnl.pos{color:var(--gl-good)}
+.wf-pnl.neg{color:var(--gl-bad)}
+.wf-pnl.flat{color:var(--gl-muted)}
+.wf-dim{color:var(--gl-faint)}
+.wf-foot{flex:none;padding:5px 4px;color:var(--gl-faint);font-size:10.5px}
 </style>
 </head>
 <body>
@@ -2931,7 +3101,7 @@ td.rr-empty{color:var(--gl-faint);font-size:11px;background:var(--gl-panel-2);bo
     <!-- Header -->
     <div class="app-header">
       <span class="brand">Galao</span>
-      <span class="verchip">v5.23</span>
+      <span class="verchip">v5.24</span>
       <span class="gl-pill" id="session-broker-badge" style="color:var(--gl-muted)">Broker: —</span>
       <span class="gl-pill" id="session-decider-badge" style="color:var(--gl-muted)">Decider: —</span>
       <span class="gl-pill" id="market-data-badge" style="color:var(--gl-muted)">Market Data: —</span>
@@ -2959,6 +3129,7 @@ td.rr-empty{color:var(--gl-faint);font-size:11px;background:var(--gl-panel-2);bo
         <li class="nav-item" data-group="trading"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-submitted" id="btn-sub-tab">Submitted</button></li>
         <li class="nav-item" data-group="results"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-stats" id="btn-stats-tab">Results</button></li>
         <li class="nav-item" data-group="results"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-compare" id="btn-compare-tab">Results Research</button></li>
+        <li class="nav-item" data-group="results"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-winformula" id="btn-winformula-tab">Winning Formula</button></li>
         <li class="nav-item" data-group="allocation"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-allocation" id="btn-allocation-tab">Allocation</button></li>
         <li class="nav-item" data-group="overview"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-overview" id="btn-overview-tab">Overview</button></li>
         <li class="nav-item" data-group="levels"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-lines" id="btn-lines-tab">Lines</button></li>
@@ -3632,6 +3803,70 @@ td.rr-empty{color:var(--gl-faint);font-size:11px;background:var(--gl-panel-2);bo
       <button class="btn btn-sm btn-outline-secondary" onclick="rrCloseDrawer()">Close</button>
     </div>
   </div>
+</div>
+
+<!-- ══════════════════════ WINNING FORMULA ══════════════════════ -->
+<div class="tab-pane fade" id="tab-winformula">
+ <div class="st-page wf-page">
+  <div class="wf-head">
+    <p class="sub">Every algorithm &times; Real/Control &times; sub-algorithm, then <b>parallel</b>
+      single-parameter breakdowns (by Bracket, by Order Type, by Direction, and per-family extras) &mdash;
+      not a multiplied-out cross-product. Sort any column by clicking its header; the level control sets
+      how deep the tree opens by default.</p>
+    <div class="wf-eodflag" id="wf-eodflag"></div>
+  </div>
+
+  <div class="wf-filterbar">
+    <div class="wf-fgroup">
+      <span class="k">Date range</span>
+      <div class="wf-pillrow" id="wf-range-pills">
+        <button class="wf-pill" data-range="today">Today</button>
+        <button class="wf-pill" data-range="yesterday">Yesterday</button>
+        <button class="wf-pill active" data-range="all">All days</button>
+      </div>
+    </div>
+    <div class="wf-fgroup">
+      <span class="k">Symbol group</span>
+      <div class="wf-chkrow"><label class="wf-chk"><input type="checkbox" id="wf-f-futures" checked>Futures</label>
+        <label class="wf-chk"><input type="checkbox" id="wf-f-stock" checked>Stock</label></div>
+    </div>
+    <div class="wf-fgroup">
+      <span class="k">Symbol</span>
+      <select class="wf-msel" id="wf-f-symbol" multiple size="4"></select>
+    </div>
+    <div class="wf-fgroup">
+      <span class="k">Data quality</span>
+      <label class="wf-chk eod"><input type="checkbox" id="wf-f-eod" checked>Include Forced-EOD trades</label>
+    </div>
+    <div class="wf-fgroup">
+      <span class="k">&nbsp;</span>
+      <button class="btn btn-sm btn-outline-secondary" id="wf-apply-btn" onclick="loadWinningFormula()">Apply</button>
+    </div>
+    <div style="flex:1"></div>
+    <div class="wf-fgroup">
+      <span class="k">Collapse to level</span>
+      <div class="wf-pillrow" id="wf-level-pills">
+        <button class="wf-pill" data-lvl="0">0 &middot; family</button>
+        <button class="wf-pill" data-lvl="1">1 &middot; real/control</button>
+        <button class="wf-pill active" data-lvl="2">2 &middot; algorithm</button>
+        <button class="wf-pill" data-lvl="3">3 &middot; breakdown</button>
+        <button class="wf-pill" data-lvl="4">4 &middot; full detail</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="wf-tablewrap">
+    <div class="wf-thead">
+      <div data-sort="label">Group</div>
+      <div class="num" data-sort="n">Trades <span class="wf-sort-ind"></span></div>
+      <div class="num" data-sort="win_rate">Win % (resolved) <span class="wf-sort-ind"></span></div>
+      <div class="num" data-sort="net_pnl">Net PnL, pts (resolved) <span class="wf-sort-ind"></span></div>
+      <div class="num" data-sort="avg_pnl">Avg/Trade <span class="wf-sort-ind"></span></div>
+    </div>
+    <div id="wf-tbody"></div>
+  </div>
+  <div class="wf-foot" id="wf-foot"></div>
+ </div>
 </div>
 
 <!-- ══════════════════════ ALLOCATION ══════════════════════ -->
@@ -6830,6 +7065,226 @@ async function loadAllocation(){
 }
 document.getElementById('btn-allocation-tab').addEventListener('click',loadAllocation);
 
+// ── Winning Formula (v5.24) ─────────────────────────────────────────────────
+// Ports the design mock's own rollup engine near-verbatim (validated across 4
+// mock iterations with the user before this was built) -- fetches classified
+// leaf rows from /api/winning-formula and does the family -> real/control ->
+// algorithm -> parallel breakdown grouping here in JS, not server-side, since
+// real trade counts are small enough that a second Python aggregation engine
+// would just be one more place for the two to quietly drift apart.
+const WF_STD_BREAKDOWNS=[
+  {key:'bracket',label:'By Bracket',fmt:v=>'Bracket '+v},
+  {key:'entry_type',label:'By Order Type',fmt:v=>v},
+  {key:'direction',label:'By Direction',fmt:v=>v},
+];
+const WF_BREAKDOWNS_BY_FAMILY={
+  'Critical Line':WF_STD_BREAKDOWNS,'GevaExtract':WF_STD_BREAKDOWNS,'Correlation':WF_STD_BREAKDOWNS,
+  'Spread':[...WF_STD_BREAKDOWNS,{key:'pair_type',label:'By Pair Type',fmt:v=>v}],
+};
+const WF_FAMILIES=['Critical Line','GevaExtract','Spread','Correlation'];
+
+let _wfLeaves=[], _wfTree=[], _wfCollapseLevel=2, _wfId=0;
+
+function _wfAggregate(leaves){
+  const n=leaves.length;
+  const n_eod=leaves.filter(l=>l.eod).length;
+  const resolved=leaves.filter(l=>!l.eod && l.pnl!=null);
+  const wins=resolved.filter(l=>l.pnl>0).length;
+  const net=resolved.reduce((s,l)=>s+l.pnl,0);
+  return {n,n_eod,n_resolved:resolved.length,
+    win_rate:resolved.length?100*wins/resolved.length:null,
+    net_pnl:resolved.length?net:null,
+    avg_pnl:resolved.length?net/resolved.length:null};
+}
+function _wfGroupBy(leaves,key){
+  const m=new Map();
+  for(const l of leaves){ const v=l[key]; if(!m.has(v)) m.set(v,[]); m.get(v).push(l); }
+  return m;
+}
+function _wfMakeNode(label,leaves,depth,dims){
+  return {_id:++_wfId,label,depth,dims,...(_wfAggregate(leaves)),children:[]};
+}
+function _wfBuildBreakdowns(family,leaves,dims){
+  const defs=WF_BREAKDOWNS_BY_FAMILY[family]||[];
+  const out=[];
+  for(const d of defs){
+    const distinct=new Set(leaves.map(l=>l[d.key]));
+    distinct.delete(undefined); distinct.delete(null);
+    if(distinct.size<2) continue;
+    const header=_wfMakeNode(d.label,leaves,3,dims);
+    const byVal=_wfGroupBy(leaves.filter(l=>l[d.key]!=null),d.key);
+    header.children=[...byVal.entries()]
+      .sort((a,b)=>String(a[0]).localeCompare(String(b[0])))
+      .map(([val,vleaves])=>_wfMakeNode(d.fmt(val),vleaves,4,{...dims,[d.key]:val}));
+    out.push(header);
+  }
+  return out;
+}
+function _wfBuildTree(leaves){
+  const byFamily=_wfGroupBy(leaves,'family');
+  return WF_FAMILIES.map(fam=>{
+    const famLeaves=byFamily.get(fam)||[];
+    const famNode=_wfMakeNode(fam,famLeaves,0,{family:fam});
+    if(!famLeaves.length){ famNode.notLive='no closed trades in range'; return famNode; }
+    famNode.children=['real','control'].map(kind=>{
+      const kindLeaves=famLeaves.filter(l=>l.kind===kind);
+      const kindNode=_wfMakeNode(kind==='real'?'Real':'Control',kindLeaves,1,{family:fam,kind});
+      const byReason=_wfGroupBy(kindLeaves,'reason');
+      kindNode.children=[...byReason.entries()].map(([reason,rleaves])=>{
+        const dims={family:fam,kind,reason};
+        const algoNode=_wfMakeNode(reason,rleaves,2,dims);
+        algoNode.children=_wfBuildBreakdowns(fam,rleaves,dims);
+        return algoNode;
+      });
+      return kindNode;
+    });
+    return famNode;
+  });
+}
+
+function _wfFmtPnl(v){
+  if(v==null) return '<span class="wf-dim">&mdash;</span>';
+  const cls=v>0?'pos':(v<0?'neg':'flat');
+  return `<span class="wf-pnl ${cls}">${v>0?'+':''}${v.toFixed(2)}</span>`;
+}
+function _wfFmtWin(row){
+  if(row.win_rate===null) return '<span class="wf-dim">no resolved trades</span>';
+  const enough=row.n_resolved>=10;
+  const cls=!enough?'thin':(row.win_rate>=50?'good':'bad');
+  return `<span class="wf-winrate ${cls}">${row.win_rate.toFixed(1)}%</span>`+
+    (!enough?` <span class="wf-dim">(n=${row.n_resolved})</span>`:'');
+}
+function _wfRenderRow(row,depth,parentOpen){
+  const hasKids=row.children&&row.children.length;
+  const hiddenCls=parentOpen?'':' wf-hidden';
+  const eodCls=row.n_eod>0?' wf-has-eod':'';
+  const ctrlCls=row.dims&&row.dims.kind==='control'?' wf-control':'';
+  const eodChip=row.n_eod>0?`<span class="wf-eodchip">${row.n_eod} EOD</span>`:'';
+  const notLive=row.notLive?` <span class="wf-dim">(${row.notLive})</span>`:'';
+  let html=`<div class="wf-row${eodCls}${ctrlCls}" data-depth="${depth}" data-id="${row._id}">
+    <div class="wf-cell wf-rowlabel" style="padding-left:${6+depth*11}px">
+      <span class="wf-twisty ${hasKids?'':'leaf'}" data-toggle="${row._id}">&#9656;</span>
+      <span class="wf-labeltext">${row.label}</span>${eodChip}${notLive}
+    </div>
+    <div class="wf-cell num">${row.n||'&mdash;'}</div>
+    <div class="wf-cell num">${_wfFmtWin(row)}</div>
+    <div class="wf-cell num">${_wfFmtPnl(row.net_pnl)}</div>
+    <div class="wf-cell num">${_wfFmtPnl(row.avg_pnl)}</div>
+  </div>`;
+  if(hasKids){
+    const childOpen=depth<_wfCollapseLevel;
+    for(const child of row.children) html+=_wfRenderRow(child,depth+1,childOpen&&parentOpen);
+  }
+  return html;
+}
+function _wfPaint(){
+  document.getElementById('wf-tbody').innerHTML=_wfTree.map(n=>_wfRenderRow(n,0,true)).join('');
+}
+
+document.getElementById('wf-tbody')?.addEventListener('click',e=>{
+  const t=e.target.closest('.wf-twisty');
+  if(!t||t.classList.contains('leaf')) return;
+  const id=t.dataset.toggle;
+  const row=document.querySelector(`.wf-row[data-id="${id}"]`);
+  const depth=+row.dataset.depth;
+  const open=t.classList.toggle('open');
+  let el=row.nextElementSibling;
+  while(el){
+    const d=+el.dataset.depth;
+    if(d<=depth) break;
+    if(!open){
+      el.classList.add('wf-hidden');
+      const tw=el.querySelector('.wf-twisty'); if(tw) tw.classList.remove('open');
+    } else if(d===depth+1){
+      el.classList.remove('wf-hidden');
+    }
+    el=el.nextElementSibling;
+  }
+});
+document.getElementById('wf-level-pills')?.addEventListener('click',e=>{
+  const b=e.target.closest('.wf-pill'); if(!b) return;
+  document.querySelectorAll('#wf-level-pills .wf-pill').forEach(p=>p.classList.remove('active'));
+  b.classList.add('active');
+  _wfCollapseLevel=+b.dataset.lvl;
+  _wfPaint();
+});
+document.getElementById('wf-range-pills')?.addEventListener('click',e=>{
+  const b=e.target.closest('.wf-pill'); if(!b) return;
+  document.querySelectorAll('#wf-range-pills .wf-pill').forEach(p=>p.classList.remove('active'));
+  b.classList.add('active');
+  loadWinningFormula();
+});
+
+let _wfSortDir={};
+document.querySelector('#tab-winformula .wf-thead')?.addEventListener('click',e=>{
+  const h=e.target.closest('[data-sort]'); if(!h) return;
+  const key=h.dataset.sort;
+  _wfSortDir[key]=!_wfSortDir[key];
+  const dir=_wfSortDir[key]?1:-1;
+  function sortLevel(rows){
+    rows.sort((a,b)=>{
+      let av=key==='label'?a.label:a[key], bv=key==='label'?b.label:b[key];
+      if(typeof av==='string'||typeof bv==='string') return dir*String(av??'').localeCompare(String(bv??''));
+      av=av==null?-Infinity:av; bv=bv==null?-Infinity:bv;
+      return dir*(av-bv);
+    });
+    for(const r of rows) if(r.children&&r.children.length) sortLevel(r.children);
+  }
+  sortLevel(_wfTree);
+  _wfPaint();
+  document.querySelectorAll('#tab-winformula .wf-sort-ind').forEach(s=>s.textContent='');
+  const ind=h.querySelector('.wf-sort-ind'); if(ind) ind.textContent=dir>0?'▲':'▼';
+});
+
+async function loadWinningFormula(){
+  _enterBusy();
+  try{
+    const range=document.querySelector('#wf-range-pills .wf-pill.active')?.dataset.range||'all';
+    const d=await (await fetch('/api/winning-formula?range='+range)).json();
+
+    const wantFutures=document.getElementById('wf-f-futures').checked;
+    const wantStock=document.getElementById('wf-f-stock').checked;
+    const wantEod=document.getElementById('wf-f-eod').checked;
+    // Rebuilt every load (not just once) -- a date-range change can surface
+    // symbols that weren't in the previously-loaded range; previously-picked
+    // selections are preserved wherever they're still a valid option.
+    const symSel=document.getElementById('wf-f-symbol');
+    const prevPicked=new Set([...symSel.selectedOptions].map(o=>o.value));
+    symSel.innerHTML='';
+    [...new Set(d.leaves.map(l=>l.symbol))].sort().forEach(s=>{
+      const o=document.createElement('option'); o.value=s; o.textContent=s;
+      if(prevPicked.has(s)) o.selected=true;
+      symSel.appendChild(o);
+    });
+    const pickedSymbols=[...symSel.selectedOptions].map(o=>o.value);
+
+    _wfLeaves=d.leaves.filter(l=>{
+      if(l.symtype==='Futures'&&!wantFutures) return false;
+      if(l.symtype==='Stock'&&!wantStock) return false;
+      if(!wantEod&&l.eod) return false;
+      if(pickedSymbols.length&&!pickedSymbols.includes(l.symbol)) return false;
+      return true;
+    });
+    _wfTree=_wfBuildTree(_wfLeaves);
+    _wfPaint();
+
+    const total=_wfLeaves.length, eodN=_wfLeaves.filter(l=>l.eod).length;
+    document.getElementById('wf-eodflag').innerHTML = total
+      ? `<b>${eodN} of ${total}</b> closed trades in this range never hit TP/SL &mdash; the day just ended `+
+        `first (Forced-EOD). Included by default and marked <b>red</b> everywhere so they're never `+
+        `silently averaged into a win rate.`
+      : `No closed trades in this range yet.`;
+    document.getElementById('wf-foot').textContent =
+      `${d.date_from} to ${d.date_to} &middot; ${total} closed trades across Critical Line/GevaExtract/Spread/Correlation.`
+        .replace('&middot;','·');
+  }catch(e){}finally{_exitBusy();}
+}
+// Futures/Stock/Symbol/Forced-EOD checkboxes deliberately do NOT auto-reload --
+// per explicit design feedback, they only take effect on "Apply" (or a date-range
+// pill click, which always needs a fresh fetch anyway). loadWinningFormula() re-
+// reads their current .checked/.selectedOptions state each time it runs.
+document.getElementById('btn-winformula-tab').addEventListener('click',loadWinningFormula);
+
 // ── Correlation ───────────────────────────────────────────────────────────────
 async function loadCorrMatrix(){
   const window_=document.getElementById('corr-window').value;
@@ -7009,6 +7464,35 @@ document.addEventListener('shown.bs.tab',function(e){
 # ── Release notes ─────────────────────────────────────────────────────────────
 
 _RELEASE_NOTES = [
+    ("v5.24", "New Winning Formula tab -- drill-down live-performance tree",
+              "User request, after 4 rounds of a design mock: a table showing every algorithm x "
+              "Real/Control x sub-algorithm, then PARALLEL single-parameter breakdowns (by Bracket, "
+              "by Order Type, by Direction, plus per-family extras like Spread's Pair Type) -- "
+              "deliberately not a multiplied-out cross-product, so pooled sample sizes stay real "
+              "instead of fragmenting into n=1 leaves. Built on a new /api/winning-formula route: "
+              "_wf_classify() reuses _bucket_for's own source tables (_BUCKET_MAP, "
+              "_ALGO_REASON_LABEL, _RESEARCH_REAL_SOURCES/_CONTROL_SOURCES) so it can't silently "
+              "disagree with Results Research about which bucket a trade belongs to, but returns a "
+              "structured (family, kind, reason) tuple instead of _bucket_for's one flat display "
+              "string -- needed because that string loses real/control specifically for "
+              "GevaExtract's control bucket (routes to the family-less 'Control', not 'GevaExtract "
+              "(Control)'). Also deliberately does NOT filter out NULL pnl_points the way "
+              "api_closed_stats/_rr_rows do -- Forced-EOD closes need to stay visible and countable "
+              "here, not vanish the way that stricter filter would still do to most of them (see "
+              "decider.py's force_close_symbol PnL fix, same session). Forced-EOD trades get a red "
+              "left-edge stripe + count chip everywhere, and a checkbox to include/exclude them, "
+              "instead of a permanent column -- keeps them impossible to silently average into a "
+              "win rate without needing their own dedicated column. The tree itself is built "
+              "client-side (same rollup engine the design mock validated across 4 iterations), not "
+              "server-side -- real trade counts are small enough that a second Python aggregation "
+              "engine would just be one more place for the two to quietly drift apart. Verified: "
+              "new _self_test_winning_formula() (9 assertions covering all 4 families, the "
+              "GevaExtract-control-keeps-its-family fix, Forced-EOD inclusion, Algo-N reason "
+              "mapping, symtype classification, and range=today filtering) passes; full self-test "
+              "suite still passes; JS rollup engine independently verified with a standalone Node "
+              "harness (7 assertions on parallel-vs-multiplicative breakdown shape); live-smoke-"
+              "tested against the real running DB on a scratch port -- real classified GevaExtract/"
+              "Critical Line trades came back correctly shaped."),
     ("v5.23", "Close the last busy-indicator gap; grey out Correlation/Algo Lab/Geva Extract",
               "User report: 'the hourglass starts nice, then turns into the default OS cursor "
               "and blue circle -- we don't have the entire hourglass.' Root cause: the init "
@@ -7830,7 +8314,8 @@ def self_test() -> bool:
 
         print("PASS -- trading_dashboard: strength scale (bug 7) + PDH/PDL look-ahead fix (bug 8)")
         rr_ok = _self_test_results_research()
-        return rr_ok
+        wf_ok = _self_test_winning_formula()
+        return rr_ok and wf_ok
     except Exception as e:
         import traceback
         print(f"FAIL -- trading_dashboard self_test: {e}")
@@ -7912,6 +8397,126 @@ def _self_test_results_research() -> bool:
     except Exception as e:
         import traceback
         print(f"FAIL -- trading_dashboard Results Research self_test: {e}")
+        traceback.print_exc()
+        return False
+    finally:
+        _DB_OVERRIDE = orig_override
+
+
+def _self_test_winning_formula() -> bool:
+    """
+    Winning Formula (v5.24): one CLOSED command per interesting case in a temp
+    DB, then hits /api/winning-formula through app.test_client() and checks:
+    (1) every one of the 4 families is represented with the right kind/reason,
+    (2) GevaExtract's control leg keeps its family (the exact info _bucket_for's
+    flat string loses for that one case -- see _wf_classify's docstring),
+    (3) a Forced-EOD row with pnl_points=NULL is still INCLUDED (not silently
+    dropped the way api_closed_stats/_rr_rows's stricter query would) and
+    flagged eod=True, (4) algo_lab is excluded entirely (not one of the 4
+    families this table covers), (5) the research_ce/_random reason-tag ->
+    "Algo N" mapping and symtype (Futures/Stock) classification both come
+    through correctly, (6) range=today narrows to just today's rows.
+    """
+    import tempfile
+    global _DB_OVERRIDE
+    orig_override = _DB_OVERRIDE
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "wf_test.db"
+            init_db(db_path)
+            today = date.today().isoformat()
+            yesterday = (date.today() - timedelta(days=1)).isoformat()
+
+            with get_db(db_path) as con:
+                line_id = con.execute(
+                    "INSERT INTO critical_lines (symbol, date, line_type, price, strength, source, note)"
+                    " VALUES ('MNQ', ?, 'SUPPORT', 100.0, 1, 'research_ce', ?)",
+                    (today, json.dumps({"reason": "PREVIOUS_DAY_LOW"}))
+                ).lastrowid
+                # Its matched random-distance control has its OWN critical_lines row
+                # (source='research_random') carrying the SAME reason tag -- matches
+                # how prep_research_lines*.py really pairs a control line with its real
+                # counterpart (confirmed live in galao.db: source/kind vary, reason
+                # doesn't), not the same critical_line_id reused for both.
+                ctrl_line_id = con.execute(
+                    "INSERT INTO critical_lines (symbol, date, line_type, price, strength, source, note)"
+                    " VALUES ('MNQ', ?, 'SUPPORT', 101.0, 1, 'research_random', ?)",
+                    (today, json.dumps({"reason": "PREVIOUS_DAY_LOW"}))
+                ).lastrowid
+
+                def _insert(symbol, source, direction, entry_type, bracket, pnl, exit_reason,
+                            exit_day=today, critical_line_id=None):
+                    con.execute(
+                        "INSERT INTO commands (symbol, line_price, line_type, line_strength, direction,"
+                        " entry_type, entry_price, tp_price, sl_price, bracket_size, quantity, status,"
+                        " pnl_points, exit_reason, exit_time, source, critical_line_id)"
+                        " VALUES (?,0,'SUPPORT',1,?,?,0,0,0,?,1,'CLOSED',?,?,?,?,?)",
+                        (symbol, direction, entry_type, bracket, pnl, exit_reason,
+                         f"{exit_day}T10:00:00Z", source, critical_line_id)
+                    )
+
+                _insert("MES", "geva_manual",         "BUY",  "LMT", 4.0,  2.0,  "TP")
+                _insert("MES", "geva_manual_control",  "BUY",  "LMT", 4.0, -1.0,  "SL")
+                _insert("MNQ", "research_ce",   "SELL", "STP", 8.0, -1.0, "SL", critical_line_id=line_id)
+                _insert("MNQ", "research_random","SELL", "STP", 8.0,  0.5, "TP", critical_line_id=ctrl_line_id)
+                _insert("MYM", "spread",        "BUY",  "MKT", 2.0,  1.5,  "TP")
+                _insert("MYM", "spread_control","BUY",  "MKT", 2.0, -0.5,  "SL")
+                _insert("M2K", "correlation",   "SELL", "STP", 4.0,  0.5,  "TP")
+                _insert("AAPL","critical_line", "BUY",  "LMT", 4.0,  1.0,  "TP")
+                _insert("MES", "algo_lab",      "BUY",  "LMT", 4.0,  3.0,  "TP")
+                # Forced-EOD, no pnl computed (the historical-row case decider.py's
+                # 2026-09-13 fix doesn't retroactively fill in) -- must still appear.
+                _insert("MES", "geva_manual", "SELL", "STP", 16.0, None, "FORCED_EOD")
+                # Yesterday's row -- must be excluded by range=today.
+                _insert("MES", "geva_manual", "BUY", "LMT", 4.0, 1.0, "TP", exit_day=yesterday)
+
+            _DB_OVERRIDE = db_path
+            client = app.test_client()
+
+            d = client.get("/api/winning-formula?range=all").get_json()
+            leaves = d["leaves"]
+            by_fam = {}
+            for l in leaves:
+                by_fam.setdefault(l["family"], []).append(l)
+
+            assert set(by_fam) == {"GevaExtract", "Critical Line", "Spread", "Correlation"}, \
+                f"algo_lab must be excluded, got families: {sorted(by_fam)}"
+            # 3 geva_manual (today TP, today FORCED_EOD, yesterday TP) + 1 geva_manual_control.
+            assert len(by_fam["GevaExtract"]) == 4, by_fam["GevaExtract"]
+
+            geva_real = [l for l in by_fam["GevaExtract"] if l["kind"] == "real"]
+            geva_ctrl = [l for l in by_fam["GevaExtract"] if l["kind"] == "control"]
+            assert len(geva_real) == 3 and len(geva_ctrl) == 1, \
+                "GevaExtract control leg must keep its family+kind, not vanish like _bucket_for's flat 'Control'"
+
+            eod_rows = [l for l in geva_real if l["eod"]]
+            assert len(eod_rows) == 1 and eod_rows[0]["pnl"] is None, \
+                "Forced-EOD row with NULL pnl must still be included, not dropped"
+
+            cl_rows = by_fam["Critical Line"]
+            assert any(l["reason"] == "Algo 1" and l["kind"] == "real" for l in cl_rows), cl_rows
+            assert any(l["reason"] == "Algo 1" and l["kind"] == "control" for l in cl_rows), cl_rows
+            assert any(l["reason"] == "Untagged/legacy" for l in cl_rows), \
+                "plain source='critical_line' row must land in its own Untagged/legacy bucket"
+            mnq_row = next(l for l in cl_rows if l["symbol"] == "MNQ")
+            assert mnq_row["symtype"] == "Futures", mnq_row
+            aapl_row = next(l for l in cl_rows if l["symbol"] == "AAPL")
+            assert aapl_row["symtype"] == "Stock", aapl_row
+
+            spread_rows = by_fam["Spread"]
+            assert {l["kind"] for l in spread_rows} == {"real", "control"}, spread_rows
+            assert by_fam["Correlation"][0]["kind"] == "real", by_fam["Correlation"]
+
+            d_today = client.get("/api/winning-formula?range=today").get_json()
+            today_geva = [l for l in d_today["leaves"] if l["family"] == "GevaExtract"]
+            assert len(today_geva) == 3, \
+                f"range=today must exclude yesterday's extra geva_manual row, got {len(today_geva)}"
+
+        print("PASS -- trading_dashboard: Winning Formula /api/winning-formula (v5.24)")
+        return True
+    except Exception as e:
+        import traceback
+        print(f"FAIL -- trading_dashboard Winning Formula self_test: {e}")
         traceback.print_exc()
         return False
     finally:
