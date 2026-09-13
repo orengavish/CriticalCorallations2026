@@ -37,7 +37,15 @@ from lib import algo_lab, algo_pnl, correlation_lab
 # ── Constants ──────────────────────────────────────────────────────────────────
 
 ALL_SYMBOLS      = ["MES", "MNQ", "MYM", "M2K"]
-TICKS            = {"MES": 0.25, "MNQ": 0.25, "MYM": 1.0, "M2K": 0.10}
+# 2026-09-13: this file used to keep its own copy of tick sizes (TICKS = {...},
+# futures-only), with every call site defaulting an unrecognized symbol to 0.25
+# (a futures tick) -- any stock symbol passed through this file's own tools
+# (Create Trades, sandbox, etc.) silently mis-rounded prices by up to $0.24
+# against lib/order_builder.py's real, already-correct get_tick_size() (which
+# has the right futures ticks AND a 0.01 stock fallback). Reusing that
+# directly instead of a second table that can drift, same fix pattern as the
+# Allocation tab's table this session.
+from lib.order_builder import get_tick_size
 DEFAULT_BRACKETS = [2.0, 4.0, 10.0]   # points
 
 _HIST_DIR   = Path(r"C:\Projects\Galgo2026\june\trader\data\history")
@@ -306,7 +314,7 @@ def _generate_lines(symbol: str, ticks: list, filter_types: set | None = None,
     to None, which reproduces the exact previous behaviour (PDH/PDL/PDC/PDO from
     `ticks` itself) for every existing caller.
     """
-    tick   = TICKS.get(symbol, 0.25)
+    tick   = get_tick_size(symbol)
     rt     = lambda p: round(round(p / tick) * tick, 10)
 
     RTH_START  = 9 * 60 + 30    # 09:30
@@ -444,7 +452,7 @@ def _generate_lines(symbol: str, ticks: list, filter_types: set | None = None,
 
     # Volume Profile — POC / VAH / VAL from RTH tick histogram
     if rth_p:
-        t_sz = TICKS.get(symbol, 0.25)
+        t_sz = get_tick_size(symbol)
         counts: dict = {}
         for p in rth_p:
             bkt = round(round(p / t_sz) * t_sz, 10)
@@ -609,7 +617,13 @@ def _run_ib_dayclean_script(mode: str) -> dict | None:
         return None
 
 
-_FUTURES = ("MES", "MNQ", "MYM", "M2K")
+# 2026-09-13: was just the original 4 micro futures -- ES/NQ/YM/RTY (added to
+# live trading earlier this session) fell through to "stock" in the Day Start
+# panel's futures-vs-stocks split below, undercounting real futures coverage
+# and inflating the stock denominator. Can't import lib.allocation's
+# ALLOC_PAIRS here (that import happens much further down this file; this name
+# is used by a route defined long before it) -- kept as its own explicit tuple.
+_FUTURES = ("MES", "MNQ", "MYM", "M2K", "ES", "NQ", "YM", "RTY")
 
 
 @app.route("/api/dayclean/verify")
@@ -638,15 +652,16 @@ def api_dayclean_verify():
             "SELECT COUNT(*) FROM commands_archive"
         ).fetchone()[0]
 
+        _fut_placeholders = ",".join("?" * len(_FUTURES))
         futures_rows = con.execute(
             "SELECT symbol, COUNT(*) c FROM critical_lines WHERE date=? AND armed=1"
-            " AND symbol IN (?,?,?,?) GROUP BY symbol", (today, *_FUTURES)
+            f" AND symbol IN ({_fut_placeholders}) GROUP BY symbol", (today, *_FUTURES)
         ).fetchall()
         futures_lines = {r["symbol"]: r["c"] for r in futures_rows}
 
         stock_row = con.execute(
             "SELECT COUNT(DISTINCT symbol) syms, COUNT(*) total FROM critical_lines"
-            " WHERE date=? AND armed=1 AND symbol NOT IN (?,?,?,?)", (today, *_FUTURES)
+            f" WHERE date=? AND armed=1 AND symbol NOT IN ({_fut_placeholders})", (today, *_FUTURES)
         ).fetchone()
 
         force_all_today = get_system_state(con, "FORCE_ALL_SYMBOLS_DATE") == today
@@ -1437,7 +1452,7 @@ def api_volume_profile(symbol: str):
     if not ticks:
         return jsonify({"profile": [], "date": None, "symbol": symbol, "error": "no data"})
 
-    t_sz  = TICKS.get(symbol, 0.25)
+    t_sz  = get_tick_size(symbol)
     rth_p = [p for (t_min, p, _) in ticks if _RTH_START_MIN <= t_min < _RTH_END_MIN]
     counts: dict = {}
     for p in rth_p:
@@ -1478,7 +1493,7 @@ def api_trades_create():
     for ln in lines:
         sym, lp, ltype = ln["symbol"], ln["price"], ln["line_type"]
         strength, source, algo = ln["strength"], ln["source"], ln["algo_type"]
-        tick = TICKS.get(sym, 0.25)
+        tick = get_tick_size(sym)
         live = prices.get(sym)
         rt   = lambda p: round(round(p / tick) * tick, 10)
 
@@ -2330,7 +2345,7 @@ def api_algo_lab_preview():
 
     combos = algo_lab.build_param_grid(cfg)
     prices = _fetch_live_prices(symbols)
-    ticks  = {s: TICKS.get(s, 0.25) for s in symbols}
+    ticks  = {s: get_tick_size(s) for s in symbols}
 
     result = algo_lab.preview_grid(symbols, today, prices, ticks, combos, db_path)
     return jsonify({**result, "combos_used": len(combos), "prices": prices})
@@ -2347,7 +2362,7 @@ def api_algo_lab_submit():
 
     combos = algo_lab.build_param_grid(cfg)
     prices = _fetch_live_prices(symbols)
-    ticks  = {s: TICKS.get(s, 0.25) for s in symbols}
+    ticks  = {s: get_tick_size(s) for s in symbols}
 
     result = algo_lab.submit_grid(
         symbols, today, prices, ticks, combos, db_path,
@@ -3101,7 +3116,7 @@ td.rr-empty{color:var(--gl-faint);font-size:11px;background:var(--gl-panel-2);bo
     <!-- Header -->
     <div class="app-header">
       <span class="brand">Galao</span>
-      <span class="verchip">v5.24</span>
+      <span class="verchip">v5.25</span>
       <span class="gl-pill" id="session-broker-badge" style="color:var(--gl-muted)">Broker: —</span>
       <span class="gl-pill" id="session-decider-badge" style="color:var(--gl-muted)">Decider: —</span>
       <span class="gl-pill" id="market-data-badge" style="color:var(--gl-muted)">Market Data: —</span>
@@ -7464,6 +7479,22 @@ document.addEventListener('shown.bs.tab',function(e){
 # ── Release notes ─────────────────────────────────────────────────────────────
 
 _RELEASE_NOTES = [
+    ("v5.25", "Fix stale futures/stock symbol lists (full-system audit)",
+              "Found via a cross-cutting architecture audit: this file's own TICKS dict "
+              "(futures-only, 0.25 default fallback) and _FUTURES tuple (4 micro futures) "
+              "predated ES/NQ/YM/RTY joining live trading. TICKS.get(sym, 0.25) meant any "
+              "stock symbol run through this file's own tools (Create Trades, sandbox price-"
+              "profile bucketing, etc.) silently mis-rounded prices by up to $0.24 against "
+              "lib/order_builder.py's real, already-correct get_tick_size() (right futures "
+              "ticks + a 0.01 stock fallback) -- now imported and used directly instead of a "
+              "second table that can drift. _FUTURES only listed 4 symbols, so the Day Start "
+              "panel's futures-vs-stock split (/api/dayclean/verify) silently bucketed ES/NQ/"
+              "YM/RTY armed lines as 'stock,' undercounting real futures coverage and "
+              "inflating the stock denominator -- fixed to all 8, with the two SQL queries "
+              "that used a hardcoded 4-placeholder IN(?,?,?,?) clause made dynamic to match. "
+              "The manual Create Trades tab's own symbol checkboxes (still just the original "
+              "4) were flagged too but left alone -- expanding that to 38 checkboxes is a UI "
+              "design call, not a pure correctness fix, and out of scope here."),
     ("v5.24", "New Winning Formula tab -- drill-down live-performance tree",
               "User request, after 4 rounds of a design mock: a table showing every algorithm x "
               "Real/Control x sub-algorithm, then PARALLEL single-parameter breakdowns (by Bracket, "
