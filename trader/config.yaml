@@ -146,7 +146,15 @@ decider:
   replenishment_poll_seconds: 90
 
 broker:
-  command_poll_seconds: 5
+  # 2026-09-13: lowered 5->1. Order submission has no event-driven path at all
+  # (unlike fills, which do) -- a new PENDING command waits up to this long
+  # before process_pending_commands() even looks at it, on top of whatever IB
+  # round-trip follows. Found via a full-system latency audit against the
+  # explicit priority "as fast as possible" for signal-to-order time. No prior
+  # comment documented 5s as a deliberately-tuned value (unlike
+  # replenishment_poll_seconds above, which was); the per-pass cost when there's
+  # nothing PENDING is one cheap indexed SQLite SELECT, negligible at 1s.
+  command_poll_seconds: 1
   ib_poll_seconds: 30
 
 visualizer:
