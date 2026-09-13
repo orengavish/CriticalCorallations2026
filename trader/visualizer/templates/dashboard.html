@@ -4,11 +4,16 @@
 
 <div class="card" style="margin-bottom:10px;padding:10px 14px">
   <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap">
-    <button id="btn-replenish" onclick="toggleReplenish()"
+    <!-- 2026-09-13: disabled by policy decision, not wired to onclick anymore --
+         replenishment manufactures extra competitors for a capacity-capped
+         admission queue. See docs/replenishment.md before ever re-enabling.
+         REPLENISH_ENABLED itself, and the /api/replenish GET/POST endpoints
+         this button used to drive, are left untouched in code. -->
+    <button id="btn-replenish" disabled title="Disabled by policy -- see docs/replenishment.md"
       style="font-family:monospace;font-size:13px;font-weight:bold;padding:6px 22px;
-             border-radius:5px;cursor:pointer;border:2px solid #30363d;
-             background:#161b22;color:#6e7681;min-width:180px;white-space:nowrap">
-      REPLENISH: OFF
+             border-radius:5px;cursor:not-allowed;border:2px solid #30363d;
+             background:#161b22;color:#6e7681;min-width:180px;white-space:nowrap;opacity:.6">
+      REPLENISH: DISABLED
     </button>
 
     <button id="btn-flatten" onclick="doFlattenAll()"
@@ -526,7 +531,12 @@ function toggleReplenish(){
   }).then(r=>r.json()).then(d => updateReplenishBtn(d.enabled));
 }
 
-fetch('/api/replenish').then(r=>r.json()).then(d => updateReplenishBtn(d.enabled));
+// 2026-09-13: no longer called on load -- the button is now a static "DISABLED"
+// (see its own HTML comment above) regardless of the real flag's value, so this
+// page can never make it look toggleable again. toggleReplenish()/
+// updateReplenishBtn() are left defined, not deleted, along with /api/replenish
+// itself -- see docs/replenishment.md for how to actually re-enable this.
+// fetch('/api/replenish').then(r=>r.json()).then(d => updateReplenishBtn(d.enabled));
 
 // ── Generate mode switching ──────────────────────────────────────────────────
 let _clLines = [];

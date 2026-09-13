@@ -334,10 +334,17 @@ def run_session(duration_minutes: int = SESSION_MINUTES,
     cleanup_stale_open_rows(db_path, ibc if not dry_run else None)
 
     # ── Set session state ────────────────────────────────────────────────────
+    # 2026-09-13: REPLENISH_ENABLED default flipped to "0" -- disabled by policy
+    # decision (see docs/replenishment.md), not a bug. Replenishment (both
+    # decider.py's own immediate re-arm-on-fill and broker.py's CLOSED-based
+    # baseline-only path) manufactures extra competitors for a capacity-capped
+    # admission queue that's already supposed to run every currently-armed line
+    # through the same priority sort -- re-enable only via that doc's own
+    # instructions, not by flipping this line back.
     with get_db(db_path) as con:
         set_system_state(con, "SESSION",           "RUNNING")
-        set_system_state(con, "REPLENISH_ENABLED", "1")
-    log.info("SESSION=RUNNING  REPLENISH_ENABLED=1")
+        set_system_state(con, "REPLENISH_ENABLED", "0")
+    log.info("SESSION=RUNNING  REPLENISH_ENABLED=0 (disabled by policy, see docs/replenishment.md)")
 
     # ── Start components ─────────────────────────────────────────────────────
     broker_cmd = [sys.executable, "broker.py"]
