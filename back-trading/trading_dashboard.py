@@ -2605,6 +2605,11 @@ body{background:var(--gl-bg)!important}
 .rail-item.active::before{content:"";position:absolute;left:-6px;top:8px;bottom:8px;width:3px;
   background:var(--gl-accent);border-radius:2px}
 .rail-spacer{flex:1}
+/* 2026-09-13: Correlation/Algo Lab/Geva Extract -- deprioritized, not removed. */
+.rail-archived-label{font-size:8px;text-transform:uppercase;letter-spacing:.06em;
+  color:var(--gl-faint);text-align:center;padding:2px 0 1px}
+.rail-item.archived{opacity:.4}
+.rail-item.archived:hover{opacity:.85}
 
 /* Main column */
 .main-col{flex:1; min-width:0; display:flex; flex-direction:column; height:100vh}
@@ -2911,10 +2916,14 @@ td.rr-empty{color:var(--gl-faint);font-size:11px;background:var(--gl-panel-2);bo
     <button class="rail-item" data-group="overview"><span class="ico">&#9671;</span><span class="lbl">Overview</span></button>
     <button class="rail-item" data-group="levels"><span class="ico">&#9638;</span><span class="lbl">Levels</span></button>
     <button class="rail-item" data-group="charts"><span class="ico">&#128200;</span><span class="lbl">Charts</span></button>
-    <button class="rail-item" data-group="correlation"><span class="ico">&#9678;</span><span class="lbl">Correlation</span></button>
-    <button class="rail-item" data-group="algolab"><span class="ico">&#9879;</span><span class="lbl">Algo Lab</span></button>
-    <a class="rail-item" id="rail-link-geva" target="_blank"><span class="ico">&#128279;</span><span class="lbl">Geva Extract</span></a>
     <div class="rail-spacer"></div>
+    <!-- 2026-09-13: Correlation/Algo Lab/Geva Extract greyed out and dropped to the
+         bottom, below the spacer -- user asked for these out of the way, not removed
+         (still fully functional, just visually deprioritized). -->
+    <div class="rail-archived-label">archived</div>
+    <button class="rail-item archived" data-group="correlation"><span class="ico">&#9678;</span><span class="lbl">Correlation</span></button>
+    <button class="rail-item archived" data-group="algolab"><span class="ico">&#9879;</span><span class="lbl">Algo Lab</span></button>
+    <a class="rail-item archived" id="rail-link-geva" target="_blank"><span class="ico">&#128279;</span><span class="lbl">Geva Extract</span></a>
   </nav>
 
   <div class="main-col">
@@ -2922,7 +2931,7 @@ td.rr-empty{color:var(--gl-faint);font-size:11px;background:var(--gl-panel-2);bo
     <!-- Header -->
     <div class="app-header">
       <span class="brand">Galao</span>
-      <span class="verchip">v5.22</span>
+      <span class="verchip">v5.23</span>
       <span class="gl-pill" id="session-broker-badge" style="color:var(--gl-muted)">Broker: —</span>
       <span class="gl-pill" id="session-decider-badge" style="color:var(--gl-muted)">Decider: —</span>
       <span class="gl-pill" id="market-data-badge" style="color:var(--gl-muted)">Market Data: —</span>
@@ -5096,6 +5105,15 @@ function _dcRenderSummary(ex){
     `· Stock lines: ${st.symbols_with_lines}/${st.of} symbols, ${st.total_lines} lines total`;
 }
 async function dcVerify(){
+  // 2026-09-12: this is one of the two calls the init IIFE fires unconditionally on
+  // every page load (loadBroker is the other) -- neither was wrapped in _enterBusy/
+  // _exitBusy, unlike every sibling fetch below. Result: the page-load splash hides on
+  // 'load' (fast -- that only waits for network resources, not these app-level fetches),
+  // then dcVerify() alone can take up to ~30s when IB is slow (this file's own comment
+  // a few lines down measured ~3.7s typical / 30s worst-case) with ZERO visible
+  // indicator during that gap -- "the nice hourglass disappears and we're back to the
+  // OS's own default busy cursor" (user report). Wrapping this closes that exact gap.
+  _enterBusy();
   _dcSetStatus('checking...');
   try{
     const d = await (await fetch('/api/dayclean/verify')).json();
@@ -5109,6 +5127,7 @@ async function dcVerify(){
     _dcApplyGating(d.gating);
     _dcRenderSummary(d.extraction);
   }catch(e){ _dcSetStatus('verify failed: '+e, true); }
+  finally{ _exitBusy(); }
 }
 async function dcClean(){
   if(!confirm('Archive (not delete) old CANCELLED noise from before today?')) return;
@@ -5172,6 +5191,9 @@ let _bkRange = 'today';
 const _BK_RANGE_LABEL = {today: 'today', yesterday: 'yesterday', all: 'all days'};
 
 async function loadBroker(){
+  // Same gap as dcVerify() above -- fired on every page load (and every 5s poll)
+  // with no busy indicator at all until now.
+  _enterBusy();
   try{
     const d=await (await fetch('/api/broker-queue?range='+_bkRange)).json();
     _bkRender('bk-pending',   d.pending,      'pending');
@@ -5206,6 +5228,7 @@ async function loadBroker(){
       heldEl.textContent='none'; heldEl.className='v';
     }
   }catch(e){}
+  finally{ _exitBusy(); }
 }
 
 // 2026-09-12 fix: clicking the Broker tab used to arm setInterval(dcVerify,15000) --
@@ -6986,6 +7009,21 @@ document.addEventListener('shown.bs.tab',function(e){
 # ── Release notes ─────────────────────────────────────────────────────────────
 
 _RELEASE_NOTES = [
+    ("v5.23", "Close the last busy-indicator gap; grey out Correlation/Algo Lab/Geva Extract",
+              "User report: 'the hourglass starts nice, then turns into the default OS cursor "
+              "and blue circle -- we don't have the entire hourglass.' Root cause: the init "
+              "IIFE that fires on every page load calls dcVerify() and loadBroker() directly, "
+              "neither wrapped in _enterBusy()/_exitBusy() unlike every sibling fetch in this "
+              "file -- so once the page-load splash hides (on window 'load', which only waits "
+              "for network resources, not these app-level fetches), there was a real multi-"
+              "second-to-30s window (dcVerify() spawns ib_dayclean.py fresh each call, ~3.7s "
+              "typical / up to 30s when IB is slow, per this file's own v5.12-era comment) with "
+              "ZERO in-page indicator -- exactly the gap where the OS's own default busy cursor "
+              "shows through. Wrapped both in _enterBusy()/_exitBusy() so the existing v5.18 "
+              "busy-strip covers this window like it already does everywhere else. Separately, "
+              "per user request: Correlation/Algo Lab/Geva Extract rail items moved below the "
+              "rail spacer and greyed out (opacity .4, .85 on hover) -- deprioritized and out of "
+              "the way, not removed; all three keep their full existing functionality."),
     ("v5.22", "Allocation tab now shares broker.py's real enforcement table (Tier 2.5 wrap-up)",
               "This dashboard's Allocation tab display and broker.py's new admission-control "
               "Gate 1b (per-family capacity allocation, this session's strategic reliability "
