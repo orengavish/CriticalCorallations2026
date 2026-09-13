@@ -71,6 +71,13 @@ def _validate(raw: dict):
             raise ValueError(f"config.yaml ib section missing: '{key}'")
     if not raw["symbols"]:
         raise ValueError("config.yaml: symbols list is empty")
+    # 2026-09-13 fix: these two nested keys used to be read directly, raising an
+    # unguarded KeyError (instead of this function's own intended ValueError
+    # message) if either was missing from an otherwise-present `orders:` section
+    # -- a plausible mid-edit config.yaml state, not just a hypothetical.
+    for subkey in ("active_brackets", "tick_size"):
+        if subkey not in raw["orders"]:
+            raise ValueError(f"config.yaml: orders.{subkey} is missing")
     if not raw["orders"]["active_brackets"]:
         raise ValueError("config.yaml: orders.active_brackets is empty")
     tick = raw["orders"]["tick_size"]
@@ -150,6 +157,28 @@ def self_test() -> bool:
         except FileNotFoundError:
             raised = True
         assert raised, "Missing file should raise FileNotFoundError"
+
+        # Test 4: `orders:` section present but missing a required subkey raises
+        # ValueError, not a raw KeyError (2026-09-13 fix -- these two were read
+        # directly with no existence check, unlike every other validated key).
+        reset_cache()
+        real = yaml.safe_load(Path(_find_config()).read_text())
+        broken = dict(real)
+        broken["orders"] = {k: v for k, v in real["orders"].items() if k != "tick_size"}
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
+            yaml.dump(broken, f)
+            tmp2 = f.name
+        try:
+            raised2 = False
+            try:
+                get_config(Path(tmp2))
+            except ValueError:
+                raised2 = True
+            except KeyError:
+                raised2 = False  # explicitly the bug this test guards against
+            assert raised2, "orders.tick_size missing should raise ValueError, not KeyError"
+        finally:
+            os.unlink(tmp2)
 
         reset_cache()
         print("[self-test] config_loader: PASS")

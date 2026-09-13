@@ -1137,14 +1137,6 @@ def get_fetch_log(con, days: int = 30) -> list:
     ).fetchall()
 
 
-def get_fetch_log_latest(con, symbol: str, date: str) -> list:
-    """Return all fetch_log rows for a specific symbol + date."""
-    return con.execute(
-        "SELECT * FROM fetch_log WHERE symbol=? AND date=? ORDER BY fetched_at DESC",
-        (symbol, date)
-    ).fetchall()
-
-
 def update_price_cache(con, symbol: str, price: float, fill_ts: str, source: str = "fill"):
     """Save/update last known price for symbol. Call on every real fill --
     bypasses paper trading's ~15min market-data delay for later commands."""
