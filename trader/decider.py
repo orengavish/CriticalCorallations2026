@@ -33,7 +33,7 @@ import sys; sys.path.insert(0, str(_ROOT)) if str(_ROOT) not in sys.path else No
 
 from lib.config_loader import get_config
 from lib.logger import get_logger
-from lib.db import get_db, init_db, get_filled_commands, get_system_state, set_system_state, update_command_status, update_price_cache, record_completed_trade
+from lib.db import get_db, init_db, get_filled_commands, get_system_state, set_system_state, update_command_status, update_price_cache, record_completed_trade, _root_critical_line_id
 from lib.order_builder import determine_entry_type, calc_bracket_prices, round_tick, get_tick_size
 from lib.critical_lines import get_armed_lines
 from lib.session_clock import (is_entry_cutoff, is_forced_exit_time, is_before_open,
@@ -339,13 +339,24 @@ def replenish(symbol: str, date_str: str, current_price: float,
                 log.debug(f"Command {cid} already replenished — skip")
                 continue
 
-        # Check armed status (may have been disarmed by SL cool-down)
+        # Check armed status (may have been disarmed by SL cool-down). Resolved
+        # by critical_line_id (walking to the chain root), NOT by re-deriving
+        # (symbol, date, price) -- 2026-09-13 fix, found via a full-system audit:
+        # a MIRRORED full-size command's (ES/NQ/YM/RTY) origin line was only
+        # ever inserted under its micro symbol (MES/MNQ/MYM/M2K); the old
+        # symbol-keyed lookup could never find a match for the full-size side,
+        # silently and permanently disabling replenishment for that whole side
+        # of a pair after its first fill -- exactly defeating the capacity-
+        # doubling design this mirroring exists for (confirmed: decider.py's own
+        # mirroring code always sets critical_line_id to the origin line, never
+        # a full-size-symbol line that doesn't exist).
         with get_db(db_path) as con:
-            line_row = con.execute(
-                "SELECT * FROM critical_lines WHERE symbol=? AND date=?"
-                " AND price=? AND armed=1",
-                (cmd["symbol"], date_str, cmd["line_price"])
-            ).fetchone()
+            line_id = _root_critical_line_id(con, cmd)
+            line_row = (
+                con.execute("SELECT * FROM critical_lines WHERE id=? AND armed=1",
+                            (line_id,)).fetchone()
+                if line_id is not None else None
+            )
 
         if not line_row:
             log.info(f"Command {cid}: line {cmd['line_price']} is disarmed — no replenishment")
@@ -359,17 +370,26 @@ def replenish(symbol: str, date_str: str, current_price: float,
         )
 
         with get_db(db_path) as con:
+            # 2026-09-13: parent_command_id/critical_line_id were never set here
+            # (found via a full-system audit, corroborated independently by a
+            # second review of lib/db.py against this file) -- every replenished
+            # command became an untraceable lineage "root," breaking per-line
+            # PnL attribution (lib/algo_pnl.py's line_detect_algo/source grouping)
+            # for the majority of live trades, and blocking the mirrored-legs fix
+            # above (which needs a real critical_line_id to resolve the line by).
             con.execute("""
                 INSERT INTO commands
                     (symbol, line_price, line_type, line_strength,
                      direction, entry_type, entry_price, tp_price, sl_price,
-                     bracket_size, source, quantity, logical_trade_id, status)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')
+                     bracket_size, source, quantity, logical_trade_id, status,
+                     parent_command_id, critical_line_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?, ?)
             """, (
                 cmd["symbol"], cmd["line_price"], cmd["line_type"], cmd["line_strength"],
                 cmd["direction"], entry_type,
                 prices["entry_price"], prices["tp_price"], prices["sl_price"],
-                cmd["bracket_size"], cmd["source"] or "critical_line", qty, cmd["logical_trade_id"]
+                cmd["bracket_size"], cmd["source"] or "critical_line", qty, cmd["logical_trade_id"],
+                cmd["id"], line_id,
             ))
 
         log.info(
@@ -905,9 +925,59 @@ def self_test() -> bool:
             assert repl_ltid == orig_ltid, \
                 f"replenish() did not propagate logical_trade_id: {orig_ltid!r} -> {repl_ltid!r}"
 
+            # 2026-09-13: replenish() used to drop parent_command_id/critical_line_id
+            # entirely, making every replenished command an untraceable lineage
+            # "root" -- must now propagate both, same as spawn_replenishment()
+            # already does for the other replenishment path.
+            with get_db(db_path) as con:
+                orig_line_id = con.execute(
+                    "SELECT critical_line_id FROM commands WHERE id=?", (cmd_id,)
+                ).fetchone()["critical_line_id"]
+                repl_row = con.execute(
+                    "SELECT parent_command_id, critical_line_id FROM commands"
+                    " ORDER BY id DESC LIMIT 1"
+                ).fetchone()
+            assert repl_row["parent_command_id"] == cmd_id, \
+                f"replenish() must set parent_command_id to the FILLED parent: {dict(repl_row)}"
+            assert repl_row["critical_line_id"] == orig_line_id, \
+                f"replenish() must preserve critical_line_id: {dict(repl_row)}"
+
             # No double-replenishment
             n_replenished2 = replenish("MES", today, current_price, cfg, db_path)
             assert n_replenished2 == 0, "Double replenishment detected"
+
+            # 2c. Mirrored full-size leg (ES) replenishment -- 2026-09-13 fix:
+            # ES's origin critical_lines row only exists under MES (mirroring
+            # never creates a duplicate line under the full-size symbol), so a
+            # symbol-keyed armed-line lookup could never find it. Build an ES
+            # command with critical_line_id pointing at the SAME MES line
+            # (exactly how decider's own mirroring code sets it up), mark it
+            # FILLED, and confirm replenish("ES", ...) now succeeds instead of
+            # silently refusing forever with "line is disarmed."
+            with get_db(db_path) as con:
+                mes_line_id = con.execute(
+                    "SELECT critical_line_id FROM commands WHERE id=?", (cmd_id,)
+                ).fetchone()["critical_line_id"]
+                assert mes_line_id is not None, "fixture MES command has no critical_line_id to mirror"
+                es_cmd_id = con.execute("""
+                    INSERT INTO commands
+                        (symbol, line_price, line_type, line_strength, direction,
+                         entry_type, entry_price, tp_price, sl_price, bracket_size,
+                         source, quantity, logical_trade_id, status, critical_line_id,
+                         fill_price, fill_time)
+                    VALUES ('ES', 6490, 'SUPPORT', 2, 'BUY', 'LMT', 6490, 6494, 6486, 4,
+                            'critical_line', 1, 'lt-es-mirror', 'FILLED', ?, ?, ?)
+                """, (mes_line_id, current_price, _now_utc())).lastrowid
+
+            n_es_replenished = replenish("ES", today, current_price, cfg, db_path)
+            assert n_es_replenished == 1, \
+                f"mirrored ES leg must replenish via its shared critical_line_id, got {n_es_replenished}"
+            with get_db(db_path) as con:
+                es_repl = con.execute(
+                    "SELECT parent_command_id, critical_line_id, symbol FROM commands"
+                    " ORDER BY id DESC LIMIT 1"
+                ).fetchone()
+            assert es_repl["parent_command_id"] == es_cmd_id and es_repl["symbol"] == "ES", dict(es_repl)
 
             # 3. Replenishment disabled on SHUTDOWN
             with get_db(db_path) as con:
