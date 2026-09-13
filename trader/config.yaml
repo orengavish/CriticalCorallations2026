@@ -9,7 +9,14 @@ ib:
   paper_host: 127.0.0.1
   paper_port: 4002
   paper_client_ids: [201, 202, 203, 204, 205, 206, 207, 208, 209, 210]
-  reconnect_interval_seconds: 30
+  # 2026-09-13: lowered 30->10 (full-system latency audit). Every retry waits
+  # this long before trying again, up to 4 waits before broker.py/decider.py
+  # give up and exit -- a blip that clears on attempt 2 or 3 still cost up to
+  # 90-120s of zero order submission/fill detection/reconciliation at 30s.
+  # Left as a single flat value rather than a graduated backoff schedule
+  # (2/5/10/20s etc.) -- that's a real further improvement but a bigger design
+  # change than this pass's confidence in the exact right schedule justifies.
+  reconnect_interval_seconds: 10
   connection_timeout: 5
   fetcher_client_ids: [801, 802, 803]
   ibc_startgateway_bat: "C:\\IBC\\StartGateway.bat"
