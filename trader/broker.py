@@ -35,6 +35,7 @@ from lib.db import get_db, init_db, get_pending_commands, update_command_status,
 from lib.allocation import check_admission, family_for_source
 from lib.ib_client import IBClient
 from lib.order_builder import build_bracket, place_bracket, round_tick, get_tick_size
+from lib.session_clock import is_entry_cutoff
 from trader.correlation_trail import trail_correlation_positions, TRAIL_TICKS
 from trader.spread_manager import check_spread_signals, check_spread_exit, check_portfolio_kill_switch
 
@@ -386,6 +387,25 @@ def process_pending_commands(ibc: IBClient, db_path, cfg) -> int:
             log.warning(f"Command {cid} ({cmd['symbol']} {cmd['direction']}, family={fam}) "
                         f"held back — {fam_resting} resting for this family on this "
                         f"pool, at its allocated cap of {fam_cap}")
+            continue
+
+        # Gate 1c: entry cutoff (2026-09-13 fix, full-system audit). decider.py already
+        # refuses to GENERATE a new command inside its own entry-cutoff window
+        # (lib.session_clock.is_entry_cutoff, ~30 min before close) -- but broker.py
+        # never imported session_clock at all, so a command already sitting PENDING
+        # before the window opened (held back by Gate 1/1b's capacity caps, or just
+        # this loop's own cadence) would sail through submission with no clock check
+        # whatsoever once capacity freed up, even minutes before close -- exactly the
+        # "stop searching for new entries" invariant this system documents but only
+        # enforced at one of its two real chances to. Same treatment as Gate 2's stale-
+        # price check: CANCEL with a reason, not left PENDING forever (it can never
+        # become valid again today).
+        if is_entry_cutoff(cmd["symbol"]):
+            with get_db(db_path) as con:
+                update_command_status(con, cid, "CANCELLED",
+                                       error_message="entry cutoff reached before submission")
+            log.info(f"Command {cid} ({cmd['symbol']}) cancelled — entry cutoff reached "
+                      f"before this PENDING command could be submitted")
             continue
 
         # Claim lock — atomic status change to SUBMITTING
@@ -1392,6 +1412,16 @@ def self_test() -> bool:
     """
     import tempfile
     from datetime import timedelta
+    # 2026-09-13: Gate 1c (entry cutoff) added below now calls the real
+    # is_entry_cutoff() against actual wall-clock time -- every OTHER test case
+    # in this function submits fake commands with no interest in testing that
+    # gate specifically, and would become a flaky, time-of-day-dependent test
+    # otherwise (failing for real only within ~30 min of some symbol's close).
+    # Same monkeypatch pattern already established in decider.py/
+    # correlation_signal.py's self-tests for this exact class of risk.
+    mod = sys.modules[__name__]
+    original_is_entry_cutoff = mod.is_entry_cutoff
+    mod.is_entry_cutoff = lambda *a, **kw: False
     try:
         from lib.logger import reset_loggers
         from lib.db import set_system_state
@@ -1875,6 +1905,23 @@ def self_test() -> bool:
             assert child_baseline is not None, \
                 "random_lmt (an ungoverned baseline source) must still be replenished"
 
+            # 11. Gate 1c (2026-09-13): a PENDING command still sitting unsubmitted once
+            # the entry-cutoff window opens must be CANCELLED at submission time, not
+            # silently let through just because it already passed generation-time checks.
+            mod.is_entry_cutoff = lambda *a, **kw: True
+            try:
+                id_cutoff = _insert_cmd(symbol='MES', direction='BUY', entry_type='LMT',
+                                         status='PENDING', needs_review=0,
+                                         entry_price=6500.0, tp_price=6502.0, sl_price=6498.0)
+                process_pending_commands(_FakeIBClient(price=6500.0), db_path, cfg)
+                with get_db(db_path) as con:
+                    s_cutoff = con.execute("SELECT status FROM commands WHERE id=?",
+                                            (id_cutoff,)).fetchone()["status"]
+                assert s_cutoff == "CANCELLED", \
+                    f"PENDING command must be cancelled once entry cutoff is reached: {s_cutoff}"
+            finally:
+                mod.is_entry_cutoff = lambda *a, **kw: False
+
         print("[self-test] broker: PASS")
         return True
 
@@ -1882,6 +1929,8 @@ def self_test() -> bool:
         print(f"[self-test] broker: FAIL -- {e}")
         import traceback; traceback.print_exc()
         return False
+    finally:
+        mod.is_entry_cutoff = original_is_entry_cutoff
 
 
 if __name__ == "__main__":
