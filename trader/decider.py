@@ -33,7 +33,7 @@ import sys; sys.path.insert(0, str(_ROOT)) if str(_ROOT) not in sys.path else No
 
 from lib.config_loader import get_config
 from lib.logger import get_logger
-from lib.db import get_db, init_db, get_filled_commands, get_system_state, set_system_state, update_command_status, update_price_cache
+from lib.db import get_db, init_db, get_filled_commands, get_system_state, set_system_state, update_command_status, update_price_cache, record_completed_trade
 from lib.order_builder import determine_entry_type, calc_bracket_prices, round_tick, get_tick_size
 from lib.critical_lines import get_armed_lines
 from lib.session_clock import (is_entry_cutoff, is_forced_exit_time, is_before_open,
@@ -446,12 +446,25 @@ def force_close_symbol(symbol: str, db_path, ibc) -> int:
         return 0
 
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    # 2026-09-13: exit_price/pnl_points were never set here -- every FORCED_EOD close
+    # left pnl_points NULL forever (found while designing a live-performance drilldown:
+    # 38 of 40 closed research trades were unscored). Capture the flatten MKT order's
+    # own fill price (ib_insync's placeOrder returns a Trade that updates in place;
+    # market orders fill within a poll or two in paper trading) and apply it as every
+    # flattened command's exit_price, same PnL formula every other exit path uses.
+    flatten_fill_price = None
     if net != 0:
         try:
             action = "SELL" if net > 0 else "BUY"
             mkt = MarketOrder(action, abs(net))
-            ibc.paper.placeOrder(contract, mkt)
-            log.info(f"[forced_eod] MKT exit placed for {symbol}: {action} {abs(net)}")
+            trade = ibc.paper.placeOrder(contract, mkt)
+            for _ in range(10):
+                if trade.orderStatus.avgFillPrice:
+                    break
+                ibc.paper.sleep(0.5)
+            flatten_fill_price = trade.orderStatus.avgFillPrice or None
+            log.info(f"[forced_eod] MKT exit placed for {symbol}: {action} {abs(net)}"
+                     + (f" @ {flatten_fill_price}" if flatten_fill_price else " (fill price still pending)"))
         except Exception as e:
             log.error(f"[forced_eod] {symbol}: MKT exit failed, leaving commands FILLED "
                        f"for retry next poll: {e}")
@@ -459,8 +472,15 @@ def force_close_symbol(symbol: str, db_path, ibc) -> int:
 
     with get_db(db_path) as con:
         for cmd in filled:
+            pnl = None
+            if flatten_fill_price is not None and cmd["fill_price"] is not None:
+                pnl = (flatten_fill_price - cmd["fill_price"]) if cmd["direction"] == "BUY" \
+                      else (cmd["fill_price"] - flatten_fill_price)
             update_command_status(con, cmd["id"], "CLOSED",
-                                  exit_time=now, exit_reason="FORCED_EOD")
+                                  exit_time=now, exit_reason="FORCED_EOD",
+                                  exit_price=flatten_fill_price,
+                                  pnl_points=round(pnl, 4) if pnl is not None else None)
+            record_completed_trade(con, cmd["id"])
     log.info(f"[forced_eod] {symbol}: force-flattened {len(filled)} command(s) "
              f"(net position was {net})")
     return len(filled)
@@ -900,10 +920,18 @@ def self_test() -> bool:
         class _FakePos:
             def __init__(self, symbol, qty): self.contract = type("C", (), {"symbol": symbol}); self.position = qty
 
+        class _FakeTrade:
+            def __init__(self, fill_price):
+                self.orderStatus = type("OS", (), {"avgFillPrice": fill_price})()
+
         class _FakePaper:
-            def __init__(self): self.orders_placed = []; self.cancels = []
-            def placeOrder(self, contract, order): self.orders_placed.append((contract, order))
+            def __init__(self, fill_price=6491.0):
+                self.orders_placed = []; self.cancels = []; self._fill_price = fill_price
+            def placeOrder(self, contract, order):
+                self.orders_placed.append((contract, order))
+                return _FakeTrade(self._fill_price)  # paper MKT orders fill instantly
             def cancelOrder(self, order): self.cancels.append(order)
+            def sleep(self, t): pass
 
         class _FakeIBC:
             def __init__(self, positions): self.paper = _FakePaper(); self._positions = positions
@@ -917,9 +945,9 @@ def self_test() -> bool:
                 con.execute(
                     "INSERT INTO commands (symbol, line_price, line_type, line_strength, direction,"
                     " entry_type, entry_price, tp_price, sl_price, bracket_size, source,"
-                    " quantity, logical_trade_id, status) VALUES"
+                    " quantity, logical_trade_id, status, fill_price, fill_time) VALUES"
                     " ('MES', 6490, 'SUPPORT', 2, 'BUY', 'LMT', 6490, 6494, 6486, 4,"
-                    " 'critical_line', 1, 'lt1', 'FILLED')"
+                    " 'critical_line', 1, 'lt1', 'FILLED', 6490.5, '2026-09-13T14:00:00Z')"
                 )
                 con.execute(
                     "INSERT INTO commands (symbol, line_price, line_type, line_strength, direction,"
@@ -936,8 +964,22 @@ def self_test() -> bool:
             assert order.action == "SELL", "net long MES position must be flattened with a SELL"
             assert order.totalQuantity == 1
             with get_db(db_path3) as con:
-                row = con.execute("SELECT status, exit_reason FROM commands WHERE logical_trade_id='lt1'").fetchone()
+                row = con.execute(
+                    "SELECT id, status, exit_reason, exit_price, pnl_points FROM commands"
+                    " WHERE logical_trade_id='lt1'").fetchone()
                 assert row["status"] == "CLOSED" and row["exit_reason"] == "FORCED_EOD"
+                # 2026-09-13: FORCED_EOD closes used to leave exit_price/pnl_points NULL
+                # forever (found designing a live-performance drilldown -- 38/40 closed
+                # research trades were unscored). Now uses the flatten MKT order's own
+                # fill price, same formula as every other exit path: BUY @ 6490.5,
+                # flattened @ 6491.0 (the fake trade's price) -> +0.5.
+                assert row["exit_price"] == 6491.0, f"expected flatten fill price 6491.0, got {row['exit_price']}"
+                assert row["pnl_points"] == 0.5, f"expected pnl_points 0.5, got {row['pnl_points']}"
+                ct_row = con.execute(
+                    "SELECT pnl_points FROM completed_trades WHERE command_id=?", (row["id"],)
+                ).fetchone()
+                assert ct_row is not None, "FORCED_EOD close must also land in completed_trades"
+                assert ct_row["pnl_points"] == 0.5
                 aapl_row = con.execute("SELECT status FROM commands WHERE logical_trade_id='lt2'").fetchone()
                 assert aapl_row["status"] == "FILLED", "AAPL must be untouched by an MES-scoped call"
 
