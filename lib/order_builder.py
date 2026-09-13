@@ -193,9 +193,14 @@ def place_bracket(ib: IB, contract, orders: dict) -> dict:
     is_stp_entry = entry_order.orderType in ('STP', 'MKT')
 
     if is_stp_entry:
-        # Place entry first to get the real orderId
+        # Place entry first to get the real orderId. 2026-09-13: the ib.sleep(0.1)
+        # that used to sit here (paid serially for every STP/MKT bracket submitted)
+        # was pure wasted latency -- confirmed against ib_insync's own placeOrder()
+        # source: orderId is assigned client-side (self.client.getReqId()) and set
+        # on the order object synchronously, before placeOrder() returns, no network
+        # round-trip involved. entry_trade.order.orderId below is already valid the
+        # instant placeOrder() returns.
         entry_trade = ib.placeOrder(contract, entry_order)
-        ib.sleep(0.1)
         real_id = entry_trade.order.orderId
         tp_order.parentId = real_id
         sl_order.parentId = real_id
