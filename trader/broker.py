@@ -823,27 +823,54 @@ def _drain_rebase_queue(ibc: IBClient, db_path) -> int:
 def replenish_if_enabled(ibc: IBClient, db_path, cfg) -> int:
     """
     If REPLENISH_ENABLED=1 in system_state, find CLOSED commands that have
-    no child replenishment yet and spawn one PENDING replacement each.
-    Returns number of replenishments spawned.
+    no child replenishment yet and spawn one PENDING replacement each via
+    spawn_replenishment() -- random direction, defaults to a MKT entry for any
+    source it doesn't recognize. Returns number of replenishments spawned.
+
+    2026-09-13: found live via a full-system audit, and confirmed already firing
+    for real in the live DB (66 spawned children, several already SUBMITTED to
+    paper IB) -- the exclusion below used to be `source != 'critical_line'`, a
+    literal string match against a source value that hasn't actually been used
+    since the source-tagging scheme evolved (0 commands anywhere have
+    source='critical_line' today; confirmed live). That made the exclusion a
+    no-op: every real signal source (research_ce/_stock, research_random/_stock,
+    geva_extract, ...) sailed through it and got "replenished" here with
+    spawn_replenishment()'s random.choice(["BUY","SELL"]) direction and a
+    defaulted MKT entry type -- a coin-flip market order with NO relation to the
+    actual signal, laundered through a code path whose whole point is
+    "regenerate what the signal says," disguised as if it belonged to the same
+    strategy (same `source` value copied onto the child). This was clearly never
+    the intent for these sources -- decider.py's OWN replenish() already
+    regenerates a proper signal-driven replacement for them (the instant an
+    entry FILLS, not once it CLOSES, so it runs first) -- this function's random-
+    replenish behavior was designed for the deliberately-random baseline sources
+    (random_lmt/random_mkt/random_stp, see random_gen.py) where "random
+    direction" is the actual point (a null-hypothesis control), not a bug.
+    Fix: only replenish sources lib.allocation doesn't recognize as a governed
+    signal family -- family_for_source() returns "Other" for exactly the
+    baseline/legacy sources this was meant for, and a real family name for every
+    signal source decider.py already re-arms on its own.
     """
     with get_db(db_path) as con:
         if get_system_state(con, "REPLENISH_ENABLED") != "1":
             return 0
 
-    # Find completed commands with no child yet
+    # Find completed commands with no child yet. Fetches a wider raw window
+    # than the final 50-candidate cap since most of it gets filtered out below
+    # by family (only ungoverned/"Other" sources are eligible here).
     with get_db(db_path) as con:
-        candidates = con.execute("""
+        raw_candidates = con.execute("""
             SELECT c.* FROM commands c
             WHERE c.status = 'CLOSED'
               AND c.source IS NOT NULL
-              AND c.source != 'critical_line'
               AND NOT EXISTS (
                   SELECT 1 FROM commands child
                   WHERE child.parent_command_id = c.id
               )
             ORDER BY c.updated_at DESC
-            LIMIT 50
+            LIMIT 500
         """).fetchall()
+    candidates = [c for c in raw_candidates if family_for_source(c["source"]) == "Other"][:50]
 
     if not candidates:
         return 0
@@ -1790,6 +1817,37 @@ def self_test() -> bool:
                 r_spread = con.execute("SELECT status FROM commands WHERE id=?", (id_spread,)).fetchone()
             assert r_spread["status"] == "FILLED", \
                 "spread legs have no real TP/SL by design -- this event path must never touch them"
+
+            # 10. replenish_if_enabled (2026-09-13, full-system audit): must NOT
+            #     randomly replenish a real signal source anymore -- confirmed live
+            #     in production (66 already-spawned random-direction MKT children
+            #     from research_ce_stock/geva_extract/research_random_stock/
+            #     research_ce parents) before this fix. Must STILL replenish a
+            #     genuinely-random baseline source (random_lmt) -- that behavior
+            #     is intentional, not part of the bug.
+            with get_db(db_path) as con:
+                set_system_state(con, "REPLENISH_ENABLED", "1")
+            id_signal = _insert_cmd(symbol='MES', source='research_ce', status='CLOSED',
+                                     needs_review=0, direction='BUY', entry_type='LMT',
+                                     fill_price=6500.0, exit_price=6504.0, exit_reason='TP',
+                                     pnl_points=4.0)
+            id_baseline = _insert_cmd(symbol='MYM', source='random_lmt', status='CLOSED',
+                                       needs_review=0, direction='SELL', entry_type='LMT',
+                                       fill_price=52000.0, exit_price=51996.0, exit_reason='TP',
+                                       pnl_points=4.0)
+            fake_ibc_repl = _FakeIBClient(price=6500.0)
+            n_spawned = replenish_if_enabled(fake_ibc_repl, db_path, cfg)
+            assert n_spawned == 1, f"expected exactly 1 replenishment (baseline only), got {n_spawned}"
+            with get_db(db_path) as con:
+                child_signal = con.execute(
+                    "SELECT id FROM commands WHERE parent_command_id=?", (id_signal,)).fetchone()
+                child_baseline = con.execute(
+                    "SELECT id, direction, entry_type FROM commands WHERE parent_command_id=?",
+                    (id_baseline,)).fetchone()
+            assert child_signal is None, \
+                "research_ce (a governed signal family) must NOT get a random replenishment"
+            assert child_baseline is not None, \
+                "random_lmt (an ungoverned baseline source) must still be replenished"
 
         print("[self-test] broker: PASS")
         return True
