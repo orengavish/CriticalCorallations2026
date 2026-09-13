@@ -44,6 +44,23 @@ SYMBOL_MULTIPLIERS = {
 }
 
 
+def _safe_params_json(raw):
+    """
+    2026-09-13: json.loads(params_json) used to run unguarded against a
+    free-form TEXT column with no validation at insert time (lib/db.py's
+    schema) -- one legacy/malformed row would raise json.JSONDecodeError and
+    crash the WHOLE breakdown for every symbol/source, not just the offending
+    row. None (same as the already-existing "no params_json at all" case) is a
+    safe fallback -- this module is read-only P&L reporting, not a trading path.
+    """
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except (ValueError, TypeError):
+        return None
+
+
 def get_breakdown(db_path, date_from: str = None, date_to: str = None) -> list:
     """
     Returns one dict per (symbol, source, algo_type, params_json, line_detect_algo)
@@ -91,7 +108,7 @@ def get_breakdown(db_path, date_from: str = None, date_to: str = None) -> list:
             g = {
                 "symbol": r["symbol"], "source": r["source"] or "unknown",
                 "algo_type": r["algo_type"],
-                "params": json.loads(r["params_json"]) if r["params_json"] else None,
+                "params": _safe_params_json(r["params_json"]),
                 "params_json": r["params_json"],
                 "line_detect_algo": li.get("algo_type"),
                 "line_detect_source": li.get("source"),
@@ -245,6 +262,16 @@ def self_test() -> bool:
             # date_from/date_to filtering
             future_only = get_breakdown(db_path, date_from="2099-01-01")
             assert future_only == [], "date_from filter should exclude all 2026 trades"
+
+            # 2026-09-13: a malformed params_json must not crash the WHOLE breakdown --
+            # one bad legacy row used to raise json.JSONDecodeError for every symbol.
+            _insert_closed("MYM", "BUY", 52000.0, 52002.0, 51999.0, 52002.0,
+                           "algo_lab", "FADE", "{not valid json")
+            breakdown_with_bad_row = get_breakdown(db_path)
+            assert len(breakdown_with_bad_row) == 4, \
+                f"malformed params_json must still produce a group, got {len(breakdown_with_bad_row)}"
+            bad_group = next(g for g in breakdown_with_bad_row if g["symbol"] == "MYM")
+            assert bad_group["params"] is None, "malformed JSON must fall back to None, not raise"
 
         print("[self-test] algo_pnl: PASS")
         return True
