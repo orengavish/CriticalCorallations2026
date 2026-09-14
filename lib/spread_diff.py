@@ -13,10 +13,12 @@ etc.), which are for the mini contracts (ES/NQ/YM/RTY) the lessons were taught
 on -- a ~10x larger dollar value per point. The ratio math is the same either
 way; the multiplier just needs to match what this system actually trades.
 
-Computed fresh from trader/data/bars.db's `bars_30m` (all 4 symbols have full
-raw coverage there -- the existing `bars_30m_diffs` table only covers 3 of the
-6 possible pairs and isn't dollar-scaled, so this reads bars_30m directly
-rather than depending on it).
+Computed fresh from trader/data/bars.db's `bars_15m` (15-min OHLCV, matching
+AI-35b's "set up on... the 15-min intraday chart" -- switched from the legacy
+bars_30m table on 2026-09-14, see docs/data_granularity.md. All 4 symbols have
+full raw coverage there; the existing `bars_30m_diffs` table only covers 3 of
+the 6 possible pairs, isn't dollar-scaled, and is the wrong granularity anyway,
+so this reads bars_15m directly rather than depending on it).
 
 Entry trigger (AI-35c), deliberately simplified for v1 -- both conditions
 required together:
@@ -47,7 +49,7 @@ ALL_PAIRS = [
 
 GAP_MULTIPLIER = 1.75          # midpoint of AI-35c's "1.5-2x" range
 SWING_WINDOW_DAYS = 20         # trailing window for the average daily swing
-EXTREME_LOOKBACK_BARS = 40     # ~20h of 30-min bars, for the "new local extreme" check
+EXTREME_LOOKBACK_BARS = 80     # ~20h of 15-min bars, for the "new local extreme" check
 
 
 def _read_closes(bars_db_path, symbol: str, limit_bars: int = None) -> list:
@@ -59,13 +61,13 @@ def _read_closes(bars_db_path, symbol: str, limit_bars: int = None) -> list:
     try:
         if limit_bars:
             rows = con.execute(
-                "SELECT ts, close FROM bars_30m WHERE symbol=? ORDER BY ts DESC LIMIT ?",
+                "SELECT ts, close FROM bars_15m WHERE symbol=? ORDER BY ts DESC LIMIT ?",
                 (symbol, limit_bars)
             ).fetchall()
             rows.reverse()
         else:
             rows = con.execute(
-                "SELECT ts, close FROM bars_30m WHERE symbol=? ORDER BY ts", (symbol,)
+                "SELECT ts, close FROM bars_15m WHERE symbol=? ORDER BY ts", (symbol,)
             ).fetchall()
         return rows
     except sqlite3.OperationalError:
@@ -183,7 +185,7 @@ def self_test() -> bool:
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "bars_test.db"
             con = sqlite3.connect(db_path)
-            con.execute("CREATE TABLE bars_30m (symbol TEXT, ts TEXT, "
+            con.execute("CREATE TABLE bars_15m (symbol TEXT, ts TEXT, "
                         "open REAL, high REAL, low REAL, close REAL, volume REAL)")
 
             # 19 quiet days (small, constant swing) then 1 wide-gap day, for MES/MNQ.
@@ -194,9 +196,9 @@ def self_test() -> bool:
                 mnq_vals = [20000.0, 20000.0] if not is_last else [20000.0, 20000.0]  # MNQ flat
                 for i, (mp, np_) in enumerate(zip(mes_vals, mnq_vals)):
                     ts = f"{d}T{14+i:02d}:00:00Z"
-                    con.execute("INSERT INTO bars_30m VALUES ('MES', ?, ?,?,?,?,?)",
+                    con.execute("INSERT INTO bars_15m VALUES ('MES', ?, ?,?,?,?,?)",
                                (ts, mp, mp, mp, mp, 100))
-                    con.execute("INSERT INTO bars_30m VALUES ('MNQ', ?, ?,?,?,?,?)",
+                    con.execute("INSERT INTO bars_15m VALUES ('MNQ', ?, ?,?,?,?,?)",
                                (ts, np_, np_, np_, np_, 100))
             con.commit()
             con.close()
@@ -229,8 +231,8 @@ def self_test() -> bool:
                 for i in range(2):
                     ts = f"{d}T{14+i:02d}:00:00Z"
                     con2 = sqlite3.connect(db_path)
-                    con2.execute("INSERT INTO bars_30m VALUES ('MYM', ?, 42000,42000,42000,42000,100)", (ts,))
-                    con2.execute("INSERT INTO bars_30m VALUES ('M2K', ?, 2200,2200,2200,2200,100)", (ts,))
+                    con2.execute("INSERT INTO bars_15m VALUES ('MYM', ?, 42000,42000,42000,42000,100)", (ts,))
+                    con2.execute("INSERT INTO bars_15m VALUES ('M2K', ?, 2200,2200,2200,2200,100)", (ts,))
                     con2.commit()
                     con2.close()
             no_signal = check_spread_entry(db_path, "MYM", "M2K")

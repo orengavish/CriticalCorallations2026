@@ -21,6 +21,22 @@ lib/algo_pnl.SYMBOL_MULTIPLIERS, simplified to a small whole-number ratio
 (Python's own fractions.Fraction.limit_denominator -- stdlib, no custom
 ratio-simplification code needed).
 
+Per-leg stop-loss (2026-09-14, explicit user instruction overriding AI-35's
+"no per-leg stop" design -- see docs/spread_bracket_stop.md for the full
+deviation note): each leg gets a real resting STP order, sized like every
+other algorithm family's bracket ("a few brackets, as we do with all other
+types" -- cfg.spread.bracket_size, same convention as generator.bracket_sizes,
+not a literal 4). This is a control-group build, not a redesign of AI-35 --
+the DIFF-pattern exit logic below is unchanged and still the PRIMARY close
+path; the per-leg stop is a safety net for the case that primary logic is
+slow to react or a leg gaps hard. If a leg's stop fires first,
+check_spread_exit() detects it, cancels the other leg's still-resting stop,
+and flattens the other leg at market (the hedge is broken the instant one
+leg is stopped out -- an unhedged single leg is exactly what
+reconcile_naked_positions() still won't protect for source='spread'/
+'spread_control', so this system's OWN exit logic must not leave one
+resting).
+
 Exit (AI-35e), deliberately simplified for v1: the full "1-2-3" pattern is a
 discretionary, multi-point pattern; this implements its core risk-control
 intent -- track the furthest the DIFF moves in the OPENING (against-position)
@@ -66,8 +82,10 @@ _ROOT = Path(__file__).parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
+from ib_insync import Order, StopOrder
+
 from lib.db import get_db, init_db
-from lib.order_builder import get_tick_size
+from lib.order_builder import get_tick_size, round_tick
 from lib.order_builder_spread import build_spread_leg, place_spread_leg
 from lib.algo_pnl import SYMBOL_MULTIPLIERS
 from lib.atr import atr20_points
@@ -75,6 +93,10 @@ from lib.spread_diff import ALL_PAIRS, check_spread_entry, diff_series
 from lib.logger import get_logger
 
 log = get_logger("spread_manager")
+
+DEFAULT_BRACKET_SIZE = 8.0   # mid-point of generator.bracket_sizes' [2,4,8,16] --
+                              # a coarse safety-net stop, not a tight profit bracket;
+                              # see cfg.spread.bracket_size
 
 
 def _now() -> str:
@@ -166,15 +188,50 @@ def _advance_exit_state(pos: dict, current_diff: float, confirm_dist: float) -> 
 
 # ── IB-interaction wrappers ─────────────────────────────────────────────────────
 
+def _place_leg_stop(ibc, sym: str, action: str, qty: int, bracket_size: float):
+    """
+    Best-effort resting STP for one already-filled leg, bracket_size points off
+    the current market price (2026-09-14 addition, see module docstring). Returns
+    (stop_price, order_id) or (None, None) if a live price isn't available --
+    that leg is left unprotected exactly as before this change, not a crash.
+    """
+    try:
+        price = ibc.get_price(sym)
+    except Exception as e:
+        log.warning(f"Spread leg stop for {sym}: no live price ({e}) -- leg left unprotected")
+        return None, None
+
+    tick = get_tick_size(sym)
+    stop_action = "SELL" if action == "BUY" else "BUY"
+    stop_price = round_tick(price - bracket_size if action == "BUY" else price + bracket_size, tick)
+
+    try:
+        order = StopOrder(stop_action, qty, stop_price)
+        order.tif = "GTC"
+        trade = ibc.paper.placeOrder(ibc.get_contract(sym), order)
+        return stop_price, trade.order.orderId
+    except Exception as e:
+        log.warning(f"Spread leg stop for {sym}: submission failed ({e}) -- leg left unprotected")
+        return None, None
+
+
 def open_spread_position(ibc, db_path, sym_a: str, sym_b: str,
                          qty_a: int, qty_b: int, action_a: str, action_b: str,
-                         source: str, entry_diff: str) -> str | None:
+                         source: str, entry_diff: str,
+                         bracket_size: float = DEFAULT_BRACKET_SIZE) -> str | None:
     """
     Submit both legs (MKT) and, only if both fill, write the tracking rows.
     If leg B's submission fails after leg A already went out, immediately
     flattens leg A with a reverse MKT order -- a lone unhedged fill left
     standing is exactly the naked-and-unprotected state
     reconcile_naked_positions() has been told to ignore for this source.
+
+    Then (2026-09-14) gives each leg its own resting STP order, bracket_size
+    points off the current price -- see module docstring for why this
+    deviates from AI-35's original "hedge bounds risk, no per-leg stop"
+    design. Best-effort: a leg with no live price available is left
+    unprotected (logged loudly) rather than blocking the whole position.
+
     Returns the new spread_group_id, or None if the pair could not be
     safely established.
     """
@@ -205,6 +262,9 @@ def open_spread_position(ibc, db_path, sym_a: str, sym_b: str,
                       f"leg B failure -- needs immediate human attention: {e2}")
         return None
 
+    sl_price_a, sl_order_id_a = _place_leg_stop(ibc, sym_a, action_a, qty_a, bracket_size)
+    sl_price_b, sl_order_id_b = _place_leg_stop(ibc, sym_b, action_b, qty_b, bracket_size)
+
     tick_a, tick_b = get_tick_size(sym_a), get_tick_size(sym_b)
     with get_db(db_path) as con:
         for sym, action, qty, ib_id, tick in (
@@ -212,8 +272,11 @@ def open_spread_position(ibc, db_path, sym_a: str, sym_b: str,
             (sym_b, action_b, qty_b, result_b["entry_id"], tick_b),
         ):
             # tp_price/sl_price = entry_price is a deliberate inert sentinel
-            # (zero-distance bracket) -- no TP/SL order is ever submitted for
-            # this row; see lib/order_builder_spread.py's module docstring.
+            # (zero-distance bracket) on the commands row itself -- the real
+            # per-leg stop (2026-09-14) is tracked on spread_positions instead
+            # (sl_price_a/b, sl_order_id_a/b), not here, since this row's own
+            # tp/sl columns are shared with every other algo family's very
+            # different single-order-per-command bracket shape.
             con.execute("""
                 INSERT INTO commands
                     (symbol, line_price, line_type, line_strength, direction,
@@ -228,21 +291,43 @@ def open_spread_position(ibc, db_path, sym_a: str, sym_b: str,
         con.execute("""
             INSERT INTO spread_positions
                 (spread_group_id, sym_a, sym_b, qty_a, qty_b, action_a, action_b,
-                 source, entry_diff, extreme_diff, status, opened_at, updated_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?, 'OPEN', ?, ?)
+                 source, entry_diff, extreme_diff, status, opened_at, updated_at,
+                 bracket_size, sl_price_a, sl_price_b, sl_order_id_a, sl_order_id_b)
+            VALUES (?,?,?,?,?,?,?,?,?,?, 'OPEN', ?, ?, ?,?,?,?,?)
         """, (group_id, sym_a, sym_b, qty_a, qty_b, action_a, action_b,
-              source, entry_diff, entry_diff, now, now))
+              source, entry_diff, entry_diff, now, now,
+              bracket_size, sl_price_a, sl_price_b, sl_order_id_a, sl_order_id_b))
 
-    log.info(f"Spread opened ({source}): {action_a} {qty_a} {sym_a} / "
-             f"{action_b} {qty_b} {sym_b}, group={group_id}, entry_diff={entry_diff}")
+    log.info(f"Spread opened ({source}): {action_a} {qty_a} {sym_a} (stop={sl_price_a}) / "
+             f"{action_b} {qty_b} {sym_b} (stop={sl_price_b}), group={group_id}, "
+             f"entry_diff={entry_diff}, bracket_size={bracket_size}")
     return group_id
+
+
+def _cancel_leg_stop(ibc, order_id) -> None:
+    """Best-effort cancel of one leg's resting STP by order id (2026-09-14 addition).
+    Same fire-and-forget pattern as decider.py's forced_eod cancels -- a stop that's
+    already filled/gone just no-ops here, not an error."""
+    if not order_id:
+        return
+    try:
+        o = Order()
+        o.orderId = order_id
+        ibc.paper.cancelOrder(o)
+    except Exception as e:
+        log.warning(f"Spread leg stop cancel (order {order_id}) failed: {e}")
 
 
 def _close_spread_position(ibc, db_path, pos: dict, reason: str) -> bool:
     """Flatten both legs with reverse MKT orders, mark commands CLOSED and the
     spread_positions row CLOSED. Best-effort on each leg independently -- a
-    failure on one leg is logged loudly but doesn't block closing the other."""
+    failure on one leg is logged loudly but doesn't block closing the other.
+    Cancels each leg's resting stop first (2026-09-14) -- otherwise it would be
+    left resting against a position that's about to be flat, an orphaned order
+    that could fire later against whatever happens to be in that symbol next."""
     now = _now()
+    _cancel_leg_stop(ibc, pos.get("sl_order_id_a"))
+    _cancel_leg_stop(ibc, pos.get("sl_order_id_b"))
     ok = True
     for sym, action, qty in (
         (pos["sym_a"], pos["action_a"], pos["qty_a"]),
@@ -272,25 +357,75 @@ def _close_spread_position(ibc, db_path, pos: dict, reason: str) -> bool:
     return ok
 
 
+def _close_spread_position_after_leg_stop(ibc, db_path, pos: dict, hit_leg: str) -> bool:
+    """
+    One leg's own resting STP already filled at IB (detected by
+    check_spread_exit()'s _leg_stop_hit() scan) -- the hedge is now broken.
+    Cancel the OTHER leg's still-resting stop and flatten it at market;
+    the hit leg needs no action, IB already closed it. hit_leg: "a" or "b".
+    """
+    now = _now()
+    other = "b" if hit_leg == "a" else "a"
+    _cancel_leg_stop(ibc, pos.get(f"sl_order_id_{other}"))
+
+    sym, action, qty = pos[f"sym_{other}"], pos[f"action_{other}"], pos[f"qty_{other}"]
+    flatten_action = "SELL" if action == "BUY" else "BUY"
+    ok = True
+    try:
+        contract = ibc.get_contract(sym)
+        order = build_spread_leg(flatten_action, qty)
+        place_spread_leg(ibc.paper, contract, order)
+    except Exception as e:
+        ok = False
+        log.error(f"Spread close {pos['spread_group_id']} (leg {hit_leg} stopped out): "
+                  f"FAILED to flatten surviving {sym} leg -- needs immediate human attention: {e}")
+
+    with get_db(db_path) as con:
+        con.execute(
+            "UPDATE commands SET status='CLOSED', exit_time=?, exit_reason=? "
+            "WHERE spread_group_id=?", (now, "SL_HIT", pos["spread_group_id"])
+        )
+        con.execute(
+            "UPDATE spread_positions SET status='CLOSED', closed_at=?, close_reason=?, "
+            "updated_at=? WHERE spread_group_id=?",
+            (now, "SL_HIT", now, pos["spread_group_id"])
+        )
+    log.info(f"Spread closed (SL_HIT, leg {hit_leg}): group={pos['spread_group_id']}, "
+             f"flattened surviving {sym} leg")
+    return ok
+
+
+def _leg_stops_hit(ibc) -> set:
+    """Order ids of any 'Filled' trades on the paper connection right now --
+    same trades()-scan pattern as broker.py's poll_tp_sl_fills(). Used to detect
+    a spread leg's own resting stop having fired."""
+    try:
+        trades = ibc.paper.trades()
+    except Exception as e:
+        log.error(f"_leg_stops_hit: error fetching trades: {e}")
+        return set()
+    return {t.order.orderId for t in trades if t.orderStatus.status == "Filled"}
+
+
 def check_spread_signals(ibc, db_path, cfg, bars_db_path=None) -> int:
     """One poll cycle: check all 6 pairs for an AI-35c entry trigger; for each
-    that fires (and has no already-open position on that pair), open BOTH the
-    literal and control-direction variants. Returns count of pairs opened."""
+    that fires, open BOTH the literal and control-direction variants, once per
+    bracket_size in cfg.spread.bracket_sizes (2026-09-14: was a single fixed
+    bracket_size -- see that config key's own comment for why this is a bigger
+    real-exposure step than it looks). "Already open" is now scoped per
+    (pair, bracket_size), not just per pair, so each bracket size runs its own
+    independent open/closed lifecycle -- a still-open 4-point group must not
+    block a fresh 32-point one on the same pair, and vice versa. Returns count
+    of (pair, bracket_size) combos opened this cycle."""
     init_db(db_path)
     bars_db_path = bars_db_path or (Path(db_path).parent / "bars.db")
     gap_mult = getattr(cfg.spread, "gap_multiplier", 1.75)
     max_denom = getattr(cfg.spread, "max_contract_ratio_denominator", 6)
+    bracket_sizes = getattr(cfg.spread, "bracket_sizes", None) or \
+        [getattr(cfg.spread, "bracket_size", DEFAULT_BRACKET_SIZE)]
 
     opened = 0
     for sym_a, sym_b in ALL_PAIRS:
-        with get_db(db_path) as con:
-            already_open = con.execute(
-                "SELECT 1 FROM spread_positions WHERE status='OPEN' "
-                "AND sym_a=? AND sym_b=?", (sym_a, sym_b)
-            ).fetchone()
-        if already_open:
-            continue
-
         signal = check_spread_entry(bars_db_path, sym_a, sym_b, gap_multiplier=gap_mult)
         if not signal:
             continue
@@ -301,19 +436,33 @@ def check_spread_signals(ibc, db_path, cfg, bars_db_path=None) -> int:
             continue
         qty_a, qty_b = ratio
 
-        for source, literal in (("spread", True), ("spread_control", False)):
-            action_a, action_b = resolve_leg_directions(signal["direction"], literal)
-            open_spread_position(ibc, db_path, sym_a, sym_b, qty_a, qty_b,
-                                 action_a, action_b, source, signal["diff"])
-        opened += 1
+        for bracket_size in bracket_sizes:
+            with get_db(db_path) as con:
+                already_open = con.execute(
+                    "SELECT 1 FROM spread_positions WHERE status='OPEN' "
+                    "AND sym_a=? AND sym_b=? AND bracket_size=?",
+                    (sym_a, sym_b, bracket_size)
+                ).fetchone()
+            if already_open:
+                continue
+
+            for source, literal in (("spread", True), ("spread_control", False)):
+                action_a, action_b = resolve_leg_directions(signal["direction"], literal)
+                open_spread_position(ibc, db_path, sym_a, sym_b, qty_a, qty_b,
+                                     action_a, action_b, source, signal["diff"],
+                                     bracket_size=bracket_size)
+            opened += 1
 
     return opened
 
 
 def check_spread_exit(ibc, db_path, bars_db_path=None, confirm_frac: float = 0.10) -> int:
-    """One poll cycle: advance the exit state machine for every OPEN spread
-    position and close any that trigger GAP_CLOSED or ADVERSE_BREAK. Returns
-    count closed."""
+    """One poll cycle: for every OPEN spread position, first check whether
+    either leg's own resting stop already fired at IB (2026-09-14 addition --
+    see module docstring); if so, close via _close_spread_position_after_leg_stop()
+    and skip the DIFF-pattern check for that position this cycle. Otherwise
+    advance the exit state machine and close any that trigger GAP_CLOSED or
+    ADVERSE_BREAK. Returns count closed (either path)."""
     bars_db_path = bars_db_path or (Path(db_path).parent / "bars.db")
 
     with get_db(db_path) as con:
@@ -322,7 +471,18 @@ def check_spread_exit(ibc, db_path, bars_db_path=None, confirm_frac: float = 0.1
         ).fetchall()]
 
     closed = 0
+    filled_ids = _leg_stops_hit(ibc) if positions else set()
     for pos in positions:
+        hit_leg = None
+        if pos.get("sl_order_id_a") and pos["sl_order_id_a"] in filled_ids:
+            hit_leg = "a"
+        elif pos.get("sl_order_id_b") and pos["sl_order_id_b"] in filled_ids:
+            hit_leg = "b"
+        if hit_leg:
+            if _close_spread_position_after_leg_stop(ibc, db_path, pos, hit_leg):
+                closed += 1
+            continue
+
         series = diff_series(bars_db_path, pos["sym_a"], pos["sym_b"], limit_bars=1)
         if not series:
             continue
@@ -453,17 +613,17 @@ def self_test() -> bool:
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "bars_test.db"
             con = sqlite3.connect(db_path)
-            con.execute("CREATE TABLE bars_30m (symbol TEXT, ts TEXT, "
+            con.execute("CREATE TABLE bars_15m (symbol TEXT, ts TEXT, "
                         "open REAL, high REAL, low REAL, close REAL, volume REAL)")
             # 21 days, MES-style symbol with a fixed 16.4pt daily range (-> ATR
             # 82pt/5 since we don't have a real ES here, so scale via mult=50
             # patched in below), and MNQ-style with a fixed 77.8pt daily range.
             for day in range(21):
                 d = f"2026-06-{day+1:02d}"
-                con.execute("INSERT INTO bars_30m VALUES ('MES', ?, 5500,5508.2,5500,5500,100)", (f"{d}T14:00:00Z",))
-                con.execute("INSERT INTO bars_30m VALUES ('MES', ?, 5500,5500,5500,5500,100)", (f"{d}T14:30:00Z",))
-                con.execute("INSERT INTO bars_30m VALUES ('MNQ', ?, 20000,20038.9,20000,20000,100)", (f"{d}T14:00:00Z",))
-                con.execute("INSERT INTO bars_30m VALUES ('MNQ', ?, 20000,20000,20000,20000,100)", (f"{d}T14:30:00Z",))
+                con.execute("INSERT INTO bars_15m VALUES ('MES', ?, 5500,5508.2,5500,5500,100)", (f"{d}T14:00:00Z",))
+                con.execute("INSERT INTO bars_15m VALUES ('MES', ?, 5500,5500,5500,5500,100)", (f"{d}T14:30:00Z",))
+                con.execute("INSERT INTO bars_15m VALUES ('MNQ', ?, 20000,20038.9,20000,20000,100)", (f"{d}T14:00:00Z",))
+                con.execute("INSERT INTO bars_15m VALUES ('MNQ', ?, 20000,20000,20000,20000,100)", (f"{d}T14:30:00Z",))
             con.commit()
             con.close()
 
@@ -558,13 +718,13 @@ def self_test() -> bool:
                 init_db(db_path3)
                 bars_path3 = Path(tmp3) / "bars.db"
                 con = sqlite3.connect(bars_path3)
-                con.execute("CREATE TABLE bars_30m (symbol TEXT, ts TEXT, "
+                con.execute("CREATE TABLE bars_15m (symbol TEXT, ts TEXT, "
                             "open REAL, high REAL, low REAL, close REAL, volume REAL)")
                 # Current diff far below entry -- a closing_down (action_a=SELL)
                 # position loses money as diff falls further past entry, i.e. this
                 # constructs a big unrealized loss on purpose.
-                con.execute("INSERT INTO bars_30m VALUES ('MES', '2026-06-01T14:00:00Z', 5500,5500,5500,5500,100)")
-                con.execute("INSERT INTO bars_30m VALUES ('MNQ', '2026-06-01T14:00:00Z', 20000,20000,20000,20000,100)")
+                con.execute("INSERT INTO bars_15m VALUES ('MES', '2026-06-01T14:00:00Z', 5500,5500,5500,5500,100)")
+                con.execute("INSERT INTO bars_15m VALUES ('MNQ', '2026-06-01T14:00:00Z', 20000,20000,20000,20000,100)")
                 con.commit()
                 con.close()
 
@@ -608,6 +768,172 @@ def self_test() -> bool:
                 # Re-running must be a no-op -- the position is already CLOSED.
                 n2 = check_portfolio_kill_switch(fake_ibc2, db_path3, cfg_stub)
                 assert n2 == 0
+
+            # ── Per-leg stop-loss (2026-09-14 addition) ──
+            # Tracks (orderId -> status) directly on _FakePaper, so _leg_stops_hit()'s
+            # trades() scan can find them (orders in .placed don't carry the assigned id).
+            class _FakePaperWithTrades(_FakePaper):
+                def __init__(self, fail_on=None):
+                    super().__init__(fail_on)
+                    self.order_ids = {}   # orderId -> (contract, order)
+                    self.filled_ids = set()
+                    self.cancelled = []
+                def placeOrder(self, contract, order):
+                    trade = super().placeOrder(contract, order)
+                    self.order_ids[trade.order.orderId] = (contract, order)
+                    return trade
+                def cancelOrder(self, order):
+                    self.cancelled.append(order.orderId)
+                def trades(self):
+                    class _T:
+                        def __init__(self, order_id, filled):
+                            self.order = _FakeOrder(order_id, "", 0)
+                            self.orderStatus = type("OS", (), {"status": "Filled" if filled else "Submitted"})()
+                    return [_T(oid, oid in self.filled_ids) for oid in self.order_ids]
+
+            class _FakeIBCFull:
+                def __init__(self, prices):
+                    self.paper = _FakePaperWithTrades()
+                    self._prices = prices
+                def get_contract(self, symbol): return _FakeContract(symbol)
+                def get_price(self, symbol, contract=None): return self._prices[symbol]
+
+            with tempfile.TemporaryDirectory() as tmp4:
+                db_path4 = Path(tmp4) / "galao_test4.db"
+                init_db(db_path4)
+                bars_path4 = Path(tmp4) / "bars.db"
+                con = sqlite3.connect(bars_path4)
+                con.execute("CREATE TABLE bars_15m (symbol TEXT, ts TEXT, "
+                            "open REAL, high REAL, low REAL, close REAL, volume REAL)")
+                con.execute("INSERT INTO bars_15m VALUES ('MES', '2026-06-01T14:00:00Z', 5500,5500,5500,5500,100)")
+                con.execute("INSERT INTO bars_15m VALUES ('MNQ', '2026-06-01T14:00:00Z', 20000,20000,20000,20000,100)")
+                con.commit()
+                con.close()
+
+                fake_ibc4 = _FakeIBCFull({"MES": 5500.0, "MNQ": 20000.0})
+                group_id4 = open_spread_position(
+                    fake_ibc4, db_path4, "MES", "MNQ", qty_a=2, qty_b=1,
+                    action_a="BUY", action_b="SELL", source="spread", entry_diff=150.0,
+                    bracket_size=8.0
+                )
+                assert group_id4 is not None
+                # 2 entry orders + 2 stop orders.
+                assert len(fake_ibc4.paper.placed) == 4
+                with get_db(db_path4) as con:
+                    pos4 = dict(con.execute(
+                        "SELECT * FROM spread_positions WHERE spread_group_id=?", (group_id4,)
+                    ).fetchone())
+                assert pos4["bracket_size"] == 8.0
+                # BUY leg (MES): stop is BELOW current price (protects a long).
+                assert pos4["sl_price_a"] == 5492.0, f"MES stop: {pos4['sl_price_a']}"
+                # SELL leg (MNQ): stop is ABOVE current price (protects a short).
+                assert pos4["sl_price_b"] == 20008.0, f"MNQ stop: {pos4['sl_price_b']}"
+                assert pos4["sl_order_id_a"] and pos4["sl_order_id_b"]
+
+                # Simulate leg A's (MES) stop firing at IB.
+                fake_ibc4.paper.filled_ids.add(pos4["sl_order_id_a"])
+                n_closed = check_spread_exit(fake_ibc4, db_path4, bars_db_path=bars_path4)
+                assert n_closed == 1, f"Expected 1 position closed via leg-stop, got {n_closed}"
+                with get_db(db_path4) as con:
+                    pos4_after = dict(con.execute(
+                        "SELECT * FROM spread_positions WHERE spread_group_id=?", (group_id4,)
+                    ).fetchone())
+                assert pos4_after["status"] == "CLOSED"
+                assert pos4_after["close_reason"] == "SL_HIT"
+                # Leg B's (MNQ) stop must have been cancelled, and MNQ flattened at market.
+                assert pos4["sl_order_id_b"] in fake_ibc4.paper.cancelled
+                flatten_calls = [o for c, o in fake_ibc4.paper.placed[4:] if c.symbol == "MNQ"]
+                assert len(flatten_calls) == 1 and flatten_calls[0].action == "BUY", \
+                    "MNQ was SELL -- flattening it must BUY"
+
+                # Re-running must be a no-op -- position already CLOSED.
+                assert check_spread_exit(fake_ibc4, db_path4, bars_db_path=bars_path4) == 0
+
+                # ── DIFF-pattern close must also cancel both legs' resting stops ──
+                fake_ibc5 = _FakeIBCFull({"MES": 5500.0, "MNQ": 20000.0})
+                group_id5 = open_spread_position(
+                    fake_ibc5, db_path4, "MES", "MNQ", qty_a=2, qty_b=1,
+                    action_a="BUY", action_b="SELL", source="spread", entry_diff=150.0,
+                    bracket_size=8.0
+                )
+                with get_db(db_path4) as con:
+                    pos5 = dict(con.execute(
+                        "SELECT * FROM spread_positions WHERE spread_group_id=?", (group_id5,)
+                    ).fetchone())
+                _close_spread_position(fake_ibc5, db_path4, pos5, "GAP_CLOSED")
+                assert pos5["sl_order_id_a"] in fake_ibc5.paper.cancelled
+                assert pos5["sl_order_id_b"] in fake_ibc5.paper.cancelled
+
+            # ── check_spread_signals: multi-bracket fan-out (2026-09-14 addition) ──
+            with tempfile.TemporaryDirectory() as tmp5:
+                db_path5 = Path(tmp5) / "galao_test5.db"
+                init_db(db_path5)
+                bars_path5 = Path(tmp5) / "bars.db"
+
+                fake_ibc6 = _FakeIBCFull({s: 100.0 for s in ("MES", "MNQ", "MYM", "M2K")})
+                cfg6 = type("Cfg", (), {"spread": type("S", (), {
+                    "gap_multiplier": 1.75, "max_contract_ratio_denominator": 6,
+                    "bracket_sizes": [4, 8],
+                })()})()
+
+                fixed_signal = {"pair": ("MES", "MNQ"), "diff": 100.0, "swing": 50.0,
+                                 "avg_swing": 20.0, "direction": "A_OVER"}
+
+                def _entry_side(bars_db_path, sym_a, sym_b, gap_multiplier=None):
+                    return fixed_signal if (sym_a, sym_b) == ("MES", "MNQ") else None
+
+                # Direct module-namespace monkeypatch (not unittest.mock.patch's dotted-path
+                # target, which fetches a SEPARATE "trader.spread_manager" import distinct
+                # from this file's own __main__ execution when run directly via
+                # `python trader/spread_manager.py --self-test`, silently patching the wrong
+                # copy -- same footgun decider.py's self-test already works around with its
+                # own mod = sys.modules[__name__] pattern).
+                mod = sys.modules[__name__]
+                _orig_check_spread_entry, _orig_contract_ratio = check_spread_entry, contract_ratio
+                mod.check_spread_entry = _entry_side
+                mod.contract_ratio = lambda *a, **kw: (2, 1)
+                try:
+                    opened = check_spread_signals(fake_ibc6, db_path5, cfg6, bars_db_path=bars_path5)
+                    # 2 bracket sizes on the one signaling pair -- each opens BOTH the
+                    # literal ('spread') and control-direction ('spread_control') variant,
+                    # same as before -- return value counts (pair, bracket) combos, not
+                    # individual open_spread_position calls.
+                    assert opened == 2, f"Expected 2 (pair,bracket) combos opened, got {opened}"
+                    with get_db(db_path5) as con:
+                        groups = [dict(g) for g in con.execute(
+                            "SELECT bracket_size, source FROM spread_positions WHERE status='OPEN'"
+                            " ORDER BY bracket_size, source"
+                        ).fetchall()]
+                    assert groups == [
+                        {"bracket_size": 4.0, "source": "spread"},
+                        {"bracket_size": 4.0, "source": "spread_control"},
+                        {"bracket_size": 8.0, "source": "spread"},
+                        {"bracket_size": 8.0, "source": "spread_control"},
+                    ], f"Expected one spread+spread_control pair per bracket size, got {groups}"
+
+                    # Re-running the same cycle: both brackets already have an OPEN
+                    # position on this pair -- must be a clean no-op (the new per-bracket
+                    # already-open guard), not a duplicate set of groups.
+                    opened_again = check_spread_signals(fake_ibc6, db_path5, cfg6, bars_db_path=bars_path5)
+                    assert opened_again == 0, f"Expected 0 (already open on every bracket), got {opened_again}"
+                    with get_db(db_path5) as con:
+                        n_open_total = con.execute(
+                            "SELECT COUNT(*) FROM spread_positions WHERE status='OPEN'"
+                        ).fetchone()[0]
+                    assert n_open_total == 4, f"Must not duplicate groups on a repeat signal, got {n_open_total}"
+
+                    # A THIRD bracket size, not yet open on this pair, must still open
+                    # fresh -- proves each bracket size has its own independent
+                    # open/closed lifecycle, not gated by "pair already has something open."
+                    cfg6b = type("Cfg", (), {"spread": type("S", (), {
+                        "gap_multiplier": 1.75, "max_contract_ratio_denominator": 6,
+                        "bracket_sizes": [4, 8, 16],
+                    })()})()
+                    opened_third = check_spread_signals(fake_ibc6, db_path5, cfg6b, bars_db_path=bars_path5)
+                    assert opened_third == 1, f"Expected 1 new (pair,16) combo opened, got {opened_third}"
+                finally:
+                    mod.check_spread_entry = _orig_check_spread_entry
+                    mod.contract_ratio = _orig_contract_ratio
 
         print("[self-test] spread_manager: PASS")
         return True

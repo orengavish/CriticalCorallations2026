@@ -647,6 +647,16 @@ def _migrate(path: Path = None):
         # additive-only, NULL for every row simulated before this existed.
         "ALTER TABLE cl_algo_sim_results ADD COLUMN line_detect_reason TEXT",
         "ALTER TABLE cl_algo_sim_results ADD COLUMN line_detect_kind TEXT",
+        # 2026-09-14: give each spread leg a real resting stop-loss (see
+        # docs/spread_bracket_stop.md) -- a deliberate deviation from AI-35's
+        # "no per-leg stop, the hedge itself bounds risk" design, per explicit
+        # user instruction. Nullable/additive-only; rows opened before this
+        # change simply have NULLs here and stay unprotected as before.
+        "ALTER TABLE spread_positions ADD COLUMN bracket_size REAL",
+        "ALTER TABLE spread_positions ADD COLUMN sl_price_a REAL",
+        "ALTER TABLE spread_positions ADD COLUMN sl_price_b REAL",
+        "ALTER TABLE spread_positions ADD COLUMN sl_order_id_a INTEGER",
+        "ALTER TABLE spread_positions ADD COLUMN sl_order_id_b INTEGER",
         # Idempotent CREATE IF NOT EXISTS for tables added after initial schema
         """CREATE TABLE IF NOT EXISTS price_cache (
             symbol       TEXT PRIMARY KEY,

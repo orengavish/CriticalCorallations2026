@@ -78,7 +78,64 @@ symbols:
   - SCHW
   - GE
   - MO
-  - CVX                # trading symbols only — used by decider, broker, position_manager
+  - CVX
+  # 2026-09-14: expanded 30 -> 77. Root cause of the prior 0-stock-critical-lines gap
+  # found and fixed: sibling project MultiSymbolTrader (which computes these lines) was
+  # fetching historical data via the PAPER IB connection -- degraded market-data
+  # entitlements versus a live-authenticated connection -- switched it to live,
+  # read-only, matching this project's own paper=orders/live=data convention. 65 of
+  # these got a real armed line the same day it was fixed. Also closes a real drift:
+  # lib/allocation.py's ALLOC_STOCK_DEDICATED plan and this list had silently diverged
+  # (11 symbols each way) -- rebuilt both from the same clean union, see that module's
+  # own comment for the full list. BRK.B still excluded -- IB dotted-class-share ticker
+  # quirk (0 bars via Stock("BRK.B","SMART","USD")), not yet fixed.
+  - GOOG
+  - JPM
+  - COST
+  - NFLX
+  - CRM
+  - WMT
+  - PEP
+  - TMO
+  - LIN
+  - MCD
+  - DHR
+  - IBM
+  - CAT
+  - PM
+  - INTU
+  - NOW
+  - CMCSA
+  - SPGI
+  - LOW
+  - AXP
+  - HON
+  - BA
+  - RTX
+  - UPS
+  - BKNG
+  - BLK
+  - PLD
+  - ADI
+  - TJX
+  - CVS
+  - CI
+  - VRTX
+  - ADP
+  - CB
+  - BMY
+  - DUK
+  - BSX
+  - SLB
+  - NOC
+  - ETN
+  - PGR
+  - COP
+  - FISV
+  - USB
+  - ABBV
+  - ADBE
+  - MRK               # trading symbols only — used by decider, broker, position_manager
 
 fetcher:
   auto_fetch_enabled: true
@@ -107,7 +164,16 @@ orders:
   # Changed 2026-09-06 from [2, 4] for the two-winning-reasons research experiment --
   # backtesting found no reason to trade brackets 1-2 (see summarize_sweep.py sweep).
   # 2026-09-09: dropped 32 -- decided to standardize on [4, 8, 16] going forward.
-  active_brackets: [4, 8, 16]
+  # 2026-09-14 (overnight allocation/bracket plan, user decision while reviewing the
+  # FORCED_EOD pnl-bug fallout): 32 reinstated -- explicit request for a wider bracket
+  # available to Correlation/Critical Line/GevaExtract's shared fan-out (this list, not
+  # a per-family override -- no per-family bracket config exists yet). Reverses the
+  # 2026-09-09 standardization call (not a backtest-evidence reversal -- that call was
+  # about 1-2, not 32 -- just a "keep it simple" one); worth re-confirming this is
+  # wanted given it also raises command volume ~33% for every family using this list,
+  # in tension with the same session's other goal of fewer concurrently-open positions.
+  # See docs/allocation_priority_redesign_2026-09-14.md.
+  active_brackets: [4, 8, 16, 32]
   quantity: 1
   tick_size: 0.25
   # 2026-09-09: broker.py admission gates (process_pending_commands), added after the
@@ -249,7 +315,7 @@ correlation:
 # judge it through the comparison engine (Part 1) like every other algorithm,
 # not by eye.
 correlation_trading:
-  enabled: false
+  enabled: true
   trail_ticks: 3                   # AI-31 "very tight trailing stop", see correlation_trail.py
 
 # ── Spread Trading (Part 3 of the comparison-engine build cycle) ───────────────
@@ -266,8 +332,23 @@ correlation_trading:
 # the reversed/mean-reversion reading), and let the comparison engine (Part 1)
 # judge which one is actually right, instead of guessing.
 spread:
-  enabled: false
+  enabled: true
   kill_switch_usd: 500             # portfolio kill-switch: flattens both legs of a
                                     # spread_group_id if its combined open loss crosses this
   gap_multiplier: 1.75             # AI-35c's "1.5-2x average daily gap swing" entry trigger
   max_contract_ratio_denominator: 6  # AI-35d contract-ratio simplification bound
+  # 2026-09-14: real per-leg stop-loss, points off the current price at open --
+  # a deliberate deviation from AI-35's "no per-leg stop" design, see
+  # docs/spread_bracket_stop.md. Was a single coarse safety-net value (8, the
+  # mid-point of the old [2,4,8,16] list) with the 4-way fan-out explicitly
+  # flagged deferred -- now made real (same night, user decision): spread_manager.py's
+  # check_spread_signals() opens one independent spread_group_id per bracket_size
+  # below, same "test every algorithm across the full bracket spread" logic the
+  # other families already get via orders.active_brackets. NOTE this multiplies
+  # spread's per-signal capital commitment and naked-leg exposure window by
+  # len(bracket_sizes) -- each entry is an immediate MKT fill on both legs, unlike
+  # every other family's resting LMT/STP fan-out, so this is a bigger real-exposure
+  # step than the other families' bracket fan-out. bracket_size (singular) kept as
+  # the fallback default if this list is ever removed.
+  bracket_size: 8
+  bracket_sizes: [4, 8, 16, 32]

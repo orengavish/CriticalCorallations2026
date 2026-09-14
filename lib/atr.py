@@ -1,15 +1,17 @@
 """
 lib/atr.py
-Average True Range (daily), computed from trader/data/bars.db's `bars_30m` table --
-the only bar granularity this repo has (confirmed by repo-wide search: no ATR
-calculation existed anywhere before this). Shared by the correlation algorithm
+Average True Range (daily), computed from trader/data/bars.db's `bars_15m` table
+-- 15-min OHLCV, matching Geva's AI-9 rule ("15-min bars to execute"; see
+Galgo2029/knowledge/Claims/entries-exits-and-risk.md). Before 2026-09-14 this
+read the legacy bars_30m table, which didn't match that rule -- switched to
+align, per docs/data_granularity.md. Shared by the correlation algorithm
 (laggard selection by $-distance-to-target) and the spread algorithm (dollar-ATR
 position sizing).
 
-bars_30m is stale in practice (backfill can lag by weeks) and this repo has no
-finer granularity -- ATR here is therefore a recent-volatility ESTIMATE, not a
-tick-fresh one. That's fine for both callers: neither needs minute-fresh ATR,
-just a reasonable read on "how much does this symbol typically move in a day."
+bars_15m can go stale between manual scripts/backfill_bars.py runs -- ATR here
+is therefore a recent-volatility ESTIMATE, not a tick-fresh one. That's fine for
+both callers: neither needs minute-fresh ATR, just a reasonable read on "how
+much does this symbol typically move in a day."
 
 Usage:
     from lib.atr import atr20_points
@@ -39,7 +41,7 @@ def _daily_ohlc(bars_db_path, symbol: str, lookback_days: int = None) -> list:
             SELECT substr(ts, 1, 10) AS d,
                    MAX(high) AS h, MIN(low) AS l,
                    MAX(ts) AS last_ts
-            FROM bars_30m WHERE symbol=?
+            FROM bars_15m WHERE symbol=?
             GROUP BY d ORDER BY d
         """, (symbol,)).fetchall()
         if not rows:
@@ -47,7 +49,7 @@ def _daily_ohlc(bars_db_path, symbol: str, lookback_days: int = None) -> list:
         # close = the close of the last bar of each day -- needs a second pass
         # since SQLite has no simple "value at max(ts)" aggregate.
         closes = dict(con.execute(
-            "SELECT ts, close FROM bars_30m WHERE symbol=?", (symbol,)
+            "SELECT ts, close FROM bars_15m WHERE symbol=?", (symbol,)
         ).fetchall())
         out = [{"date": d, "high": h, "low": l, "close": closes.get(last_ts)}
                for d, h, l, last_ts in rows]
@@ -95,7 +97,7 @@ def self_test() -> bool:
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "bars_test.db"
             con = sqlite3.connect(db_path)
-            con.execute("CREATE TABLE bars_30m (symbol TEXT, ts TEXT, "
+            con.execute("CREATE TABLE bars_15m (symbol TEXT, ts TEXT, "
                         "open REAL, high REAL, low REAL, close REAL, volume REAL)")
 
             # 21 days of MES bars: each day ranges [base, base+10] (constant
@@ -105,10 +107,10 @@ def self_test() -> bool:
             base = 5500.0
             for day in range(21):
                 d = f"2026-06-{day+1:02d}" if day < 30 else f"2026-07-{day-29:02d}"
-                # two 30-min bars per day: one sets the low, one sets the high
-                con.execute("INSERT INTO bars_30m VALUES ('MES', ?, ?,?,?,?,?)",
+                # two 15-min bars per day: one sets the low, one sets the high
+                con.execute("INSERT INTO bars_15m VALUES ('MES', ?, ?,?,?,?,?)",
                            (f"{d}T14:00:00Z", base, base, base - 5, base, 100))
-                con.execute("INSERT INTO bars_30m VALUES ('MES', ?, ?,?,?,?,?)",
+                con.execute("INSERT INTO bars_15m VALUES ('MES', ?, ?,?,?,?,?)",
                            (f"{d}T14:30:00Z", base, base + 5, base, base, 100))
                 # close = base each day -> next day's TR = max(H-L, |H-pc|, |L-pc|)
                 # = max(10, 5, 5) = 10 exactly
@@ -129,9 +131,9 @@ def self_test() -> bool:
             # Single day of data -> None (needs a prior close for true range)
             db2 = Path(tmp) / "bars_test2.db"
             con2 = sqlite3.connect(db2)
-            con2.execute("CREATE TABLE bars_30m (symbol TEXT, ts TEXT, "
+            con2.execute("CREATE TABLE bars_15m (symbol TEXT, ts TEXT, "
                          "open REAL, high REAL, low REAL, close REAL, volume REAL)")
-            con2.execute("INSERT INTO bars_30m VALUES ('MES','2026-06-01T14:00:00Z',"
+            con2.execute("INSERT INTO bars_15m VALUES ('MES','2026-06-01T14:00:00Z',"
                         "5500,5505,5495,5500,100)")
             con2.commit()
             con2.close()

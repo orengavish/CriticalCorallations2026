@@ -981,9 +981,25 @@ def reconcile_stuck_commands(ibc: IBClient, db_path) -> int:
         resolved += 1
 
     # -- case 2 (bug 5): FILLED commands whose bracket vanished --
+    # 2026-09-14: scope to status='FILLED' -- a row that's since moved to CLOSED
+    # (by whatever path) has nothing left to reconcile, but the old query had no
+    # status filter at all, so a needs_review=1 flag that outlived its own FILLED
+    # status kept re-matching here forever, re-logging "still open, needs human
+    # review" every poll cycle even after the command was already resolved
+    # (found live: commands 72514/72515, both CLOSED since 2026-09-10, still
+    # spamming this warning 4 days later because they happened to share a symbol
+    # with an unrelated later position). Stale flags on non-FILLED rows are
+    # cleared below instead of re-processed.
     with get_db(db_path) as con:
+        stale_flags = con.execute(
+            "SELECT id FROM commands WHERE needs_review=1 AND fill_price IS NOT NULL"
+            " AND status != 'FILLED'"
+        ).fetchall()
+        for row in stale_flags:
+            clear_needs_review(con, row["id"])
         stuck_filled = con.execute(
             "SELECT * FROM commands WHERE needs_review=1 AND fill_price IS NOT NULL"
+            " AND status='FILLED'"
         ).fetchall()
 
     if stuck_filled:
@@ -1559,6 +1575,22 @@ def self_test() -> bool:
             assert r_open["status"] == "FILLED" and r_open["needs_review"] == 1, \
                 f"open-position case should stay untouched: {dict(r_open)}"
 
+            # 7a. 2026-09-14 fix: a row that's already CLOSED (by any path) but still
+            # carries a stale needs_review=1 flag must get that flag cleared, not
+            # re-processed as if still FILLED -- found live spamming "still open,
+            # needs human review" every poll cycle for 4 days on a command that had
+            # already closed, because the old query had no status filter at all.
+            id_stale_closed = _insert_cmd(symbol='MES', status='CLOSED', needs_review=1,
+                                          fill_price=6500.0, fill_time=old_fill_time,
+                                          ib_order_id=9040, ib_tp_order_id=9041, ib_sl_order_id=9042)
+            reconcile_stuck_commands(fake_ibc_3, db_path)
+            with get_db(db_path) as con:
+                r_stale = con.execute(
+                    "SELECT status, needs_review FROM commands WHERE id=?", (id_stale_closed,)
+                ).fetchone()
+            assert r_stale["status"] == "CLOSED" and r_stale["needs_review"] == 0, \
+                f"already-CLOSED row must have its stale flag cleared, not re-warned: {dict(r_stale)}"
+
             # 7b. reconcile_naked_positions: a symbol with an open position and
             # zero resting orders normally gets an emergency protective stop --
             # this is the exact safety net the spread algorithm's TP/SL-less legs
@@ -1734,46 +1766,74 @@ def self_test() -> bool:
             assert s2 == "SUBMITTED", \
                 f"FILLED same-direction commands must not double-count toward their own side: {s2}"
 
-            #    8e. per-family allocation cap (2026-09-12, capacity-allocation plan):
-            #    Critical Line's own share of the MES+ES pool is 5, well under the flat
-            #    per-symbol cap of 10 -- so a 6th research_ce command on MES must be held
-            #    back by Gate 1b specifically, not Gate 1 (which alone would still allow
-            #    it, 5 < 10). A DIFFERENT family (spread) on the SAME symbol/side, with
-            #    its own separate 5-slot share, must NOT be blocked by Critical Line's
-            #    usage -- proving the two families don't share one budget.
-            for _ in range(5):
-                _insert_cmd(symbol='MES', direction='SELL', source='research_ce',
-                            status='SUBMITTED', needs_review=0)
-            with get_db(db_path) as con:
-                con.execute("""
-                    INSERT INTO commands
-                        (symbol, line_price, line_type, line_strength, source,
-                         direction, entry_type, entry_price, tp_price, sl_price, bracket_size)
-                    VALUES ('MES', 6500.0, 'SUPPORT', 2, 'research_ce',
-                            'SELL', 'LMT', 6500.0, 6498.0, 6502.0, 2.0)
-                """)
-                id_family_capped = con.execute("SELECT last_insert_rowid()").fetchone()[0]
-                con.execute("""
-                    INSERT INTO commands
-                        (symbol, line_price, line_type, line_strength, source,
-                         direction, entry_type, entry_price, tp_price, sl_price, bracket_size)
-                    VALUES ('MES', 6496.0, 'SUPPORT', 2, 'spread',
-                            'SELL', 'LMT', 6496.0, 6494.0, 6500.0, 2.0)
-                """)
-                # entry 4pts from the fake price below (6500.0) -- clears the default
-                # 8-tick (2pt) Gate 2 buffer, so this one reaches SUBMITTED rather than
-                # being cancelled as stale, proving it got PAST both admission gates.
-                id_other_family = con.execute("SELECT last_insert_rowid()").fetchone()[0]
-            process_pending_commands(_FakeIBClient(price=6500.0), db_path, cfg)
-            with get_db(db_path) as con:
-                s_capped = con.execute("SELECT status FROM commands WHERE id=?",
-                                       (id_family_capped,)).fetchone()["status"]
-                s_other = con.execute("SELECT status FROM commands WHERE id=?",
-                                      (id_other_family,)).fetchone()["status"]
+            #    8e. per-family allocation cap (2026-09-12, capacity-allocation plan;
+            #    2026-09-14: cap is now DYNAMIC -- lib.allocation.dynamic_cap_for()
+            #    lets a family reclaim another family's currently-UNUSED nominal share
+            #    on the same pool, rather than that share sitting reserved and idle.
+            #    To actually prove Gate 1b still holds a family at its nominal floor,
+            #    every OTHER family on the pool must ALSO be at its own full nominal
+            #    share first (nothing left to reclaim) -- GevaExtract=15 (8 MES + 7
+            #    ES), Spread=5, Correlation=5, all seeded to capacity below. Critical
+            #    Line's own 5th resting command then leaves cap=5 (5 own + 0
+            #    reclaimable from anyone), so a 6th is held back -- the flat
+            #    per-symbol cap alone would still have allowed it there, proving this
+            #    is Gate 1b specifically, not Gate 1. Uses its OWN fresh temp DB
+            #    (not the shared db_path every earlier case in this self-test has
+            #    been accumulating state into) so this scenario's counts are exact
+            #    and not affected by MES/MNQ/etc. fixtures other cases left behind.
+            with tempfile.TemporaryDirectory() as tmp_1b:
+                db_path_1b = Path(tmp_1b) / "gate1b_test.db"
+                init_db(db_path_1b)
+                with get_db(db_path_1b) as con:
+                    def _seed(symbol, direction, source, n):
+                        for _ in range(n):
+                            con.execute("""
+                                INSERT INTO commands
+                                    (symbol, line_price, line_type, line_strength, direction,
+                                     entry_type, entry_price, tp_price, sl_price, bracket_size,
+                                     source, quantity, status, needs_review)
+                                VALUES (?, 6500, 'SUPPORT', 2, ?, 'LMT', 6500, 6498, 6502, 2,
+                                        ?, 1, 'SUBMITTED', 0)
+                            """, (symbol, direction, source))
+                    _seed("MES", "SELL", "research_ce", 5)
+                    _seed("MES", "SELL", "geva_manual", 8)
+                    _seed("ES",  "SELL", "geva_manual", 7)
+                    _seed("MES", "SELL", "spread", 5)
+                    _seed("MES", "SELL", "correlation", 5)
+
+                    con.execute("""
+                        INSERT INTO commands
+                            (symbol, line_price, line_type, line_strength, source,
+                             direction, entry_type, entry_price, tp_price, sl_price, bracket_size)
+                        VALUES ('MES', 6500.0, 'SUPPORT', 2, 'research_ce',
+                                'SELL', 'LMT', 6500.0, 6498.0, 6502.0, 2.0)
+                    """)
+                    id_family_capped = con.execute("SELECT last_insert_rowid()").fetchone()[0]
+                    # A DIFFERENT family, on a COMPLETELY UNRELATED pool (MNQ+NQ,
+                    # nothing seeded there at all in this fresh DB) -- proves
+                    # families/pools don't share one budget. Priced near the fake
+                    # client's single flat price (6500.0) rather than MNQ's real
+                    # scale -- _FakeIBClient.get_price() returns one flat value for
+                    # every symbol, and this only needs to clear the Gate 2
+                    # staleness check, not look like a real MNQ quote.
+                    con.execute("""
+                        INSERT INTO commands
+                            (symbol, line_price, line_type, line_strength, source,
+                             direction, entry_type, entry_price, tp_price, sl_price, bracket_size)
+                        VALUES ('MNQ', 6504.0, 'SUPPORT', 2, 'spread',
+                                'SELL', 'LMT', 6504.0, 6500.0, 6508.0, 4.0)
+                    """)
+                    id_other_family = con.execute("SELECT last_insert_rowid()").fetchone()[0]
+                process_pending_commands(_FakeIBClient(price=6500.0), db_path_1b, cfg)
+                with get_db(db_path_1b) as con:
+                    s_capped = con.execute("SELECT status FROM commands WHERE id=?",
+                                           (id_family_capped,)).fetchone()["status"]
+                    s_other = con.execute("SELECT status FROM commands WHERE id=?",
+                                          (id_other_family,)).fetchone()["status"]
             assert s_capped == "PENDING", \
-                f"Critical Line at its 5-slot MES+ES share should be held back by Gate 1b: {s_capped}"
+                f"Critical Line at its 5-slot MES+ES share (everyone else also at their own full share, nothing to reclaim) should be held back by Gate 1b: {s_capped}"
             assert s_other == "SUBMITTED", \
-                f"Spread's own separate share on the same symbol should not be blocked by Critical Line: {s_other}"
+                f"Spread's own separate share on an unrelated pool should not be blocked by Critical Line: {s_other}"
 
             #    8e. geva_manual is no longer exempt from the cap (2026-09-10 reversal --
             #    the exemption let real exposure quietly compound across days until IB's
@@ -1800,15 +1860,23 @@ def self_test() -> bool:
             #    8e2. ...but geva_manual still gets priority when capacity DOES exist: a
             #    geva_manual command queued behind a pile of lower-priority ones for a
             #    symbol/side with room must still get processed (not starved by queue order).
+            #    Uses 'ZZZZ' (not a real symbol, never in lib.allocation's stock plan) --
+            #    2026-09-14: this used to be 'GS', which was an ungoverned stock under the
+            #    old 30-symbol plan (cap=None, Gate 1b a no-op) but became a governed,
+            #    zero-share symbol for GevaExtract once GS joined the 77-symbol expansion
+            #    (Gate 1b then legitimately blocks geva_manual on it, same as any other
+            #    stock -- GevaExtract only ever trades futures for real). A deliberately
+            #    never-real symbol keeps this test about Gate 1/priority ordering only,
+            #    independent of whatever stocks lib.allocation happens to govern later.
             for _ in range(3):
-                _insert_cmd(symbol='GS', direction='BUY', status='SUBMITTED', needs_review=0,
+                _insert_cmd(symbol='ZZZZ', direction='BUY', status='SUBMITTED', needs_review=0,
                             source='research_ce')
             with get_db(db_path) as con:
                 con.execute("""
                     INSERT INTO commands
                         (symbol, line_price, line_type, line_strength, source,
                          direction, entry_type, entry_price, tp_price, sl_price, bracket_size)
-                    VALUES ('GS', 500.0, 'SUPPORT', 2, 'geva_manual',
+                    VALUES ('ZZZZ', 500.0, 'SUPPORT', 2, 'geva_manual',
                             'BUY', 'LMT', 500.0, 502.0, 498.0, 2.0)
                 """)
                 id_geva_priority = con.execute("SELECT last_insert_rowid()").fetchone()[0]

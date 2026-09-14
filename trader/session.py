@@ -37,7 +37,6 @@ _ROOT = Path(__file__).parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from lib.config_loader import get_config
 from lib.logger import get_logger
 from lib.db import get_db, init_db, get_system_state, set_system_state
 from lib.singleton_lock import is_locked_by_other, _pid_alive
@@ -51,20 +50,47 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _load_own_config():
+    """
+    Load trader/config.yaml directly, bypassing lib.config_loader's global
+    process-wide cache (documented footgun -- see
+    CORRELATIONCRITICAL_INTEGRATION_REPORT.md and
+    back-trading/trading_dashboard.py's own _trader_config()/_resolve_db(),
+    which work around the same issue the same way): that cache is keyed on
+    whichever config.yaml some *other* module loads first via a bare
+    get_config(), and this module is imported into
+    back-trading/trading_dashboard.py, which has its own separate
+    back-trading/config.yaml for the backtest engine -- so a bare
+    get_config() call from here can silently return that other file's
+    contents instead (hit live 2026-09-14: AttributeError on
+    self._cfg.session.monitor_poll_seconds because the cached config was
+    back-trading's, which has no `session:` section).
+    """
+    import yaml
+    from types import SimpleNamespace
+    cfg_path = (Path(__file__).parent / "config.yaml").resolve()
+    with open(cfg_path) as f:
+        raw = yaml.safe_load(f) or {}
+    cfg_dir = cfg_path.parent
+    if "paths" in raw:
+        raw["paths"] = {k: str(cfg_dir / v) for k, v in raw["paths"].items()}
+
+    def _to_ns(d):
+        if isinstance(d, dict):
+            return SimpleNamespace(**{k: _to_ns(v) for k, v in d.items()})
+        if isinstance(d, list):
+            return [_to_ns(v) for v in d]
+        return d
+
+    return _to_ns(raw)
+
+
 class SessionManager:
     """Supervises broker.py + decider.py as subprocesses. See module docstring."""
 
     def __init__(self, cfg=None, db_path: Path = None, trader_dir: Path = None,
                  log_dir: Path = None, component_cmds: dict[str, list[str]] = None):
-        # Explicit path, not bare get_config(): lib.config_loader._find_config()
-        # picks a config.yaml near the *caller's* script, and get_config() caches
-        # globally regardless of path once called once. When this class is
-        # imported into trading_dashboard.py (which lives in back-trading/, and
-        # has its own separate back-trading/config.yaml for the backtest engine),
-        # ambient resolution would silently load the wrong config — wrong DB path,
-        # missing session.* keys. Always load trader/config.yaml by its own
-        # location instead, regardless of who's importing this module.
-        self._cfg = cfg or get_config(Path(__file__).parent / "config.yaml")
+        self._cfg = cfg or _load_own_config()
         self._trader_dir = Path(trader_dir) if trader_dir else Path(__file__).parent
         self._db_path = Path(db_path) if db_path else Path(self._cfg.paths.db)
         self._log_dir = Path(log_dir) if log_dir else Path(self._cfg.paths.logs)

@@ -1602,6 +1602,31 @@ def api_broker_queue():
             "SELECT COUNT(*) FROM commands WHERE status=?", (status,)
         ).fetchone()[0]
 
+    def bucket_counts(con, status):
+        """
+        Algo-type distribution for a full status bucket -- NOT the capped-at-300
+        `rows()` list above (see the true_count() comment: a capped list silently
+        undercounts once a bucket exceeds 300, so distribution counts are computed
+        against every matching row, same as true_count()). Reuses _bucket_for(),
+        the same source+note->display-bucket logic the Results screen uses, via
+        the same commands/critical_lines join api_closed_stats() uses -- see that
+        route for why line_source/line_note (not the command's own bare source)
+        is the ground truth.
+        """
+        all_rows = con.execute(
+            "SELECT c.symbol, c.source, cl.source AS line_source, cl.note AS line_note"
+            " FROM commands c LEFT JOIN critical_lines cl ON cl.id = c.critical_line_id"
+            " WHERE c.status=?", (status,)
+        ).fetchall()
+        counts: dict[str, int] = {}
+        for r in all_rows:
+            true_source = r["line_source"] or r["source"]
+            bucket = _bucket_for(true_source, r["symbol"], r["line_note"])
+            counts[bucket] = counts.get(bucket, 0) + 1
+        order_index = {b: i for i, b in enumerate(_BUCKET_ORDER)}
+        return [{"bucket": b, "n": n} for b, n in
+                sorted(counts.items(), key=lambda kv: order_index.get(kv[0], len(_BUCKET_ORDER)))]
+
     # 2026-09-10: today / yesterday / all days, same pattern as Results' st-range --
     # "closed_today" keys below now mean "closed in the selected range".
     range_sel = request.args.get("range", "today")
@@ -1656,6 +1681,10 @@ def api_broker_queue():
         n_submitted = true_count(con, "SUBMITTED")
         n_filled    = true_count(con, "FILLED")
 
+        submitted_by_algo = bucket_counts(con, "SUBMITTED")
+        filled_by_algo    = bucket_counts(con, "FILLED")
+        pending_by_algo   = bucket_counts(con, "PENDING")
+
         closed_today = [dict(r) for r in con.execute(
             "SELECT id, symbol, direction, source, exit_reason, pnl_points, exit_time"
             f" FROM commands WHERE status='CLOSED' AND {closed_date_clause}"
@@ -1665,6 +1694,32 @@ def api_broker_queue():
             f"SELECT COUNT(*) FROM commands WHERE status='CLOSED' AND {closed_date_clause}",
             closed_date_params
         ).fetchone()[0]
+
+        # Same "full bucket, not the capped display list" discipline as bucket_counts()
+        # above -- feeds both the Closed tile's count-per-algo tooltip and the Net P&L
+        # tile's $-per-algo tooltip from one query, same range filter (today/yesterday/
+        # all) as closed_today itself.
+        closed_algo_rows = con.execute(
+            "SELECT c.symbol, c.source, c.pnl_points, cl.source AS line_source,"
+            " cl.note AS line_note"
+            " FROM commands c LEFT JOIN critical_lines cl ON cl.id = c.critical_line_id"
+            f" WHERE c.status='CLOSED' AND {closed_date_clause} AND c.pnl_points IS NOT NULL",
+            closed_date_params
+        ).fetchall()
+        closed_agg: dict[str, dict] = {}
+        for r in closed_algo_rows:
+            true_source = r["line_source"] or r["source"]
+            bucket = _bucket_for(true_source, r["symbol"], r["line_note"])
+            agg = closed_agg.setdefault(bucket, {"n": 0, "pts": 0.0, "usd": 0.0})
+            pts = r["pnl_points"] or 0
+            agg["n"]   += 1
+            agg["pts"] += pts
+            agg["usd"] += pts * algo_pnl.SYMBOL_MULTIPLIERS.get(r["symbol"], 1.0)
+        order_index = {b: i for i, b in enumerate(_BUCKET_ORDER)}
+        closed_by_algo = [
+            {"bucket": b, "n": v["n"], "pts": round(v["pts"], 2), "usd": round(v["usd"], 2)}
+            for b, v in sorted(closed_agg.items(), key=lambda kv: order_index.get(kv[0], len(_BUCKET_ORDER)))
+        ]
 
         # 2026-09-12: was a bare get_config() -- lib.config_loader caches globally
         # PER PROCESS and ignores the path argument on every call after the first
@@ -1719,10 +1774,103 @@ def api_broker_queue():
         "range": range_sel,
         "counts": {"pending": n_pending, "submitted": n_submitted,
                    "filled": n_filled, "closed_today": n_closed_today},
+        "submitted_by_algo": submitted_by_algo,
+        "filled_by_algo": filled_by_algo,
+        "pending_by_algo": pending_by_algo,
+        "closed_by_algo": closed_by_algo,
         "net_pnl_today": {"points": round(net_pts, 2), "usd": round(net_usd, 2)},
         "held_back": held_back,
         "recent_stale": recent_stale,
         "cap": cap,
+    })
+
+
+@app.route("/api/algo-diagnostics")
+def api_algo_diagnostics():
+    """
+    Live "how close is it" view for Spread and Correlation -- both enabled live
+    for the first time 2026-09-14, and both genuinely quiet since (zero armed
+    lines, zero commands) as of the day this was built. Neither module logs a
+    no-op cycle, only an actual arm/open, so log silence alone can't tell you
+    "working, just hasn't fired" from "silently broken" -- this reads the same
+    state each module itself tracks (correlation_watch for Correlation;
+    lib.spread_diff's DIFF series, read-only, over bars_15m, for Spread -- same
+    functions trader/correlation_signal.py and trader/spread_manager.py
+    themselves call) so the Broker screen can show real progress instead of
+    asking you to take "it's fine" on faith.
+    """
+    from lib.spread_diff import diff_series, average_daily_swing, ALL_PAIRS
+
+    cfg = _trader_config()
+    corr_cfg   = cfg.get("correlation_trading") or {}
+    spread_cfg = cfg.get("spread") or {}
+
+    today  = date.today().isoformat()
+    cutoff = (datetime.now(timezone.utc) - timedelta(minutes=60)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    # Mirrors trader/correlation_signal.py's own status progression -- RECLAIMED
+    # ranks with FAILED_RECLAIM (both terminal) purely so a symbol that reclaimed
+    # still shows its furthest-reached state rather than losing to an older,
+    # less-advanced WATCHING row for a different line on the same symbol.
+    _RANK = {"WATCHING": 0, "BROKEN": 1, "RETESTED": 2, "FAILED_RECLAIM": 3, "RECLAIMED": 3}
+
+    with get_db(_resolve_db()) as con:
+        watch_rows = [dict(r) for r in con.execute(
+            "SELECT symbol, status, break_direction, last_price, line_price, updated_at"
+            " FROM correlation_watch WHERE date=? ORDER BY updated_at DESC", (today,)
+        ).fetchall()]
+        leaders = {"UP": set(), "DOWN": set()}
+        for r in con.execute(
+            "SELECT DISTINCT symbol, break_direction FROM correlation_watch"
+            " WHERE status='FAILED_RECLAIM' AND triggered_line_id IS NULL AND resolved_at >= ?",
+            (cutoff,)
+        ).fetchall():
+            leaders[r["break_direction"]].add(r["symbol"])
+
+    best_per_symbol = {}
+    for r in watch_rows:
+        cur = best_per_symbol.get(r["symbol"])
+        if cur is None or _RANK.get(r["status"], 0) > _RANK.get(cur["status"], 0):
+            best_per_symbol[r["symbol"]] = r
+
+    correlation = {
+        "enabled": bool(corr_cfg.get("enabled", False)),
+        "min_leaders": 3,  # trader/correlation_signal.py's MIN_LEADERS -- kept in sync by hand
+        "leaders_up": sorted(leaders["UP"]),
+        "leaders_down": sorted(leaders["DOWN"]),
+        "watches": [best_per_symbol[s] for s in ("MES", "MNQ", "MYM", "M2K") if s in best_per_symbol],
+    }
+
+    bars_db_path = _bars_db_path()
+    gap_mult = spread_cfg.get("gap_multiplier", 1.75)
+    pairs = []
+    for sym_a, sym_b in ALL_PAIRS:
+        avg_swing = average_daily_swing(bars_db_path, sym_a, sym_b)
+        series = diff_series(bars_db_path, sym_a, sym_b, limit_bars=80)
+        if not series or not avg_swing:
+            pairs.append({"pair": [sym_a, sym_b], "status": "no data"})
+            continue
+        today_diffs = [d for ts, d in series if ts[:10] == series[-1][0][:10]]
+        if len(today_diffs) < 2:
+            pairs.append({"pair": [sym_a, sym_b], "avg_swing": avg_swing, "status": "no bars yet today"})
+            continue
+        today_swing = max(today_diffs) - min(today_diffs)
+        current = today_diffs[-1]
+        all_vals = [d for _, d in series]
+        is_extreme = current >= max(all_vals) or current <= min(all_vals)
+        ratio = round(today_swing / avg_swing, 2)
+        pairs.append({
+            "pair": [sym_a, sym_b], "diff": round(current, 2),
+            "today_swing": round(today_swing, 2), "avg_swing": avg_swing,
+            "gap_multiplier": gap_mult, "ratio": ratio,
+            "gap_met": ratio >= gap_mult, "is_extreme": is_extreme,
+            "would_trigger": ratio >= gap_mult and is_extreme,
+        })
+    pairs.sort(key=lambda p: p.get("ratio") or 0, reverse=True)
+
+    return jsonify({
+        "correlation": correlation,
+        "spread": {"enabled": bool(spread_cfg.get("enabled", False)), "pairs": pairs},
     })
 
 
@@ -2096,7 +2244,11 @@ def _wf_rows(con, date_from: str, date_to: str) -> list:
         r["kind"] = kind
         r["reason"] = reason or family
         r["symtype"] = "Futures" if r["symbol"] in _WF_FUTURES_SYMBOLS else "Stock"
-        r["eod"] = r["exit_reason"] == "FORCED_EOD"
+        # 2026-09-14: FORCED_EOD_APPROX (decider.py's force_close_symbol, v2 fix) --
+        # same "not a real TP/SL exit" data-quality flag as FORCED_EOD itself, just
+        # priced off a cached-price fallback instead of the flatten order's own
+        # reported fill when that didn't arrive in time.
+        r["eod"] = r["exit_reason"] in ("FORCED_EOD", "FORCED_EOD_APPROX")
     return rows
 
 
@@ -2814,7 +2966,7 @@ body{background:var(--gl-bg)!important}
   position:sticky;top:0;z-index:5}
 .broker-stat{background:var(--gl-panel);padding:10px 12px}
 .broker-stat .k{font-size:10px;color:var(--gl-faint);text-transform:uppercase;letter-spacing:.05em;margin-bottom:4px}
-.broker-stat .v{font-family:var(--gl-mono);font-size:18px;font-variant-numeric:tabular-nums}
+.broker-stat .v{font-family:var(--gl-mono);font-size:18px;font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .broker-stat .v.good{color:var(--gl-good)}
 .broker-stat .v.bad{color:var(--gl-bad)}
 .broker-stat .v.warn{color:var(--gl-accent)}
@@ -2856,6 +3008,22 @@ body{background:var(--gl-bg)!important}
   overflow:hidden}
 .broker-closed-strip h6{flex-shrink:0}
 .broker-closed-strip .broker-list{flex:1 1 auto}
+
+/* ── Spread/Correlation live diagnostics (2026-09-14) ── */
+.algo-diag{background:var(--gl-panel);border:1px solid var(--gl-border);border-radius:8px;
+  padding:10px 12px;margin-top:12px}
+.algo-diag-hdr{cursor:pointer;user-select:none}
+.algo-diag-hdr .small{color:var(--gl-faint)}
+.algo-diag-body{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:8px}
+.algo-diag-body.collapsed{display:none}
+.algo-diag-h{font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--gl-muted);
+  margin-bottom:4px}
+.algo-diag-table{width:100%;border-collapse:collapse;font-family:var(--gl-mono);font-size:11px}
+.algo-diag-table th{text-align:left;color:var(--gl-faint);font-weight:400;padding:3px 6px;
+  border-bottom:1px solid var(--gl-border)}
+.algo-diag-table td{padding:3px 6px;border-bottom:1px solid var(--gl-border-dim,var(--gl-border))}
+.algo-diag-table td.num{text-align:right;font-variant-numeric:tabular-nums}
+.algo-diag-table td.good{color:var(--gl-good)}
 
 /* ── Stats screen: top bar capped small, matrix takes the rest ── */
 /* .st-page, not #tab-stats itself -- the tab-pane element's display is Bootstrap's to
@@ -3116,7 +3284,7 @@ td.rr-empty{color:var(--gl-faint);font-size:11px;background:var(--gl-panel-2);bo
     <!-- Header -->
     <div class="app-header">
       <span class="brand">Galao</span>
-      <span class="verchip">v5.26</span>
+      <span class="verchip">v5.33</span>
       <span class="gl-pill" id="session-broker-badge" style="color:var(--gl-muted)">Broker: —</span>
       <span class="gl-pill" id="session-decider-badge" style="color:var(--gl-muted)">Decider: —</span>
       <span class="gl-pill" id="market-data-badge" style="color:var(--gl-muted)">Market Data: —</span>
@@ -3971,6 +4139,28 @@ td.rr-empty{color:var(--gl-faint);font-size:11px;background:var(--gl-panel-2);bo
       <h6 class="mb-0" id="bk-closed-title">Closed today</h6>
     </div>
     <div class="broker-list" id="bk-closed"></div>
+  </div>
+
+  <!-- Spread/Correlation both enabled live 2026-09-14; zero commands from either so
+       far isn't distinguishable from "silently broken" by eye -- this reads each
+       module's own live state (correlation_watch; lib.spread_diff's DIFF series) so
+       "why is nothing submitted from Spread/Correlation" has a real answer on screen
+       instead of a guess. -->
+  <div class="algo-diag">
+    <div class="algo-diag-hdr" onclick="document.getElementById('algo-diag-body').classList.toggle('collapsed')">
+      <h6 class="mb-0 d-inline">Spread &amp; Correlation — live diagnostics</h6>
+      <span class="small"> how close each is to its own entry trigger, not just whether one has fired yet</span>
+    </div>
+    <div class="algo-diag-body" id="algo-diag-body">
+      <div>
+        <div class="algo-diag-h" id="corr-diag-sub">Correlation</div>
+        <table class="algo-diag-table" id="corr-diag-table"></table>
+      </div>
+      <div>
+        <div class="algo-diag-h" id="spread-diag-sub">Spread</div>
+        <table class="algo-diag-table" id="spread-diag-table"></table>
+      </div>
+    </div>
   </div>
 </div>
 
@@ -5428,7 +5618,7 @@ async function dcExtractFutures(){
   dcVerify();
 }
 async function dcExtractStocks(){
-  _dcSetStatus('extracting stock lines (Algo 1/2, 30 symbols)...');
+  _dcSetStatus('extracting stock lines (Algo 1/2, 77 symbols)...');
   try{
     const d = await (await fetch('/api/dayclean/extract-stock-lines',{method:'POST'})).json();
     const last = (d.stdout||'').trim().split('\n').pop() || '(no output)';
@@ -5455,6 +5645,20 @@ async function loadBroker(){
     document.getElementById('bk-c-submitted').textContent = d.counts.submitted;
     document.getElementById('bk-c-filled').textContent    = d.counts.filled;
     document.getElementById('bk-c-closed').textContent    = d.counts.closed_today;
+
+    // Same count+tooltip pattern as the "At cap (held back)" tile above (v5.28) --
+    // a full per-algo breakdown text would wrap and blow out this row's height the
+    // same way the held-back symbol list did, so it lives in the hover tooltip
+    // instead of the tile itself. v5.31: extended to every remaining broker-stat
+    // count (Pending, Closed) plus a $-per-algo variant for Net P&L.
+    const _algoTitle = list => (list||[]).map(x=>`${x.bucket}: ${x.n}`).join('\n');
+    document.getElementById('bk-c-pending').title   = _algoTitle(d.pending_by_algo);
+    document.getElementById('bk-c-submitted').title = _algoTitle(d.submitted_by_algo);
+    document.getElementById('bk-c-filled').title    = _algoTitle(d.filled_by_algo);
+    document.getElementById('bk-c-closed').title    = _algoTitle(d.closed_by_algo);
+    document.getElementById('bk-pnl').title = (d.closed_by_algo||[])
+      .filter(x=>x.usd!==0)
+      .map(x=>`${x.bucket}: ${x.usd>=0?'+':''}$${x.usd.toFixed(2)}`).join('\n');
     const rangeLbl = _BK_RANGE_LABEL[d.range] || d.range;
     document.getElementById('bk-closed-label').textContent = `Closed (${rangeLbl})`;
     document.getElementById('bk-pnl-label').textContent    = `Net P&L (${rangeLbl})`;
@@ -5472,14 +5676,58 @@ async function loadBroker(){
 
     const heldEl=document.getElementById('bk-held');
     if(d.held_back.length){
-      heldEl.textContent = d.held_back.map(h=>`${h.symbol} ${h.direction} (${h.c})`).join(', ');
+      heldEl.textContent = String(d.held_back.length);
+      heldEl.title = d.held_back.map(h=>`${h.symbol} ${h.direction} (${h.c})`).join(', ');
       heldEl.className='v warn';
     } else {
-      heldEl.textContent='none'; heldEl.className='v';
+      heldEl.textContent='none'; heldEl.title=''; heldEl.className='v';
     }
   }catch(e){}
   finally{ _exitBusy(); }
 }
+
+// 2026-09-14: "why is nothing submitted from Spread/Correlation" -- separate, slower
+// poll than loadBroker()'s 5s (the underlying data can't move faster than
+// correlation_signal.py's 90s decider poll or a new 15-min bar, so 5s would just be
+// wasted requests).
+async function loadAlgoDiagnostics(){
+  let d;
+  try{ d = await (await fetch('/api/algo-diagnostics')).json(); }
+  catch(e){ return; }
+
+  const c = d.correlation;
+  document.getElementById('corr-diag-sub').textContent =
+    `Correlation — needs ${c.min_leaders} symbols FAILED_RECLAIM same direction within 60min `+
+    `(UP ${c.leaders_up.length}/${c.min_leaders}${c.leaders_up.length?' ['+c.leaders_up.join(',')+']':''}, `+
+    `DOWN ${c.leaders_down.length}/${c.min_leaders}${c.leaders_down.length?' ['+c.leaders_down.join(',')+']':''})`;
+  const corrRows = (c.watches||[]).map(w=>{
+    const dist = (w.last_price!=null && w.line_price!=null) ? (w.last_price - w.line_price) : null;
+    const distTxt = dist!=null ? (dist>=0?'+':'')+dist.toFixed(2) : '—';
+    return `<tr><td>${w.symbol}</td><td>${w.status}</td><td>${w.break_direction||'—'}</td>`+
+           `<td class="num">${w.last_price ?? '—'}</td><td class="num">${w.line_price ?? '—'}</td>`+
+           `<td class="num">${distTxt}</td></tr>`;
+  }).join('');
+  document.getElementById('corr-diag-table').innerHTML =
+    '<tr><th>Sym</th><th>Status</th><th>Dir</th><th>Last</th><th>Line</th><th>Dist</th></tr>'+
+    (corrRows || '<tr><td colspan="6" class="text-muted">No watch data yet today</td></tr>');
+
+  const s = d.spread;
+  const gapMult = (s.pairs[0] && s.pairs[0].gap_multiplier) || 1.75;
+  document.getElementById('spread-diag-sub').textContent =
+    `Spread — needs today's swing ≥ ${gapMult}× avg AND a new extreme, both at once`;
+  const spreadRows = (s.pairs||[]).map(p=>{
+    if(p.status){ return `<tr><td>${p.pair.join('/')}</td><td colspan="4" class="text-muted">${p.status}</td></tr>`; }
+    const pct = Math.round((p.ratio/p.gap_multiplier)*100);
+    return `<tr><td>${p.pair.join('/')}</td>`+
+           `<td class="num">${p.today_swing}</td><td class="num">${p.avg_swing}</td>`+
+           `<td class="num${p.would_trigger?' good':''}">${pct}%</td>`+
+           `<td>${p.is_extreme?'yes':'no'}</td></tr>`;
+  }).join('');
+  document.getElementById('spread-diag-table').innerHTML =
+    '<tr><th>Pair</th><th>Today swing</th><th>Avg swing</th><th>Gap %</th><th>At extreme</th></tr>'+
+    (spreadRows || '<tr><td colspan="5" class="text-muted">No data</td></tr>');
+}
+let _algoDiagTimer=null;
 
 // 2026-09-12 fix: clicking the Broker tab used to arm setInterval(dcVerify,15000) --
 // dcVerify() spawns ib_dayclean.py fresh each call (measured ~3.7s live, up to 30s if
@@ -5495,12 +5743,15 @@ document.getElementById('btn-broker-tab').addEventListener('click',()=>{
   clearInterval(_bkTimer);
   _bkTimer=setInterval(loadBroker,5000);   // matches broker.py's own command_poll_seconds
   dcVerify();
+  loadAlgoDiagnostics();
+  clearInterval(_algoDiagTimer);
+  _algoDiagTimer=setInterval(loadAlgoDiagnostics,30000);
 });
 
 // Leaving the Broker tab stops its poll and restores the normal tab title --
 // any other top-tab button click does it.
 document.querySelectorAll('#mainTab .top-tab:not(#btn-broker-tab)').forEach(b=>{
-  b.addEventListener('click',()=>{ clearInterval(_bkTimer); document.title='Galao'; });
+  b.addEventListener('click',()=>{ clearInterval(_bkTimer); clearInterval(_algoDiagTimer); document.title='Galao'; });
 });
 
 // Keyboard shortcuts: 'b' -> Broker, Escape -> Overview. Ignored while typing in a field.
@@ -5508,7 +5759,7 @@ document.addEventListener('keydown', e=>{
   const tag=(e.target.tagName||'').toLowerCase();
   if(tag==='input'||tag==='textarea'||tag==='select') return;
   if(e.key==='b'||e.key==='B'){ selectGroupTab('trading','tab-broker'); document.getElementById('btn-broker-tab').click(); }
-  else if(e.key==='Escape'){ clearInterval(_bkTimer); selectGroupTab('overview','tab-overview'); }
+  else if(e.key==='Escape'){ clearInterval(_bkTimer); clearInterval(_algoDiagTimer); selectGroupTab('overview','tab-overview'); }
 });
 
 // ── Stats screen ─────────────────────────────────────────────────────────────
@@ -7450,6 +7701,9 @@ document.addEventListener('shown.bs.tab',function(e){
   loadBroker();
   clearInterval(_bkTimer);
   _bkTimer=setInterval(loadBroker,5000);
+  loadAlgoDiagnostics();
+  clearInterval(_algoDiagTimer);
+  _algoDiagTimer=setInterval(loadAlgoDiagnostics,30000);
   // 2026-09-12 regression fix: dcVerify() spawns a whole new Python subprocess
   // that connects fresh to IB Gateway (trader/scripts/ib_dayclean.py, up to a
   // 30s timeout) -- auto-starting a 15s repeat of that on every page load (not
@@ -7479,6 +7733,101 @@ document.addEventListener('shown.bs.tab',function(e){
 # ── Release notes ─────────────────────────────────────────────────────────────
 
 _RELEASE_NOTES = [
+    ("v5.33", "Overnight allocation/bracket/bug-fix plan (2026-09-14) -- Winning Formula filter update",
+              "Companion to tonight's decider.py/spread_manager.py/lib/allocation.py changes "
+              "(FORCED_EOD pnl-recording bug fix + historical backfill, allocation priority "
+              "reshuffle Correlation>GevaExtract>Critical Line>Spread, Correlation mini-contract-"
+              "only, Spread multi-bracket fan-out, bracket 32 reinstated) -- see "
+              "DAY_SUMMARY_AND_PLAN_2026-09-14.md for the full writeup. This file's own change: "
+              "the Winning Formula tab's 'Include Forced-EOD trades' filter now also catches the "
+              "new FORCED_EOD_APPROX exit_reason (the fallback-priced variant of tonight's bug "
+              "fix), same data-quality bucket as plain FORCED_EOD."),
+    ("v5.32", "New Broker-tab panel: live Spread/Correlation diagnostics",
+              "Direct follow-up to today's 'why is nothing submitted from Spread or "
+              "Correlation' question -- both are confirmed working (gated correctly, "
+              "polling on schedule, no errors), just genuinely haven't hit their entry "
+              "trigger yet on day one live (2026-09-14). Rather than leave that as a "
+              "one-time verbal answer, added a collapsible panel at the bottom of the "
+              "Broker tab, new GET /api/algo-diagnostics, refreshed every 30s (slower "
+              "than loadBroker()'s 5s -- the underlying data can't move faster than "
+              "correlation_signal.py's 90s decider poll or a new 15-min bar anyway): "
+              "Correlation side shows each of the 4 futures' current watch status "
+              "(WATCHING/BROKEN/RETESTED/FAILED_RECLAIM/RECLAIMED, from correlation_watch, "
+              "furthest-progressed row per symbol today) plus leader counts toward the "
+              "3-needed threshold; Spread side shows all 6 symbol pairs' today-swing vs "
+              "avg-swing ratio as a % of the 1.75x gap_multiplier trigger (via "
+              "lib.spread_diff.diff_series/average_daily_swing, the same read-only "
+              "functions spread_manager.py itself calls) plus whether each pair is "
+              "currently at a new DIFF extreme -- both conditions needed together. "
+              "Live-tested: correlation showed MES already RECLAIMED (a false break) with "
+              "MNQ/MYM/M2K still WATCHING; spread showed all 6 pairs at 23-35% of trigger, "
+              "confirming neither is stuck, just not there yet."),
+    ("v5.31", "Broker stats: per-algo hover breakdown extended to Pending/Closed/Net P&L",
+              "User request (2026-09-14): same treatment as v5.30's Submitted/Filled, "
+              "applied to the rest of the row -- Pending and Closed now get a per-algo "
+              "count tooltip (new pending_by_algo, reusing bucket_counts() unchanged; "
+              "closed_by_algo, a fresh commands/critical_lines join filtered by the same "
+              "today/yesterday/all range as closed_today -- deliberately NOT built from "
+              "the capped 300-row closed_today list itself, same true-count discipline as "
+              "bucket_counts()), and Net P&L gets a $-per-algo tooltip built from that same "
+              "closed_by_algo aggregate (n/pts/usd per bucket in one pass)."),
+    ("v5.30", "Broker stats: Submitted/Filled tiles now show per-algo distribution",
+              "User request (2026-09-14): wanted to see the distribution among algo types "
+              "within the Submitted and Filled counts, not just the raw total. Reuses the "
+              "existing Results-screen _bucket_for() source+note->display-bucket logic "
+              "(GevaExtract / Algo 1-5 Real+Control / Spread Real+Control / Correlation "
+              "Real+Control / Critical Line / Algo Lab / Other) via the same "
+              "commands/critical_lines join api_closed_stats() already uses. New "
+              "/api/broker-queue fields submitted_by_algo/filled_by_algo (each a list of "
+              "{bucket, n}, ordered per the Results screen's _BUCKET_ORDER, computed "
+              "against the FULL status bucket, not the display list's 300-row cap -- same "
+              "care as true_count() above). Same count+tooltip pattern as v5.28's held-back "
+              "fix: the tile itself still shows just the number, full breakdown on hover, "
+              "so this can't blow out the row height the same way that tile did."),
+    ("v5.29", "Fix reproducible 500 on /api/session/status (poisoned config cache, again)",
+              "Hit live post-restart (2026-09-14): GET /api/session/status crashed with "
+              "AttributeError on self._cfg.session.monitor_poll_seconds inside "
+              "SessionManager.__init__. Root cause: lib/config_loader.py's get_config() "
+              "caches globally in a single _cached slot regardless of the path argument -- "
+              "whichever config.yaml some module loads first in the process wins for its "
+              "whole lifetime (documented footgun, CORRELATIONCRITICAL_INTEGRATION_REPORT.md; "
+              "this file's own _trader_config()/_resolve_db() already route around it the "
+              "same way). trader/session.py's SessionManager was still calling bare "
+              "get_config(trader/config.yaml) though, so once anything in this dashboard's "
+              "process loaded back-trading/config.yaml first (no session: section there), "
+              "every session.py call silently got that wrong config back. Fixed by giving "
+              "session.py its own _load_own_config() that reads trader/config.yaml directly, "
+              "bypassing the shared cache entirely -- same pattern trading_dashboard.py "
+              "already uses, now applied consistently. Root lib/config_loader.py cache "
+              "itself intentionally left as-is (shared across sibling projects; each caller "
+              "routing around it is the established convention here, not a lib rewrite)."),
+    ("v5.28", "Broker stat: fix 'At cap (held back)' tile blowing out row height",
+              "The tile's value rendered the full comma-joined list of every held-back "
+              "symbol/direction/count (dozens of entries during an active session), which "
+              "wrapped across many lines in the fixed-height broker-stats grid row and "
+              "forced all 6 stat tiles in that row to stretch to match -- now shows just "
+              "the count, with the full list moved to a hover tooltip; also added "
+              "nowrap/ellipsis overflow guards to .broker-stat .v generally so no future "
+              "stat value can repeat this."),
+    ("v5.27", "Expand live stock universe 30 -> 77, fix cross-project data-fetch bug",
+              "Big multi-part session (2026-09-14): (1) switched bars.db from 30-min to "
+              "15-min OHLCV to match Geva's actual AI-9/AI-35b rule, which the system had "
+              "been deviating from; (2) gave Spread's legs a real per-leg stop-loss "
+              "(deliberate, documented deviation from AI-35's 'hedge bounds risk, no stop' "
+              "design, docs/spread_bracket_stop.md); (3) enabled Spread and Correlation "
+              "live for the first time; (4) made lib/allocation.py's futures-pool capacity "
+              "caps dynamic -- a family can now reclaim another family's currently-unused "
+              "share instead of it sitting reserved and idle (docs/dynamic_allocation.md); "
+              "(5) found and fixed the real root cause of 0 stock critical lines: sibling "
+              "project MultiSymbolTrader was fetching historical data via the PAPER IB "
+              "connection, which has degraded market-data entitlements -- switched it to "
+              "live, read-only, exactly this project's own paper=orders/live=data "
+              "convention; (6) with that fixed, 65 stocks got real armed lines the same "
+              "day (vs. 0 before) -- expanded the live-traded stock list and "
+              "lib/allocation.py's ALLOC_STOCK_DEDICATED from a drifted, inconsistent 30 "
+              "(11 symbols differed each way between the allocation plan and the actual "
+              "live list) to a clean, fully-aligned 77, split 26/26/25 across Critical "
+              "Line/Spread/Correlation."),
     ("v5.26", "Surface review_note as a tooltip on the '⚠ review' badge",
               "Found via a full-system code-quality audit: broker.py's flag_needs_review() "
               "writes a human-readable diagnostic (e.g. 'TP/SL order ids (X, Y) both missing "

@@ -33,7 +33,7 @@ import sys; sys.path.insert(0, str(_ROOT)) if str(_ROOT) not in sys.path else No
 
 from lib.config_loader import get_config
 from lib.logger import get_logger
-from lib.db import get_db, init_db, get_filled_commands, get_system_state, set_system_state, update_command_status, update_price_cache, record_completed_trade, _root_critical_line_id
+from lib.db import get_db, init_db, get_filled_commands, get_system_state, set_system_state, update_command_status, update_price_cache, record_completed_trade, _root_critical_line_id, get_cached_price
 from lib.order_builder import determine_entry_type, calc_bracket_prices, round_tick, get_tick_size
 from lib.critical_lines import get_armed_lines
 from lib.session_clock import (is_entry_cutoff, is_forced_exit_time, is_before_open,
@@ -47,6 +47,15 @@ log = get_logger("decider")
 # Control-group sources fan out to fewer brackets than real/treatment lines --
 # see generate_commands()'s brackets_control.
 _CONTROL_SOURCES = {"geva_manual_control", "research_random", "research_random_stock"}
+
+# 2026-09-14 (overnight allocation/bracket plan, explicit user decision): Correlation
+# stays mini-contract only -- do NOT mirror its lines onto the paired full-size
+# contract (MES->ES etc, see _mirror_onto_pair_symbol) the way every other family's
+# lines already are. User considered mini+full for Correlation too and rejected it
+# ("this will not help me"). Doesn't reduce Correlation's bracket fan-out (still gets
+# the full orders.active_brackets set, same as everyone else) or its allocation share
+# -- only removes the second (full-size) contract copy of each command.
+_MINI_ONLY_SOURCES = {"correlation", "correlation_control"}
 
 
 def _now_utc() -> str:
@@ -218,13 +227,18 @@ def _mirror_onto_pair_symbol(symbol: str, lines: list, current_price: float,
     lines() can pass a lambda returning set() since its own line-level NOT EXISTS
     guard already guarantees these lines have zero commands under ANY symbol yet).
     Returns (count, skipped), same shape as _generate_commands_for_lines().
+
+    2026-09-14: Correlation-sourced lines (_MINI_ONLY_SOURCES) are excluded here --
+    mini-contract only, no full-size mirror. Filtered centrally in this one shared
+    function rather than at each call site so it can't be missed by a future caller.
     """
     mirror = _mirror_pair_symbol(symbol)
-    if not mirror or not lines:
+    mirror_lines = [l for l in lines if (l["source"] or "") not in _MINI_ONLY_SOURCES]
+    if not mirror or not mirror_lines:
         return 0, 0
     mirror_in_flight = in_flight_fn(mirror)
     m_count, m_skipped = _generate_commands_for_lines(
-        lines, mirror, current_price, cfg, db_path, mirror_in_flight
+        mirror_lines, mirror, current_price, cfg, db_path, mirror_in_flight
     )
     if m_count:
         log.info(f"Mirrored {m_count} command(s) onto {mirror} (paired with {symbol})")
@@ -497,30 +511,55 @@ def force_close_symbol(symbol: str, db_path, ibc) -> int:
         return 0
 
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    # 2026-09-13: exit_price/pnl_points were never set here -- every FORCED_EOD close
-    # left pnl_points NULL forever (found while designing a live-performance drilldown:
-    # 38 of 40 closed research trades were unscored). Capture the flatten MKT order's
-    # own fill price (ib_insync's placeOrder returns a Trade that updates in place;
-    # market orders fill within a poll or two in paper trading) and apply it as every
+    # 2026-09-13 fix (v1): exit_price/pnl_points were never set here -- every
+    # FORCED_EOD close left pnl_points NULL forever (found designing a
+    # live-performance drilldown: 38/40 closed research trades were unscored).
+    # Capture the flatten MKT order's own fill price and apply it as every
     # flattened command's exit_price, same PnL formula every other exit path uses.
+    #
+    # 2026-09-14 fix (v2): v1's 5s wait (10 x 0.5s) was nowhere near enough under
+    # real EOD load -- a live batch flatten across 9 symbols left 297 of 300
+    # commands with pnl_points still NULL, only 11 caught the fill in time.
+    # Two changes: (1) also check trade.fills directly (populated per-execution,
+    # sometimes visible before orderStatus.avgFillPrice rolls up) and wait up to
+    # 20s instead of 5s; (2) if the MKT order genuinely still hasn't reported a
+    # fill after that -- rare, but v1's failure mode shows "rare" still happens
+    # at scale -- fall back to the last cached price for the symbol rather than
+    # leaving pnl_points NULL forever again. This is an approximation (the actual
+    # fill could differ by a tick or two from the last cached read), not the
+    # exact fill price, so it's flagged via exit_reason='FORCED_EOD_APPROX'
+    # instead of silently passing as an exact 'FORCED_EOD' close.
     flatten_fill_price = None
+    price_is_approx = False
     if net != 0:
         try:
             action = "SELL" if net > 0 else "BUY"
             mkt = MarketOrder(action, abs(net))
             trade = ibc.paper.placeOrder(contract, mkt)
-            for _ in range(10):
+            for _ in range(40):
                 if trade.orderStatus.avgFillPrice:
+                    flatten_fill_price = trade.orderStatus.avgFillPrice
+                    break
+                if trade.fills:
+                    flatten_fill_price = trade.fills[-1].execution.price
                     break
                 ibc.paper.sleep(0.5)
-            flatten_fill_price = trade.orderStatus.avgFillPrice or None
+            if flatten_fill_price is None:
+                with get_db(db_path) as con:
+                    flatten_fill_price = get_cached_price(con, symbol)
+                price_is_approx = flatten_fill_price is not None
+                log.warning(f"[forced_eod] {symbol}: MKT exit fill not reported after 20s -- "
+                            f"using last cached price {flatten_fill_price} as an approximation "
+                            f"instead of leaving pnl_points NULL")
             log.info(f"[forced_eod] MKT exit placed for {symbol}: {action} {abs(net)}"
-                     + (f" @ {flatten_fill_price}" if flatten_fill_price else " (fill price still pending)"))
+                     + (f" @ {flatten_fill_price}{' (approx)' if price_is_approx else ''}"
+                        if flatten_fill_price else " (no fill price available at all)"))
         except Exception as e:
             log.error(f"[forced_eod] {symbol}: MKT exit failed, leaving commands FILLED "
                        f"for retry next poll: {e}")
             return n_cancelled_entries
 
+    exit_reason = "FORCED_EOD_APPROX" if price_is_approx else "FORCED_EOD"
     with get_db(db_path) as con:
         for cmd in filled:
             pnl = None
@@ -528,7 +567,7 @@ def force_close_symbol(symbol: str, db_path, ibc) -> int:
                 pnl = (flatten_fill_price - cmd["fill_price"]) if cmd["direction"] == "BUY" \
                       else (cmd["fill_price"] - flatten_fill_price)
             update_command_status(con, cmd["id"], "CLOSED",
-                                  exit_time=now, exit_reason="FORCED_EOD",
+                                  exit_time=now, exit_reason=exit_reason,
                                   exit_price=flatten_fill_price,
                                   pnl_points=round(pnl, 4) if pnl is not None else None)
             record_completed_trade(con, cmd["id"])
@@ -861,6 +900,12 @@ def self_test() -> bool:
             # generate_commands() already ran (e.g. a correlation signal firing
             # mid-session) must get picked up on the very next call, without
             # waiting for a session restart.
+            #
+            # 2026-09-14: this test's line is source='correlation' -- deliberately so,
+            # since it's also the regression guard for _MINI_ONLY_SOURCES (mini-contract
+            # only, no ES mirror): expected_new is now * 1, not * mirror_factor, and the
+            # explicit "zero commands landed on ES" check below is the actual point of
+            # this test now, not just a side effect of the bracket-count math.
             with get_db(db_path) as con:
                 cur = con.execute(
                     "INSERT INTO critical_lines (symbol, date, line_type, price,"
@@ -869,7 +914,7 @@ def self_test() -> bool:
                 )
                 new_line_id = cur.lastrowid
             n_new = generate_commands_for_new_lines("MES", today, current_price, cfg, db_path)
-            expected_new = len(brackets) * 2 * mirror_factor  # 2026-09-12: + ES mirror
+            expected_new = len(brackets) * 2  # mini-contract only -- no ES mirror for Correlation
             assert n_new == expected_new, \
                 f"Expected {expected_new} commands for the new line, got {n_new}"
             with get_db(db_path) as con:
@@ -877,6 +922,8 @@ def self_test() -> bool:
                     "SELECT * FROM commands WHERE critical_line_id=?", (new_line_id,)
                 ).fetchall()
             assert len(new_line_cmds) == n_new
+            assert all(r["symbol"] == "MES" for r in new_line_cmds), \
+                "Correlation-sourced line must stay mini-contract only -- found an ES command"
 
             # Re-calling immediately is a no-op -- the line now has commands, so
             # it no longer matches the "zero commands ever" filter.
@@ -1176,6 +1223,46 @@ def self_test() -> bool:
             with get_db(db_path3) as con:
                 row5e = con.execute("SELECT status FROM commands WHERE id=?", (resting_id,)).fetchone()
             assert row5e["status"] == "CANCELLED", row5e
+
+            # 5f. 2026-09-14 fix (v2): the MKT flatten order's fill never reports
+            # (avgFillPrice stays falsy AND trade.fills stays empty for the whole
+            # wait) -- this is the exact live failure mode that left 297/300
+            # FORCED_EOD closes with pnl_points NULL on 2026-09-14. Must now fall
+            # back to the last cached price instead of giving up with NULL, and
+            # must flag the close as FORCED_EOD_APPROX (not plain FORCED_EOD) so
+            # it's distinguishable from a close priced off a real reported fill.
+            class _FakeTradeNoFill:
+                def __init__(self):
+                    self.orderStatus = type("OS", (), {"avgFillPrice": None})()
+                    self.fills = []
+
+            class _FakePaperNoFill(_FakePaper):
+                def placeOrder(self, contract, order):
+                    self.orders_placed.append((contract, order))
+                    return _FakeTradeNoFill()
+
+            with get_db(db_path3) as con:
+                con.execute(
+                    "INSERT INTO commands (symbol, line_price, line_type, line_strength, direction,"
+                    " entry_type, entry_price, tp_price, sl_price, bracket_size, source,"
+                    " quantity, logical_trade_id, status, fill_price, fill_time) VALUES"
+                    " ('TSLA', 250, 'SUPPORT', 2, 'BUY', 'LMT', 250, 254, 246, 4,"
+                    " 'critical_line', 1, 'lt6', 'FILLED', 250.0, '2026-09-14T14:00:00Z')"
+                )
+                update_price_cache(con, "TSLA", 251.5, "2026-09-14T19:55:00Z", source="live_poll")
+            nofill_ibc = _FakeIBC([_FakePos("TSLA", 1)])
+            nofill_ibc.paper = _FakePaperNoFill()
+            n_nofill = force_close_symbol("TSLA", db_path3, nofill_ibc)
+            assert n_nofill == 1, f"expected exactly 1 TSLA command closed, got {n_nofill}"
+            with get_db(db_path3) as con:
+                row5f = con.execute(
+                    "SELECT status, exit_reason, exit_price, pnl_points FROM commands"
+                    " WHERE logical_trade_id='lt6'").fetchone()
+                assert row5f["status"] == "CLOSED"
+                assert row5f["exit_reason"] == "FORCED_EOD_APPROX", \
+                    f"expected FORCED_EOD_APPROX when falling back to cached price, got {row5f['exit_reason']}"
+                assert row5f["exit_price"] == 251.5, f"expected cached-price fallback 251.5, got {row5f['exit_price']}"
+                assert row5f["pnl_points"] == 1.5, f"expected pnl_points 1.5 (251.5-250.0), got {row5f['pnl_points']}"
 
         # 5c. Regression guard: decider's own __main__ must connect with paper=True.
         # This exact line (paper=False, "decider only needs LIVE for price") is what
